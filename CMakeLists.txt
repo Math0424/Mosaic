@@ -271,3 +271,11 @@ add_subdirectory(src)
 
 include("${CMAKE_SOURCE_DIR}/cmake/format.cmake")
 include("${CMAKE_SOURCE_DIR}/cmake/package.cmake")
+
+add_custom_target(download_vision_model
+    COMMAND ${CMAKE_COMMAND}
+        -DMODEL_DIR="${CMAKE_SOURCE_DIR}/assets/onnx/v1"
+        -P "${CMAKE_SOURCE_DIR}/cmake/download_vision_model.cmake"
+    COMMENT "Downloading vision model..."
+    VERBATIM
+)
