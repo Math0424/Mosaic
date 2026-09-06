@@ -136,19 +136,25 @@ else()
     set(INSTALLER_SCRIPT "${CMAKE_SOURCE_DIR}/installer/Mosaic.iss")
     set(INSTALLER_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/build/installer")
 
+    file(READ "${CMAKE_SOURCE_DIR}/build_number.txt" BUILD_NUMBER)
+    string(STRIP "${BUILD_NUMBER}" BUILD_NUMBER)
+    if(NOT BUILD_NUMBER MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "Invalid build number: ${BUILD_NUMBER}")
+    endif()
+
     add_custom_target(installer
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "${INSTALLER_OUTPUT_DIR}"
 
         COMMAND "${ISCC}"
-            /DMyAppVersion=${PROJECT_VERSION}
+            /DMyAppVersion=${BUILD_NUMBER}
             /DPackageDir=${PACKAGE_DIR}
             /DOutputDir=${INSTALLER_OUTPUT_DIR}
             "${INSTALLER_SCRIPT}"
 
         DEPENDS package
 
-        COMMENT "Building Mosaic Windows installer (Inno Setup)..."
+        COMMENT "Building Mosaic Windows installer (${BUILD_NUMBER})..."
         VERBATIM
     )
 endif()

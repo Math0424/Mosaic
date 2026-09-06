@@ -9,7 +9,9 @@
 ; ============================================================================
 
 #define MyAppName "Mosaic"
+#ifndef MyAppVersion
 #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "Mosaic"
 #define MyAppExeName "Mosaic.exe"
 #define MyAppIcon "..\assets\icon.ico"
