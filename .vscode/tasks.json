@@ -1,0 +1,116 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Configure Dev",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--preset",
+				"dev"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Build Mosaic",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"--preset",
+				"dev"
+			],
+			"dependsOn": "Configure Dev",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": [
+				"$msCompile"
+			]
+		},
+		{
+			"label": "Clean Mosaic",
+			"type": "shell",
+			"command": "Remove-Item",
+			"args": [
+				"-Recurse",
+				"-Force",
+				"${workspaceFolder}/build/dev"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Rebuild Mosaic",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Clean Mosaic",
+				"Configure Dev",
+				"Build Mosaic"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Build Publish",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"--preset",
+				"publish"
+			],
+			"dependsOn": "Configure Publish",
+			"group": "build",
+			"problemMatcher": [
+				"$msCompile"
+			]
+		},
+		{
+			"label": "Configure Publish",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--preset",
+				"publish"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Rebuild Publish",
+			"dependsOrder": "sequence",
+			"dependsOn": [
+				"Clean Publish",
+				"Configure Publish",
+				"Build Publish"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Clean Publish",
+			"type": "shell",
+			"command": "Remove-Item",
+			"args": [
+				"-Recurse",
+				"-Force",
+				"${workspaceFolder}/build/publish"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Package Installer",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"--preset",
+				"publish",
+				"--target",
+				"installer"
+			],
+			"dependsOn": "Build Publish",
+			"problemMatcher": [
+				"$msCompile"
+			]
+		}
+	]
+}

@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Mosaic (dev)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/dev/bin/Mosaic.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build/dev/bin",
+      "console":"integratedTerminal",
+      "preLaunchTask": "Build Mosaic",
+      "environment": [
+        {
+          "name": "PATH",
+          "value": "${workspaceFolder}/build/dev/bin;${env:PATH}"
+        }
+      ]
+    }
+  ]
+}

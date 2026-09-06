@@ -1,0 +1,767 @@
+#include "SourceBrowser.h"
+
+#include "FlowLayout.h"
+#include "Icons.h"
+#include "TagColors.h"
+#include "ViewerWindow.h"
+#include "../app/MainWindow.h"
+#include "../core/Paths.h"
+
+#include <QtConcurrentRun>
+#include <QAbstractItemView>
+#include <QDebug>
+#include <QDir>
+#include <QFileInfo>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QStringListModel>
+#include <QPointer>
+#include <QPushButton>
+#include <QResizeEvent>
+#include <QScrollArea>
+#include <QCompleter>
+#include <QScrollBar>
+#include <QStyle>
+#include <QTemporaryFile>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWheelEvent>
+#include "../media/VideoDecoder.h"
+#include "../sources/local/LibrarySource.h"
+#include <QKeyEvent>
+
+namespace Mosaic {
+
+namespace {
+
+constexpr int kThumbSize = 168;      ///< total thumbnail cell size
+constexpr int kImageSize = 150;      ///< image area inside the cell
+constexpr int kPageSize = 75;        ///< images requested per page
+constexpr int kPrefetchPx = 400;     ///< load next page this close to the bottom
+constexpr int kRecycleMargin = 800;  ///< keep decoded thumbs this far beyond the viewport
+
+// On-disk thumbnail cache folder.
+QString thumbCacheDir() { return QDir(Paths::tempDir()).filePath(QStringLiteral("thumbcache")); }
+
+}  // namespace
+
+// Thumbnail
+
+ThumbnailButton::ThumbnailButton(const SourceImage& image, QWidget* parent)
+    : QWidget(parent), m_image(image) {
+    setCursor(Qt::PointingHandCursor);
+    setToolTip(m_image.tooltipHtml());
+}
+
+QSize ThumbnailButton::sizeHint() const { return QSize(kThumbSize, kThumbSize); }
+
+void ThumbnailButton::setPixmap(const QPixmap& pixmap) {
+    m_pixmap = pixmap;
+    update();
+}
+
+void ThumbnailButton::paintEvent(QPaintEvent* event) {
+    Q_UNUSED(event);
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+
+    const QRect content = rect().adjusted(1, 1, -1, -1);
+    p.fillRect(content, palette().window());
+
+    const int padding = qMax(2, width() / 48);
+    const QRect imgRect = content.adjusted(padding, padding, -padding, -padding);
+    if (m_pixmap.isNull()) {
+        p.setPen(palette().placeholderText().color());
+        p.drawRoundedRect(imgRect, 6, 6);
+        p.drawText(imgRect, Qt::AlignCenter, QStringLiteral("…"));
+    } else {
+        const QPixmap scaled =
+            m_pixmap.scaled(imgRect.size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        p.drawPixmap(imgRect.x() + (imgRect.width() - scaled.width()) / 2,
+                     imgRect.y() + (imgRect.height() - scaled.height()) / 2, scaled);
+    }
+
+    QVector<QPixmap> indicators;
+
+    if (m_image.hasChildren) {
+        indicators.append(assetIcon(QStringLiteral("images.svg")).pixmap(18, 18));
+    }
+
+    if (m_image.localPath.isEmpty() && m_image.isLocal()) {
+        indicators.append(assetIcon(QStringLiteral("file.svg")).pixmap(18, 18));
+    }
+
+    const int s = qMax(18, width() / 18);
+    const int icon_padding = 2;
+
+    for (int i = 0; i < indicators.size(); ++i) {
+        const int x = imgRect.right() - s - icon_padding - (i * (s + icon_padding));
+        const QRect iconRect(x, imgRect.top() + icon_padding, s, s);
+        p.drawPixmap(iconRect, indicators[i]);
+    }
+}
+
+void ThumbnailButton::mousePressEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        emit clicked();
+    }
+    QWidget::mousePressEvent(event);
+}
+
+// SourceBrowser
+
+SourceBrowser::SourceBrowser(Source* source, QWidget* parent) : QWidget(parent), m_source(source) {
+    buildUi();
+}
+
+SourceBrowser::~SourceBrowser() {
+    if (m_viewer)
+        m_viewer->close();
+}
+
+void SourceBrowser::buildUi() {
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(6, 6, 6, 6);
+    root->setSpacing(6);
+
+    // --- Search bar ---
+    auto* bar = new QHBoxLayout();
+    bar->setSpacing(6);
+
+    // Completes the word under the cursor, not just the whole query.
+    m_completer = new QCompleter(this);
+    m_completer->setCaseSensitivity(Qt::CaseInsensitive);
+    m_completer->setCompletionMode(QCompleter::PopupCompletion);
+    m_completer->setFilterMode(Qt::MatchStartsWith);
+    m_completer->setMaxVisibleItems(12);
+    connect(m_completer, QOverload<const QString&>::of(&QCompleter::activated), this,
+            [this](const QString& completion) {
+                const int cursor = m_tagEdit->cursorPosition();
+                const QString text = m_tagEdit->text();
+                int start = cursor;
+                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+                QString updated = text;
+                updated.replace(start, cursor - start, completion);
+                m_tagEdit->setText(updated);
+                m_tagEdit->setCursorPosition(start + completion.size() + 1);
+                m_completer->popup()->hide();
+            });
+
+    m_tagEdit = new QLineEdit(this);
+    m_tagEdit->setPlaceholderText(QStringLiteral("Tags (space separated, -tag to exclude)…"));
+    m_tagEdit->setClearButtonEnabled(true);
+    m_completer->setWidget(m_tagEdit);
+    if (m_completer->popup())
+        m_completer->popup()->installEventFilter(this);
+    m_tagEdit->installEventFilter(this);
+
+    // Use the library's tag list for completions, consistent across tabs.
+    LibrarySource lib_src;
+    refreshCompletions(lib_src.allTagNames());
+    m_tagCategories = lib_src.allTagCategories();
+    connect(m_tagEdit, &QLineEdit::textChanged, this, [this](const QString&) {
+        updateCompletion();
+        updateTagColor();
+    });
+    connect(m_tagEdit, &QLineEdit::cursorPositionChanged, this, [this](int, int) {
+        updateCompletion();
+        updateTagColor();
+    });
+
+    m_searchButton = new QPushButton(QStringLiteral("Search"), this);
+    m_searchButton->setDefault(true);
+
+    // Editable page field: type a number and press Enter to jump.
+    m_pageLabel = new QLineEdit(this);
+    m_pageLabel->setFixedWidth(90);
+    m_pageLabel->setAlignment(Qt::AlignCenter);
+    m_pageLabel->setPlaceholderText(QStringLiteral("page"));
+    m_pageLabel->setToolTip(QStringLiteral("Type a page number and press Enter to jump to it"));
+    connect(m_pageLabel, &QLineEdit::returnPressed, this, [this]() {
+        bool ok = false;
+        const int page = m_pageLabel->text().trimmed().toInt(&ok);
+        if (ok && page >= 1) {
+            m_pageLabel->clear();
+            searchFromPage(page);
+        }
+    });
+
+    m_prevButton = new QPushButton(QStringLiteral("Prev"), this);
+    m_prevButton->setIcon(assetIcon(QStringLiteral("page-up.svg")));
+    m_prevButton->setEnabled(false);
+    m_prevButton->setToolTip(QStringLiteral("Load the previous page of results"));
+
+    m_loadMoreButton = new QPushButton(QStringLiteral("Next"), this);
+    m_loadMoreButton->setIcon(assetIcon(QStringLiteral("page-down.svg")));
+    m_loadMoreButton->setEnabled(false);
+    m_loadMoreButton->setToolTip(QStringLiteral("Load the next page of results"));
+
+    bar->addWidget(m_tagEdit, 1);
+    bar->addWidget(m_searchButton);
+    bar->addWidget(m_pageLabel);
+    bar->addWidget(m_prevButton);
+    bar->addWidget(m_loadMoreButton);
+
+    // Wrapped in a widget so it can be hidden wholesale.
+    auto* barWidget = new QWidget(this);
+    barWidget->setContentsMargins(0, 0, 0, 0);
+    barWidget->setLayout(bar);
+    m_searchBar = barWidget;
+    root->addWidget(barWidget);
+
+    connect(m_searchButton, &QPushButton::clicked, this, &SourceBrowser::onSearchClicked);
+    connect(m_tagEdit, &QLineEdit::returnPressed, this, &SourceBrowser::onSearchClicked);
+    connect(m_prevButton, &QPushButton::clicked, this, &SourceBrowser::onLoadPrevClicked);
+    connect(m_loadMoreButton, &QPushButton::clicked, this, &SourceBrowser::onLoadMoreClicked);
+
+    // --- Thumbnail grid ---
+    m_gridContainer = new QWidget();
+    m_gridContainer->setContentsMargins(0, 0, 0, 0);
+    m_gridContainer->setAutoFillBackground(true);
+    m_gridContainer->setPalette(palette());
+    auto* gridLayout = new FlowLayout(m_gridContainer, 0, 1, 1);
+    gridLayout->setItemSizeRange(220);
+    m_gridContainer->setLayout(gridLayout);
+    m_gridLayout = gridLayout;
+
+    m_gridScroll = new QScrollArea(this);
+    m_gridScroll->setFrameShape(QFrame::NoFrame);
+    m_gridScroll->setWidgetResizable(true);
+    m_gridScroll->setWidget(m_gridContainer);
+    m_gridScroll->viewport()->installEventFilter(this);
+    root->addWidget(m_gridScroll, 1);
+
+    // Shown when a search finished without results.
+    m_emptyLabel = new QLabel(QStringLiteral("(nothing to show)"), m_gridScroll);
+    m_emptyLabel->setAlignment(Qt::AlignCenter);
+    m_emptyLabel->hide();
+
+    connect(m_gridScroll->verticalScrollBar(), &QScrollBar::valueChanged, this,
+            &SourceBrowser::onGridScrolled);
+
+    // Debounced thumbnail RAM recycling while scrolling.
+    m_recycleTimer = new QTimer(this);
+    m_recycleTimer->setSingleShot(true);
+    m_recycleTimer->setInterval(200);
+    connect(m_recycleTimer, &QTimer::timeout, this, &SourceBrowser::recycleThumbnails);
+}
+
+void SourceBrowser::setMinCreatedAt(qint64 unixSeconds) { m_minCreatedAt = unixSeconds; }
+
+void SourceBrowser::setBlacklist(const QStringList& tags) { m_blacklist = tags; }
+
+QString SourceBrowser::tags() const { return m_tagEdit->text().trimmed(); }
+
+void SourceBrowser::setTags(const QString& tags) { m_tagEdit->setText(tags); }
+
+void SourceBrowser::setSearchBarVisible(bool visible) {
+    if (m_searchBar)
+        m_searchBar->setVisible(visible);
+}
+
+void SourceBrowser::search() { runSearch(1, FetchMode::Replace); }
+
+void SourceBrowser::searchFromPage(int page) { runSearch(qMax(1, page), FetchMode::Replace); }
+
+void SourceBrowser::onSearchClicked() { runSearch(1, FetchMode::Replace); }
+
+void SourceBrowser::onLoadMoreClicked() { runSearch(m_nextPage, FetchMode::Append); }
+
+void SourceBrowser::onLoadPrevClicked() {
+    if (m_firstPage > 1)
+        runSearch(m_firstPage - 1, FetchMode::Prepend);
+}
+
+void SourceBrowser::applyGridSettings(int maxSize, int spacing) {
+    if (!m_gridLayout)
+        return;
+    m_gridLayout->setItemSizeRange(qMax(100, maxSize));
+    m_gridLayout->setSpacing(spacing);
+    m_gridLayout->invalidate();
+}
+
+void SourceBrowser::onGridScrolled() {
+    if (!m_searching && !m_exhausted && !m_images.isEmpty()) {
+        QScrollBar* bar = m_gridScroll->verticalScrollBar();
+        if (bar->maximum() - bar->value() <= kPrefetchPx) {
+            runSearch(m_nextPage, FetchMode::Append);
+        }
+    }
+
+    // Unload far-scrolled thumbnails, debounced.
+    if (m_recycleTimer)
+        m_recycleTimer->start();
+}
+
+void SourceBrowser::runSearch(int page, FetchMode mode) {
+    if (m_searching)
+        return;
+    m_searching = true;
+
+    // Stamp page counters immediately so saveState() persists the right
+    // page while the fetch is still in flight.
+    if (mode == FetchMode::Replace) {
+        m_page = page;
+        m_firstPage = page;
+        m_nextPage = page + 1;
+    }
+
+    updateEmptyLabel();
+
+    m_searchButton->setEnabled(false);
+    m_prevButton->setEnabled(false);
+    m_loadMoreButton->setEnabled(false);
+    emit statusChanged(
+        QStringLiteral("Loading page %1 from %2…").arg(page).arg(m_source->displayName()));
+
+    SourceQuery query;
+    query.tags = m_tagEdit->text().trimmed();
+    for (const QString& tag : m_blacklist) query.tags += QStringLiteral(" -") + tag;
+    query.page = page;
+    query.limit = kPageSize;
+
+    QPointer<SourceBrowser> self(this);
+    Source* source = m_source;
+    const auto future = QtConcurrent::run([self, source, query, page, mode]() {
+        const SourceResult result = source->search(query);
+        if (self) {
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self, result, page, mode]() {
+                    if (!self)
+                        return;
+                    self->appendResult(result, mode, page);
+                },
+                Qt::QueuedConnection);
+        }
+    });
+    Q_UNUSED(future);
+}
+
+void SourceBrowser::appendResult(const SourceResult& result, FetchMode mode, int page) {
+    m_searching = false;
+    m_searchButton->setEnabled(true);
+
+    if (!result.ok) {
+        // Keep page counters across an HTTP error.
+        emit statusChanged(QStringLiteral("Search failed: %1").arg(result.error));
+        m_prevButton->setEnabled(m_firstPage > 1);
+        m_loadMoreButton->setEnabled(!m_exhausted);
+        m_pageLabel->setPlaceholderText(
+            m_page > 0 ? QStringLiteral("pages %1–%2").arg(m_firstPage).arg(m_page)
+                       : QStringLiteral("page"));
+        updateEmptyLabel();
+        return;
+    }
+
+    if (mode == FetchMode::Replace)
+        clearGrid();
+
+    // Keep the viewport stable when prepending.
+    QScrollBar* bar = m_gridScroll->verticalScrollBar();
+    const int oldHeight = m_gridContainer->height();
+    const int oldScroll = bar->value();
+
+    auto* layout = m_gridContainer->layout();
+    int insertAt = (mode == FetchMode::Prepend) ? 0 : m_thumbnails.size();
+
+    for (const SourceImage& img : result.images) {
+        if (img.previewUrl.isEmpty() && img.sampleUrl.isEmpty() && img.localPath.isEmpty()) {
+            continue;
+        }
+        // Exact Favorites cutoff on top of the day-granular date: metatag.
+        if (m_minCreatedAt > 0 && img.createdAt > 0 && img.createdAt < m_minCreatedAt) {
+            continue;
+        }
+
+        auto* thumb = new ThumbnailButton(img, m_gridContainer);
+        if (mode == FetchMode::Prepend) {
+            m_images.prepend(img);
+            m_thumbnails.prepend(thumb);
+            if (auto* flow = qobject_cast<FlowLayout*>(layout))
+                flow->insertWidget(insertAt++, thumb);
+            else
+                layout->addWidget(thumb);
+        } else {
+            m_images.append(img);
+            m_thumbnails.append(thumb);
+            layout->addWidget(thumb);
+        }
+        // Resolve the index at click time so prepending never stales it.
+        connect(thumb, &ThumbnailButton::clicked, this,
+                [this, thumb]() { openViewer(m_thumbnails.indexOf(thumb)); });
+    }
+
+    if (mode == FetchMode::Replace) {
+        m_firstPage = page;
+        m_page = page;
+    } else if (mode == FetchMode::Prepend) {
+        m_firstPage = qMin(m_firstPage > 0 ? m_firstPage : page, page);
+    } else {
+        m_page = qMax(m_page, page);
+    }
+
+    if (mode == FetchMode::Prepend) {
+        m_gridContainer->updateGeometry();
+        m_gridContainer->adjustSize();
+        bar->setValue(oldScroll + (m_gridContainer->height() - oldHeight));
+    }
+
+    // A short page means no more results.
+    const int pageSize = result.pageLimit > 0 ? result.pageLimit : kPageSize;
+    m_exhausted = result.images.isEmpty() || result.images.size() < pageSize;
+    m_nextPage = m_page + 1;
+    m_prevPage = qMax(0, m_firstPage - 1);
+    m_prevButton->setEnabled(m_firstPage > 1);
+    m_loadMoreButton->setEnabled(!m_exhausted);
+    m_pageLabel->setPlaceholderText(QStringLiteral("pages %1–%2").arg(m_firstPage).arg(m_page));
+
+    QString status = QStringLiteral("%1: %2 image(s) loaded (pages %3–%4)")
+                         .arg(m_source->displayName())
+                         .arg(m_images.size())
+                         .arg(m_firstPage)
+                         .arg(m_page);
+    if (!result.warning.isEmpty())
+        status += QStringLiteral(" — %1").arg(result.warning);
+    emit statusChanged(status);
+
+    // Deferred one event-loop tick: geometries are only final after the
+    // layout pass.
+    m_gridContainer->updateGeometry();
+    QTimer::singleShot(0, this, [this]() { loadNearbyThumbnails(); });
+
+    updateEmptyLabel();
+}
+
+void SourceBrowser::updateEmptyLabel() {
+    if (!m_emptyLabel)
+        return;
+    m_emptyLabel->setVisible(!m_searching && m_images.isEmpty() && m_page > 0);
+    m_emptyLabel->raise();
+}
+
+void SourceBrowser::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    if (m_emptyLabel && m_gridScroll)
+        m_emptyLabel->setGeometry(m_gridScroll->rect());
+}
+
+void SourceBrowser::clearGrid() {
+    for (ThumbnailButton* t : m_thumbnails) {
+        t->deleteLater();
+    }
+    m_thumbnails.clear();
+    m_images.clear();
+    m_previewInFlight.clear();
+    m_firstPage = 0;
+    m_prevPage = 0;
+    m_page = 0;
+    m_nextPage = 1;
+    m_exhausted = false;
+    m_pageLabel->clear();
+    m_pageLabel->setPlaceholderText(QStringLiteral("page"));
+    updateEmptyLabel();
+}
+
+void SourceBrowser::openViewer(int index) {
+    if (index < 0 || index >= m_images.size())
+        return;
+    // One viewer window per tab, reused across posts.
+    if (!m_viewer) {
+        m_viewer = new ViewerWindow(m_source, m_images, index);
+        m_viewer->setAttribute(Qt::WA_DeleteOnClose);
+        connect(m_viewer, &QObject::destroyed, this, [this]() { m_viewer = nullptr; });
+        connect(m_viewer, &ViewerWindow::tagSearchRequested, this,
+                [this](const QString& tag) { emit tagSearchRequested(tag, m_source->id()); });
+    } else {
+        m_viewer->setImages(m_source, m_images, index);
+    }
+    m_viewer->show();
+    m_viewer->raise();
+    m_viewer->activateWindow();
+}
+
+void SourceBrowser::closeViewerWindow() {
+    if (m_viewer) {
+        m_viewer->close();
+        m_viewer = nullptr;
+    }
+}
+
+void SourceBrowser::requestPreview(const SourceImage& image) {
+    if (image.md5.isEmpty())
+        return;
+    if (m_previewInFlight.contains(image.md5))
+        return;
+    m_previewInFlight.insert(image.md5);
+
+    // Fetch off the UI thread; decoded previews are cached on disk. QImage
+    // here - QPixmap is GUI-thread only.
+    QPointer<SourceBrowser> self(this);
+    Source* source = m_source;
+    const QString md5 = image.md5;
+    const QString cacheDir = thumbCacheDir();
+    const auto future = QtConcurrent::run([self, source, image, md5, cacheDir]() {
+        QImage decoded;
+        const QString cachePath = cacheDir + QLatin1Char('/') + md5 + QLatin1String(".jpg");
+
+        if (!decoded.load(cachePath)) {
+            if (QFileInfo::exists(cachePath))
+                QFile::remove(cachePath);
+
+            const FileKind kind =
+                !image.previewUrl.isEmpty() ? FileKind::Preview : FileKind::Sample;
+            const QByteArray bytes = source->fetch(image, kind);
+            if (!decoded.loadFromData(bytes)) {
+                QString ext = QFileInfo(image.localPath).suffix().toLower();
+                if (ext.isEmpty()) {
+                    ext = image.format.toLower();
+                }
+                if (!ext.isEmpty()) {
+                    QTemporaryFile tmp(QDir::tempPath() + QLatin1String("/Mosaic-thumb-XXXXXX.") +
+                                       ext);
+                    if (tmp.open()) {
+                        tmp.write(bytes);
+                        tmp.flush();
+                        tmp.close();
+                        Mosaic::VideoDecoder decoder;
+                        if (decoder.open(tmp.fileName())) {
+                            const Mosaic::VideoDecoder::Frame frame = decoder.nextFrame();
+                            if (!frame.image.isNull()) {
+                                decoded = frame.image;
+                            } else {
+                                qDebug() << "SourceBrowser::requestPreview: VideoDecoder returned "
+                                            "no frame for"
+                                         << md5;
+                            }
+                        } else {
+                            qDebug() << "SourceBrowser::requestPreview: VideoDecoder failed to "
+                                        "open"
+                                     << tmp.fileName();
+                        }
+                    } else {
+                        qDebug() << "SourceBrowser::requestPreview: failed to create temp "
+                                    "thumbnail file"
+                                 << tmp.fileName();
+                    }
+                }
+            }
+
+            if (!decoded.isNull()) {
+                QDir().mkpath(cacheDir);
+                decoded.save(cachePath, "JPG", 80);
+            }
+        }
+
+        if (self) {
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self, md5, decoded]() {
+                    if (!self)
+                        return;
+                    self->m_previewInFlight.remove(md5);
+                    const QPixmap pixmap =
+                        decoded.isNull() ? QPixmap() : QPixmap::fromImage(decoded);
+                    for (ThumbnailButton* t : self->m_thumbnails) {
+                        if (t->image().md5 == md5) {
+                            if (!pixmap.isNull())
+                                t->setPixmap(pixmap);
+                            break;
+                        }
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+    });
+    Q_UNUSED(future);
+}
+
+void SourceBrowser::recycleThumbnails() {
+    if (!m_gridScroll || m_thumbnails.isEmpty())
+        return;
+
+    // Visible part of the grid in container coordinates.
+    const QRect visible(-m_gridContainer->pos(), m_gridScroll->viewport()->size());
+    const QRect keep =
+        visible.adjusted(-kRecycleMargin, -kRecycleMargin, kRecycleMargin, kRecycleMargin);
+
+    for (ThumbnailButton* t : m_thumbnails) {
+        const bool near = keep.intersects(t->geometry());
+        if (!near && t->hasPixmap()) {
+            t->releasePixmap();
+        } else if (near && !t->hasPixmap()) {
+            requestPreview(t->image());
+        }
+    }
+}
+
+void SourceBrowser::loadNearbyThumbnails() {
+    if (!m_gridScroll || m_thumbnails.isEmpty())
+        return;
+
+    const QRect visible(-m_gridContainer->pos(), m_gridScroll->viewport()->size());
+    const QRect keep =
+        visible.adjusted(-kRecycleMargin, -kRecycleMargin, kRecycleMargin, kRecycleMargin);
+
+    for (ThumbnailButton* t : m_thumbnails) {
+        if (!t)
+            continue;
+        const bool near = keep.intersects(t->geometry());
+        if (near && !t->hasPixmap()) {
+            requestPreview(t->image());
+        } else if (!near && t->hasPixmap()) {
+            t->releasePixmap();
+        }
+    }
+}
+
+void SourceBrowser::refreshCompletions(const QStringList& tagNames) {
+    m_completer->setModel(new QStringListModel(tagNames, m_completer));
+}
+
+bool SourceBrowser::eventFilter(QObject* watched, QEvent* event) {
+    // Tab accepts the completer's highlighted item.
+    if (m_completer && watched == m_completer->popup() && event->type() == QEvent::KeyPress) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Tab) {
+            QString completion;
+            const QModelIndex idx = m_completer->popup()->currentIndex();
+            if (idx.isValid())
+                completion = idx.data().toString();
+            if (completion.isEmpty())
+                completion = m_completer->currentCompletion();
+            if (completion.isEmpty() && m_completer->completionCount() == 1)
+                completion = m_completer->completionModel()->index(0, 0).data().toString();
+            if (!completion.isEmpty()) {
+                const int cursor = m_tagEdit->cursorPosition();
+                const QString text = m_tagEdit->text();
+                int start = cursor;
+                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+                QString updated = text;
+                updated.replace(start, cursor - start, completion);
+                m_tagEdit->setText(updated);
+                m_tagEdit->setCursorPosition(start + completion.size() + 1);
+            }
+            m_completer->popup()->hide();
+            m_tagEdit->setFocus();
+            return true;
+        }
+    }
+
+    if (watched == m_tagEdit && event->type() == QEvent::KeyPress) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Tab) {
+            QString completion;
+            if (m_completer && m_completer->popup() && m_completer->popup()->isVisible()) {
+                const QModelIndex idx = m_completer->popup()->currentIndex();
+                if (idx.isValid())
+                    completion = idx.data().toString();
+            }
+            if (completion.isEmpty() && m_completer) {
+                completion = m_completer->currentCompletion();
+                if (completion.isEmpty() && m_completer->completionCount() == 1) {
+                    completion = m_completer->completionModel()->index(0, 0).data().toString();
+                }
+            }
+            if (!completion.isEmpty()) {
+                const int cursor = m_tagEdit->cursorPosition();
+                const QString text = m_tagEdit->text();
+                int start = cursor;
+                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+                QString updated = text;
+                updated.replace(start, cursor - start, completion);
+                m_tagEdit->setText(updated);
+                m_tagEdit->setCursorPosition(start + completion.size() + 1);
+            }
+            return true;
+        }
+    }
+
+    // Fullscreen fix, 'virtual' scroll if no scrollbar.
+    if (m_gridScroll && watched == m_gridScroll->viewport() && event->type() == QEvent::Wheel) {
+        auto* wheel = static_cast<QWheelEvent*>(event);
+        QScrollBar* bar = m_gridScroll->verticalScrollBar();
+        const bool noScrollbar = bar->maximum() <= bar->minimum();
+        const bool nearBottom = bar->maximum() - bar->value() <= kPrefetchPx;
+        if (wheel->angleDelta().y() < 0 && (noScrollbar || nearBottom)) {
+            if (!m_searching && !m_exhausted && !m_images.isEmpty()) {
+                runSearch(m_nextPage, FetchMode::Append);
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void SourceBrowser::updateCompletion() {
+    // Complete the word under the cursor.
+    const QString text = m_tagEdit->text();
+    const int cursor = m_tagEdit->cursorPosition();
+
+    int start = cursor;
+    while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+
+    QString token = text.mid(start, cursor - start);
+    if (token.startsWith(QLatin1Char('-')))
+        token.remove(0, 1);
+
+    if (token.isEmpty()) {
+        if (m_completer->popup())
+            m_completer->popup()->hide();
+        return;
+    }
+
+    m_completer->setCompletionPrefix(token);
+    if (m_completer->completionCount() > 0) {
+        QRect rect = m_tagEdit->rect();
+        const int leftX =
+            m_tagEdit->fontMetrics().horizontalAdvance(text.left(start)) + m_tagEdit->rect().left();
+        rect.setLeft(leftX);
+        m_completer->complete(rect);
+    } else if (m_completer->popup()) {
+        m_completer->popup()->hide();
+    }
+}
+
+void SourceBrowser::updateTagColor() {
+    if (!m_tagEdit)
+        return;
+
+    const QString text = m_tagEdit->text();
+    const int cursor = m_tagEdit->cursorPosition();
+
+    int start = cursor;
+    while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+    int end = cursor;
+    while (end < text.size() && text.at(end) != QLatin1Char(' ')) ++end;
+
+    QString token = text.mid(start, end - start);
+    if (token.startsWith(QLatin1Char('-')))
+        token.remove(0, 1);
+
+    // Qualified "usergroup:favorite" terms color by their group.
+    QString category;
+    const int colon = token.indexOf(QLatin1Char(':'));
+    if (colon > 0) {
+        const QString group = token.left(colon).toLower();
+        if (group == QLatin1String("artist") || group == QLatin1String("character") ||
+            group == QLatin1String("species") || group == QLatin1String("meta") ||
+            group == QLatin1String("model") || group == QLatin1String("usergroup")) {
+            category = group;
+        }
+    }
+    if (category.isEmpty())
+        category = m_tagCategories.value(token.toLower());
+
+    // Stylesheet colors the text via the MosaicTagColor property.
+    m_tagEdit->setProperty("MosaicTagColor", category.isEmpty() ? QVariant() : QVariant(category));
+    if (m_tagEdit->style()) {
+        m_tagEdit->style()->unpolish(m_tagEdit);
+        m_tagEdit->style()->polish(m_tagEdit);
+    }
+}
+
+}  // namespace Mosaic

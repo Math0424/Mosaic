@@ -1,0 +1,39 @@
+#pragma once
+
+#include <QString>
+#include "Database.h"
+
+namespace Mosaic {
+
+// Catalog schema for the Mosaic image library.
+
+// Flat library: files are copied into one folder named by MD5; the catalog
+// is the source of truth. Image primary key is the MD5 hash. Tags are
+// normalized (tags dictionary + image_tags junction) so tag filtering is a
+// cheap indexed join and renames/merges touch one row. Parent/child lives
+// directly on images.parent_id.
+namespace Schema {
+
+// Bump when ddlStatements() changes. Migrations are additive (IF NOT EXISTS).
+constexpr int kVersion = 2;
+
+enum class TagCategory {
+    General,
+    Artist,
+    Character,
+    Species,
+    Meta,
+    Model,
+    UserGroup,
+};
+
+QString categoryToString(TagCategory c);
+
+bool isCategoryName(const QString& name);
+
+// Creates all catalog tables if missing and records the schema version.
+bool ensureSchema(DbConnection& conn, QString* error);
+
+}  // namespace Schema
+
+}  // namespace Mosaic

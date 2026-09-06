@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Windows Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "publish",
+      "displayName": "Windows MinSize Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/publish",
+      "cacheVariables": {
+        "PUBLISH_NO_CONSOLE": "ON",
+        "CMAKE_BUILD_TYPE": "MinSizeRel",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "OFF",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
+        "CMAKE_C_FLAGS_MINSIZEREL": "/O1 /Ob1 /DNDEBUG",
+        "CMAKE_CXX_FLAGS_MINSIZEREL": "/O1 /Ob1 /DNDEBUG",
+        "CMAKE_EXE_LINKER_FLAGS_MINSIZEREL": "/OPT:REF /OPT:ICF",
+        "CMAKE_SHARED_LINKER_FLAGS_MINSIZEREL": "/OPT:REF /OPT:ICF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "publish",
+      "configurePreset": "publish"
+    }
+  ]
+}

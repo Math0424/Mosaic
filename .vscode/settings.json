@@ -1,0 +1,18 @@
+{
+    "cmake.configureOnOpen": false,
+    "clang-format.style": "file",
+    "C_Cpp.clang_format_fallbackStyle": "Google",
+    "editor.formatOnSave": true,
+    "[cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools"
+    },
+    "files.associations": {
+        "*.h": "cpp",
+        "*.hpp": "cpp"
+    },
+    "C_Cpp.default.cppStandard": "c++20",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/dev/compile_commands.json"
+}

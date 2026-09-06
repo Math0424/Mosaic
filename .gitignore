@@ -1,0 +1,33 @@
+# Build outputs
+build/
+out/
+
+# Installer output (Inno Setup)
+build/installer/
+
+# Local CMake overrides (e.g. custom Qt path)
+CMakeUserPresets.json
+
+# IDE / editor
+.vs/
+.idea/
+*.user
+*.suo
+
+Thumbs.db
+Desktop.ini
+.DS_Store
+# Preprocessor dumps / intermediates
+*.i
+*.obj
+*.pdb
+*.ilk
+
+third_party/libs/duckdb/**
+third_party/libs/opencv/**
+third_party/libs/ffmpeg/**
+third_party/libs/onnxruntime/**
+!third_party/libs/ffmpeg/README.md
+!third_party/libs/onnxruntime/README.md
+
+TODO.md

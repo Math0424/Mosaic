@@ -1,0 +1,31 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "dev-local",
+      "displayName": "Windows Debug (custom Qt)",
+      "inherits": "dev",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "D:/Qt/6.11.1/msvc2022_64"
+      }
+    },
+    {
+      "name": "publish-local",
+      "displayName": "Windows MinSize Release (custom Qt)",
+      "inherits": "publish",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "D:/Qt/6.11.1/msvc2022_64"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev-local",
+      "configurePreset": "dev-local"
+    },
+    {
+      "name": "publish-local",
+      "configurePreset": "publish-local"
+    }
+  ]
+}
