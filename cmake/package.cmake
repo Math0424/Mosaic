@@ -83,7 +83,7 @@ add_custom_target(package
         "$<TARGET_FILE_DIR:Mosaic>"
         "${PACKAGE_BIN}/"
 
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${PACKAGE_BIN}/assets"r
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${PACKAGE_BIN}/assets"
 
     # -----------------------------------------------------------------------
     # Assets
