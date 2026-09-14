@@ -28,7 +28,7 @@ namespace Mosaic {
 
 namespace {
 
-constexpr int kBatchSize = 10;
+constexpr int kBatchSize = 15;
 constexpr qint64 kSkipMs = 1500;
 constexpr qint64 kFullWatchMs = 8000;
 constexpr qint64 kAbandonMs = 60000;

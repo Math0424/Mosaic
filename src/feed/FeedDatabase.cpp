@@ -88,10 +88,10 @@ QByteArray unpackHalf(const QByteArray& fp16) {
 QReadWriteLock s_lock;
 
 // Nothing repeats within the last N shown posts; older history is pruned.
-constexpr qint64 kNoRepeatWindow = 5000;
+constexpr qint64 kNoRepeatWindow = 10000;
 
-constexpr qint64 kMaxImpressionEvents = 2000;
-constexpr qint64 kMaxInteractionEvents = 5000;
+constexpr qint64 kMaxImpressionEvents = 3000;
+constexpr qint64 kMaxInteractionEvents = 10000;
 
 // Interaction weights.
 constexpr double kWeightFavorite = 1.00;
@@ -107,16 +107,16 @@ constexpr double kQuickSkipSeconds = 1.5;
 
 // Taste model constants.
 constexpr double kNewTasteThreshold = 0.30;
-constexpr double kTasteLearningRate = 0.25;
+constexpr double kTasteLearningRate = 0.27;
 constexpr int kMaxTastes = 12;
 constexpr int kMinTasteTags = 3;
 // Tag summary is just a hint/query seed; the visual vector is the main
 // representation, so prune to the strongest K tags.
-constexpr int kTasteTagLimit = 10;
+constexpr int kTasteTagLimit = 15;
 // Positive strength deltas shrink toward this ceiling.
 constexpr double kStrengthCeiling = 12.0;
-constexpr double kTasteHalfLifeDays = 120.0;
-constexpr double kExposureHalfLifeDays = 7.0;
+constexpr double kTasteHalfLifeDays = 60.0;
+constexpr double kExposureHalfLifeDays = 3.0;
 constexpr double kConfidenceRamp = 3.0;
 
 // Negative model constants. Hard negatives are deliberately SLOW to learn:

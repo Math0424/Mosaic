@@ -24,8 +24,8 @@ namespace Mosaic {
 namespace {
 
 // Ranking coefficients.
-constexpr double kUserSimWeight = 0.45;
-constexpr double kSessionSimWeight = 0.15;
+constexpr double kUserSimWeight = 0.35;
+constexpr double kSessionSimWeight = 0.2;
 constexpr double kTagPrefWeight = 0.10;
 constexpr double kFavOverlapWeight = 0.15;
 constexpr double kFreshnessWeight = 0.05;
@@ -52,7 +52,7 @@ double sessionBlendFor(int skipStreak) {
 constexpr double kMmrLambda = 0.75;
 
 // Exploration floor: minimum fraction of exploration candidates per batch.
-constexpr double kExplorationFloor = 0.10;
+constexpr double kExplorationFloor = 0.15;
 
 // Quality floor: minimum site score.
 constexpr int kMinPostScore = 2;
