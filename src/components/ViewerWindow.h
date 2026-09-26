@@ -47,6 +47,7 @@ class ViewerWindow : public QWidget {
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
    signals:
@@ -101,6 +102,8 @@ class ViewerWindow : public QWidget {
 
     void setInfo(const SourceImage& image);
     void updateSidebars();
+    void updateAnimatedBadge();
+    void placeAnimatedBadge();
     void updateFavoriteButton();
     bool currentIsLocal() const;
 
@@ -137,6 +140,7 @@ class ViewerWindow : public QWidget {
     QStackedWidget* m_mediaStack = nullptr;
     ViewerWidget* m_viewer = nullptr;
     QLabel* m_gifLabel = nullptr;
+    QLabel* m_animatedBadge = nullptr;  // "animated" overlay on media
     QLabel* m_infoLabel = nullptr;
     QLabel* m_statusLabel = nullptr;
 

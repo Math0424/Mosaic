@@ -100,7 +100,7 @@ void TagSidebar::buildUi() {
 }
 
 bool TagSidebar::eventFilter(QObject* watched, QEvent* event) {
-    if (event->type() == QEvent::MouseButtonDblClick) {
+    if (event->type() == QEvent::MouseButtonPress) {
         if (auto* widget = qobject_cast<QWidget*>(watched);
             widget && m_tagLabels.contains(widget)) {
             emit tagSearchRequested(m_tagLabels.value(widget));

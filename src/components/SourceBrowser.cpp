@@ -47,6 +47,19 @@ constexpr int kRecycleMargin = 800;  ///< keep decoded thumbs this far beyond th
 // On-disk thumbnail cache folder.
 QString thumbCacheDir() { return QDir(Paths::tempDir()).filePath(QStringLiteral("thumbcache")); }
 
+bool isAnimatedFormat(const SourceImage& img) {
+    QString f = img.format.toLower();
+    if (f.isEmpty() && !img.localPath.isEmpty())
+        f = QFileInfo(img.localPath).suffix().toLower();
+    static const QStringList animated = {
+        QStringLiteral("gif"),  QStringLiteral("webm"), QStringLiteral("mp4"),
+        QStringLiteral("mov"),  QStringLiteral("mkv"),  QStringLiteral("avi"),
+        QStringLiteral("m4v"),  QStringLiteral("apng"), QStringLiteral("swf"),
+        QStringLiteral("webp"),
+    };
+    return animated.contains(f);
+}
+
 }  // namespace
 
 // Thumbnail
@@ -86,6 +99,10 @@ void ThumbnailButton::paintEvent(QPaintEvent* event) {
     }
 
     QVector<QPixmap> indicators;
+
+    if (isAnimatedFormat(m_image)) {
+        indicators.append(assetIcon(QStringLiteral("play.svg")).pixmap(18, 18));
+    }
 
     if (m_image.hasChildren) {
         indicators.append(assetIcon(QStringLiteral("images.svg")).pixmap(18, 18));

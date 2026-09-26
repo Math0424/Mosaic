@@ -235,6 +235,15 @@ void ViewerWindow::buildUi() {
     m_mediaStack->addWidget(m_viewer);
     centerLayout->addWidget(m_mediaStack, 1);
 
+    m_animatedBadge = new QLabel(m_mediaStack);
+    m_animatedBadge->setText(QStringLiteral("▶ animated"));
+    m_animatedBadge->setStyleSheet(
+        QStringLiteral("QLabel { background: rgba(20,20,24,190); color: #e8e9ec;"
+                       " border-radius: 6px; padding: 3px 8px; font-weight: bold; }"));
+    m_animatedBadge->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_animatedBadge->adjustSize();
+    m_animatedBadge->hide();
+
     m_videoControls = new QWidget(center);
     auto* videoLayout = new QHBoxLayout(m_videoControls);
     videoLayout->setContentsMargins(0, 0, 0, 0);
@@ -394,6 +403,7 @@ void ViewerWindow::showAt(int index) {
     m_chainStack.clear();
     m_current = m_images.at(index);
     m_animatedMedia = false;
+    updateAnimatedBadge();
     if (m_loupe)
         hideLoupe();
 
@@ -869,6 +879,25 @@ ViewerWindow::MediaKind ViewerWindow::mediaKindOf(const SourceImage& image) cons
     return MediaKind::Image;
 }
 
+void ViewerWindow::placeAnimatedBadge() {
+    if (!m_animatedBadge)
+        return;
+    m_animatedBadge->adjustSize();
+    m_animatedBadge->move(m_mediaStack->width() - m_animatedBadge->width() - 10, 10);
+    m_animatedBadge->raise();
+}
+
+void ViewerWindow::updateAnimatedBadge() {
+    m_animatedBadge->setVisible(m_animatedMedia);
+    if (m_animatedMedia)
+        placeAnimatedBadge();
+}
+
+void ViewerWindow::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    placeAnimatedBadge();
+}
+
 void ViewerWindow::deliverMedia(const QByteArray& bytes) {
     m_loading = false;
     m_statusLabel->clear();
@@ -891,6 +920,7 @@ void ViewerWindow::deliverMedia(const QByteArray& bytes) {
         if (!frame.image.isNull()) {
             m_animatedMedia = false;
             m_viewer->showImage(frame.image);
+            updateAnimatedBadge();
             return;
         }
     }
@@ -942,7 +972,9 @@ void ViewerWindow::showImageBytes(const QByteArray& bytes) {
     }
     m_currentMediaFile.clear();
     m_mediaStack->setCurrentWidget(m_viewer);
+    m_animatedMedia = false;
     m_viewer->showImage(image);
+    updateAnimatedBadge();
 }
 
 void ViewerWindow::showGifPath(const QString& path) {
@@ -957,6 +989,7 @@ void ViewerWindow::showGifPath(const QString& path) {
     }
     m_animatedMedia = true;
     m_mediaStack->setCurrentWidget(m_viewer);
+    updateAnimatedBadge();
     connect(m_gif, &QMovie::frameChanged, this, [this](int) {
         if (!m_gif)
             return;
@@ -977,6 +1010,8 @@ void ViewerWindow::showVideoPath(const QString& path) {
     auto* decoder = new VideoDecoder();
     if (!decoder->open(path)) {
         delete decoder;
+        m_animatedMedia = false;
+        updateAnimatedBadge();
         m_statusLabel->setText(QStringLiteral("Cannot decode video"));
         return;
     }
@@ -999,6 +1034,7 @@ void ViewerWindow::startVideoPlayback(VideoDecoder* decoder) {
     m_mediaStack->setCurrentWidget(m_viewer);
     m_playback->setVolume(m_volumeSlider->value());
     m_playback->start(decoder);
+    updateAnimatedBadge();
 
     const qint64 duration = m_playback->durationMs();
     m_progress->setRange(0,
