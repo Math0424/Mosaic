@@ -967,6 +967,10 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
     filtered.reserve(candidates.size());
     // Per-reason drop counters, logged below.
     int dropNoMd5 = 0, dropDup = 0, dropShown = 0, dropAnimated = 0, dropScore = 0, dropHardNeg = 0;
+    auto recordDrop = [&](const SourceImage& img, const QString& reason) {
+        if (funnel.dropped.size() < 60)
+            funnel.dropped.append({img, reason});
+    };
     for (const Candidate& c : candidates) {
         const SourceImage& img = c.image;
         if (img.md5.isEmpty()) {
@@ -975,18 +979,22 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
         }
         if (seen.contains(img.md5)) {
             ++dropDup;
+            recordDrop(img, "dup");
             continue;
         }
         if (m_db.wasShown(img.md5)) {
             ++dropShown;
+            recordDrop(img, "shown");
             continue;
         }
         if (isAnimated(img)) {
             ++dropAnimated;
+            recordDrop(img, "animated");
             continue;
         }
         if (img.score < kMinPostScore) {
             ++dropScore;
+            recordDrop(img, QStringLiteral("lowScore (%1 < %2)").arg(img.score).arg(kMinPostScore));
             continue;
         }
         if (!hardNegs.isEmpty()) {
@@ -999,6 +1007,13 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
             }
             if (hasNeg) {
                 ++dropHardNeg;
+                QStringList hit;
+                for (const SourceTag& t : img.tags) {
+                    const QString name = t.name.trimmed().toLower();
+                    if (hardNegs.contains(name))
+                        hit << name;
+                }
+                recordDrop(img, QStringLiteral("hardNeg: %1").arg(hit.join(QStringLiteral(", "))));
                 continue;
             }
         }

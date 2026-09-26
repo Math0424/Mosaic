@@ -82,11 +82,15 @@ SourceResult R34Source::search(const SourceQuery& query) {
         if (img.md5.isEmpty())
             continue;
 
-        const QStringList tags = m.captured(QStringLiteral("tags"))
-                                     .simplified()
-                                     .split(QLatin1Char(' '), Qt::SkipEmptyParts);
-        for (const QString& tag : tags)
-            img.tags.append(SourceTag{tag.toLower(), QStringLiteral("general")});
+        // rule34.us titles are comma-separated with underscores for spaces.
+        QStringList tags;
+        for (QString tag :
+             m.captured(QStringLiteral("tags")).split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+            tag = tag.trimmed().toLower().replace(QLatin1Char(' '), QLatin1Char('_'));
+            if (!tag.isEmpty())
+                tags << tag;
+        }
+        for (const QString& tag : tags) img.tags.append(SourceTag{tag, QStringLiteral("general")});
 
         // The derived file URL is unreliable (the real file can have a
         // different extension than the thumbnail, e.g. .jpeg vs .jpg), so

@@ -4,20 +4,31 @@
 #include "EmbeddingBackend.h"
 #include "FeedRecommender.h"
 #include "../core/AppState.h"
+#include "../core/Paths.h"
+#include "../components/FlowLayout.h"
 #include "../components/Icons.h"
+#include "../components/SourceBrowser.h"
 #include "../components/TagSidebar.h"
+#include "../components/ViewerWindow.h"
 #include "../sources/SourceManager.h"
 #include "../sources/local/LibrarySource.h"
 
+#include <QAbstractItemView>
 #include <QDateTime>
 #include <QCompleter>
+#include <QDialog>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QFrame>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
@@ -212,24 +223,18 @@ void FeedPage::buildUi() {
         setFocus();
     });
 
-    // Debug sidebar on the right (F12).
-    m_debugButton = new QPushButton(this);
-    m_debugButton->setIcon(assetIcon(QStringLiteral("bug.svg")));
-    m_debugButton->setToolTip(QStringLiteral("Toggle recommendation debug panel (F12)"));
-    m_debugButton->setFixedWidth(36);
-    m_debugButton->setFocusPolicy(Qt::NoFocus);
-    actions->addWidget(m_debugButton);
-    connect(m_debugButton, &QPushButton::clicked, this, [this]() {
-        toggleDebug();
-        setFocus();
-    });
-
     m_debugPanel = new QWidget(this);
     m_debugPanel->setFixedWidth(320);
     auto* debugLayout = new QVBoxLayout(m_debugPanel);
     debugLayout->setContentsMargins(6, 6, 6, 6);
     m_debugText = new QTextBrowser(m_debugPanel);
     debugLayout->addWidget(m_debugText, 1);
+
+    m_droppedButton = new QPushButton(QStringLiteral("Dropped images"), m_debugPanel);
+    m_droppedButton->setToolTip(
+        QStringLiteral("Show the posts the funnel dropped this batch, with the reason"));
+    debugLayout->addWidget(m_droppedButton);
+    connect(m_droppedButton, &QPushButton::clicked, this, &FeedPage::toggleDropped);
 
     // Profile resets: soft re-learns from the user's library favorites,
     // hard wipes everything for a truly fresh start.
@@ -248,30 +253,69 @@ void FeedPage::buildUi() {
     connect(m_softResetButton, &QPushButton::clicked, this, &FeedPage::onSoftReset);
     connect(m_hardResetButton, &QPushButton::clicked, this, &FeedPage::onHardReset);
 
+    m_debugPanel->hide();
+    root->addWidget(m_debugPanel);
+
     // Taste sway: temporary tags steering the feed right now. Session-only,
-    // never trains the long-term model.
-    auto* swayRow = new QHBoxLayout();
-    swayRow->setSpacing(6);
-    m_swayEdit = new QLineEdit(m_debugPanel);
+    // never trains the long-term model. Lives in the action bar, not the
+    // debug panel - it is a first-class feature.
+    m_swayEdit = new QLineEdit(this);
     m_swayEdit->setPlaceholderText(QStringLiteral("sway tags (space separated)"));
     m_swayEdit->setToolTip(
         QStringLiteral("Temporarily steer the feed toward these tags. Does not change your "
                        "learned profile - clear the box to go back."));
-    m_swayCompleter = new QCompleter(m_swayEdit);
+    m_swayEdit->setClearButtonEnabled(true);
+    m_swayEdit->setMinimumWidth(320);
+    m_swayCompleter = new QCompleter(this);
     m_swayCompleter->setCaseSensitivity(Qt::CaseInsensitive);
     m_swayCompleter->setCompletionMode(QCompleter::PopupCompletion);
     m_swayCompleter->setFilterMode(Qt::MatchStartsWith);
     m_swayCompleter->setMaxVisibleItems(12);
+    m_swayCompleter->setWidget(m_swayEdit);
     m_swayEdit->setCompleter(m_swayCompleter);
-    m_swayButton = new QPushButton(QStringLiteral("Sway"), m_debugPanel);
-    swayRow->addWidget(m_swayEdit, 1);
-    swayRow->addWidget(m_swayButton);
-    debugLayout->addLayout(swayRow);
+    m_swayEdit->installEventFilter(this);
+    m_swayButton = new QPushButton(QStringLiteral("Sway"), this);
+    m_swayButton->setToolTip(
+        QStringLiteral("Apply the sway tags (Enter works too). Clear the box to go back."));
+    m_swayButton->setFocusPolicy(Qt::NoFocus);
+    actions->addWidget(m_swayEdit, 1);
+    actions->addWidget(m_swayButton);
     connect(m_swayButton, &QPushButton::clicked, this, &FeedPage::applySwayTags);
     connect(m_swayEdit, &QLineEdit::returnPressed, this, &FeedPage::applySwayTags);
-
-    m_debugPanel->hide();
-    root->addWidget(m_debugPanel);
+    // QCompleter matches the whole line text, so after the first space it
+    // stops suggesting. Complete the word under the cursor instead (same
+    // approach as the source-browser search box).
+    connect(m_swayEdit, &QLineEdit::textChanged, this, [this]() { updateSwayCompletion(); });
+    connect(m_swayEdit, &QLineEdit::cursorPositionChanged, this,
+            [this]() { updateSwayCompletion(); });
+    connect(m_swayCompleter, QOverload<const QString&>::of(&QCompleter::activated), this,
+            [this](const QString& completion) {
+                const int cursor = m_swayEdit->cursorPosition();
+                const QString text = m_swayEdit->text();
+                int start = cursor;
+                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+                QString updated = text;
+                updated.replace(start, cursor - start, completion);
+                m_swayEdit->setText(updated);
+                m_swayEdit->setCursorPosition(start + completion.size() + 1);
+                m_swayCompleter->popup()->hide();
+            });
+    // Library tag list for completions (same source the search bars use).
+    QThreadPool::globalInstance()->start([self = QPointer<FeedPage>(this)]() {
+        LibrarySource library;
+        const QStringList names = library.allTagNames();
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, names]() {
+                if (!self)
+                    return;
+                self->m_swayTagNames = names;
+                self->m_swayCompleter->setModel(new QStringListModel(names, self->m_swayCompleter));
+            },
+            Qt::QueuedConnection);
+    });
 
     // Click anywhere to restore keyboard focus.
     setFocusPolicy(Qt::StrongFocus);
@@ -348,6 +392,7 @@ void FeedPage::keyPressEvent(QKeyEvent* event) {
             }
             break;
         case Qt::Key_F12:
+        case Qt::Key_F11:
             toggleDebug();
             break;
         default:
@@ -773,6 +818,12 @@ void FeedPage::seedFromFavorites() {
 }
 
 void FeedPage::onSoftReset() {
+    const auto answer = QMessageBox::question(
+        this, QStringLiteral("Soft reset"),
+        QStringLiteral("Wipe the learned profile and rebuild it from your library favorites?"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
     m_db->reset();
     seedFromFavorites();
     m_queue.clear();
@@ -785,6 +836,13 @@ void FeedPage::onSoftReset() {
 }
 
 void FeedPage::onHardReset() {
+    const auto answer = QMessageBox::warning(
+        this, QStringLiteral("Hard reset"),
+        QStringLiteral("Wipe the ENTIRE feed profile? All learned tastes, tag preferences and "
+                       "history are gone for good."),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
     m_db->reset();
     m_queue.clear();
     m_seenMd5s.clear();
@@ -795,26 +853,119 @@ void FeedPage::onHardReset() {
     showNext();
 }
 
+void FeedPage::toggleDropped() {
+    const auto dropped = m_recommender->lastFunnelStats().dropped;
+    auto* dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle(QStringLiteral("Dropped images (last funnel run)"));
+    dialog->resize(900, 600);
+    auto* layout = new QVBoxLayout(dialog);
+
+    // Thumbnail grid like the source-browser tabs; click opens the viewer.
+    auto* scroll = new QScrollArea(dialog);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* content = new QWidget(scroll);
+    auto* grid = new FlowLayout(content, 0, 1, 1);
+    grid->setItemSizeRange(220);
+    scroll->setWidget(content);
+    layout->addWidget(scroll);
+
+    if (dropped.isEmpty()) {
+        auto* empty = new QLabel(QStringLiteral("Nothing dropped in the last batch."), content);
+        grid->addWidget(empty);
+    }
+
+    QList<SourceImage> images;
+    for (const auto& [img, reason] : dropped) {
+        if (img.md5.isEmpty())
+            continue;
+        const int index = images.size();
+        images.append(img);
+        auto* thumb = new ThumbnailButton(img, content);
+        thumb->setToolTip(QStringLiteral("<b style='color:#e8a33d;'>%1</b><br>%2")
+                              .arg(reason.toHtmlEscaped(), img.tooltipHtml()));
+        grid->addWidget(thumb);
+        connect(thumb, &ThumbnailButton::clicked, this, [this, images, index]() {
+            auto* viewer =
+                new ViewerWindow(m_sources.source(images.at(index).sourceId.isEmpty()
+                                                      ? m_sources.remoteSources().value(0)->id()
+                                                      : images.at(index).sourceId),
+                                 images, index);
+            viewer->setAttribute(Qt::WA_DeleteOnClose);
+            viewer->show();
+        });
+    }
+
+    // Load previews off-thread, same disk cache as the source browser.
+    const QString cacheDir = QDir(Paths::tempDir()).filePath(QStringLiteral("thumbcache"));
+    for (ThumbnailButton* thumb : content->findChildren<ThumbnailButton*>()) {
+        const SourceImage img = thumb->image();
+        QPointer<QWidget> self(this);
+        QPointer<ThumbnailButton> btn(thumb);
+        Source* source = m_sources.source(
+            img.sourceId.isEmpty() ? m_sources.remoteSources().value(0)->id() : img.sourceId);
+        if (!source)
+            continue;
+        QThreadPool::globalInstance()->start([btn, source, img, cacheDir]() {
+            QImage decoded;
+            const QString cachePath = cacheDir + QLatin1Char('/') + img.md5 + QLatin1String(".jpg");
+            if (!decoded.load(cachePath)) {
+                if (QFileInfo::exists(cachePath))
+                    QFile::remove(cachePath);
+                const FileKind kind =
+                    !img.previewUrl.isEmpty() ? FileKind::Preview : FileKind::Sample;
+                const QByteArray bytes = source->fetch(img, kind);
+                if (!decoded.loadFromData(bytes) && !img.localPath.isEmpty())
+                    decoded.load(img.localPath);
+                if (!decoded.isNull()) {
+                    QDir().mkpath(cacheDir);
+                    decoded.save(cachePath, "JPG", 80);
+                }
+            }
+            if (decoded.isNull() || !btn)
+                return;
+            const QPixmap pixmap = QPixmap::fromImage(decoded);
+            QMetaObject::invokeMethod(
+                btn.data(),
+                [btn, pixmap]() {
+                    if (btn)
+                        btn->setPixmap(pixmap);
+                },
+                Qt::QueuedConnection);
+        });
+    }
+
+    dialog->show();
+}
+
+void FeedPage::updateSwayCompletion() {
+    // Complete the word under the cursor (SourceBrowser::updateCompletion).
+    const QString text = m_swayEdit->text();
+    const int cursor = m_swayEdit->cursorPosition();
+    int start = cursor;
+    while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+    const QString token = text.mid(start, cursor - start);
+    if (token.isEmpty()) {
+        if (m_swayCompleter->popup())
+            m_swayCompleter->popup()->hide();
+        return;
+    }
+    m_swayCompleter->setCompletionPrefix(token);
+    if (m_swayCompleter->completionCount() > 0) {
+        QRect rect = m_swayEdit->rect();
+        const int leftX = m_swayEdit->fontMetrics().horizontalAdvance(text.left(start)) +
+                          m_swayEdit->rect().left();
+        rect.setLeft(leftX);
+        m_swayCompleter->complete(rect);
+    } else if (m_swayCompleter->popup()) {
+        m_swayCompleter->popup()->hide();
+    }
+}
+
 void FeedPage::applySwayTags() {
     const QStringList tags = m_swayEdit->text().split(QLatin1Char(' '), Qt::SkipEmptyParts);
     m_db->setSwayTags(tags);
-    // Refresh the completer from the library tag list (same source the
-    // search bars use).
-    QPointer<FeedPage> self(this);
-    QThreadPool::globalInstance()->start([self]() {
-        LibrarySource library;
-        const QStringList names = library.allTagNames();
-        if (!self)
-            return;
-        QMetaObject::invokeMethod(
-            self.data(),
-            [self, names]() {
-                if (!self || !self->m_swayCompleter)
-                    return;
-                self->m_swayCompleter->setModel(new QStringListModel(names, self->m_swayCompleter));
-            },
-            Qt::QueuedConnection);
-    });
 
     // Drop the not-yet-shown part of the queue so the next posts come from
     // the swayed ranking instead of the old one.

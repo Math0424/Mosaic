@@ -71,6 +71,8 @@ class FeedPage : public QWidget {
     void refreshHeavyStats();
     void seedFromFavorites();
     void applySwayTags();
+    void updateSwayCompletion();
+    void toggleDropped();
 
     SourceManager& m_sources;
     FeedDatabase* m_db = nullptr;
@@ -88,14 +90,15 @@ class FeedPage : public QWidget {
     QPushButton* m_saveButton = nullptr;
     QPushButton* m_nextButton = nullptr;
     QPushButton* m_prevButton = nullptr;       // back to the previous post
-    QPushButton* m_debugButton = nullptr;      // toggles the debug sidebar
-    QWidget* m_debugPanel = nullptr;           // right-hand debug sidebar (hidden)
+    QWidget* m_debugPanel = nullptr;           // right-hand debug sidebar (hidden, F12)
     QTextBrowser* m_debugText = nullptr;       // score breakdown / model stats
     QPushButton* m_softResetButton = nullptr;  // rebuild profile from favorites
     QPushButton* m_hardResetButton = nullptr;  // full wipe
+    QPushButton* m_droppedButton = nullptr;    // debug: list stage-1 dropped images
     QLineEdit* m_swayEdit = nullptr;           // temporary taste-sway tags
     QPushButton* m_swayButton = nullptr;
     QCompleter* m_swayCompleter = nullptr;
+    QStringList m_swayTagNames;  // full library tag list, filtered per word
 
     // Feed state
     QList<SourceImage> m_queue;      // upcoming posts (already ranked)
