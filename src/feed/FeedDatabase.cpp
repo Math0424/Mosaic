@@ -88,10 +88,10 @@ QByteArray unpackHalf(const QByteArray& fp16) {
 QReadWriteLock s_lock;
 
 // Nothing repeats within the last N shown posts; older history is pruned.
-constexpr qint64 kNoRepeatWindow = 10000;
+constexpr qint64 kNoRepeatWindow = 50000;
 
-constexpr qint64 kMaxImpressionEvents = 3000;
-constexpr qint64 kMaxInteractionEvents = 10000;
+constexpr qint64 kMaxImpressionEvents = 10000;
+constexpr qint64 kMaxInteractionEvents = 50000;
 
 // Interaction weights.
 constexpr double kWeightFavorite = 1.00;
@@ -118,6 +118,9 @@ constexpr double kStrengthCeiling = 12.0;
 constexpr double kTasteHalfLifeDays = 60.0;
 constexpr double kExposureHalfLifeDays = 3.0;
 constexpr double kConfidenceRamp = 3.0;
+// Tastes below this strength are deleted by decayTastes() so new ones can
+// replace them instead of a stale taste squatting a slot forever.
+constexpr double kTasteRetireStrength = 0.5;
 
 // Negative model constants. Hard negatives are deliberately SLOW to learn:
 // reaching the hard filter requires ~15+ consistent explicit dislikes.
@@ -379,12 +382,32 @@ void FeedDatabase::ensureSchema() {
 }
 
 void FeedDatabase::repairSkipPoisonedConfidence() {
-    // One-time repair; zero tag confidence once on open (runs inside
-    // open() with the write lock held - must not take it again).
+    // One-time repair, guarded by a feed_meta flag: old builds let skips
+    // accumulate veto confidence. Clamped rather than zeroed so legitimate
+    // dislike evidence survives. Runs inside open() with the write lock
+    // held - must not take it again.
     DbConnectionGuard conn(m_db);
     if (!conn.ok())
         return;
-    conn.execute(QStringLiteral("UPDATE feed_tag_preferences SET confidence = 0"));
+    duckdb_result res{};
+    bool alreadyDone = false;
+    if (conn.query(QStringLiteral("SELECT value FROM feed_meta WHERE key = "
+                                  "'skip_confidence_repaired'"),
+                   &res)) {
+        alreadyDone = duckdb_row_count(&res) > 0;
+        duckdb_destroy_result(&res);
+    }
+    if (alreadyDone)
+        return;
+    // The hard filter needs confidence >= 15; old skip-poisoned rows sat far
+    // above what real dislike evidence could produce. Cap at 4 - enough to
+    // keep a tag eligible as a query exclusion, never enough to veto.
+    conn.execute(
+        QStringLiteral("UPDATE feed_tag_preferences SET confidence = min(confidence, 4.0) "
+                       "WHERE confidence > 4.0"));
+    conn.execute(
+        QStringLiteral("INSERT INTO feed_meta(key, value) VALUES ('skip_confidence_repaired', 1) "
+                       "ON CONFLICT (key) DO UPDATE SET value = 1"));
 }
 
 // events
@@ -1015,6 +1038,10 @@ void FeedDatabase::decayTastes() {
                 .arg(r.exposure * exposureDecay, 0, 'f', 6)
                 .arg(r.engagement * exposureDecay, 0, 'f', 6));
     }
+    // Retire tastes that decayed into noise so their slot frees up for a
+    // new taste; otherwise a stale taste blocks kMaxTastes forever.
+    conn.execute(QStringLiteral("DELETE FROM feed_tastes WHERE strength < %1")
+                     .arg(kTasteRetireStrength, 0, 'f', 4));
     Q_UNUSED(nowMs);
 }
 
@@ -1415,23 +1442,64 @@ QStringList FeedDatabase::negativeQueryTags(int limit) const {
 QHash<QString, double> FeedDatabase::sessionWeights() const { return m_sessionVec; }
 
 double FeedDatabase::sessionSimilarity(const QStringList& tags) const {
-    if (m_sessionVec.isEmpty() || tags.isEmpty())
+    if (tags.isEmpty())
         return 0.0;
     const QHash<QString, double> img = tagVector(tags);
-    double dot = 0.0, imgNorm = 0.0, sesNorm = 0.0;
-    for (auto it = img.constBegin(); it != img.constEnd(); ++it) {
-        imgNorm += it.value() * it.value();
-        auto sit = m_sessionVec.constFind(it.key());
-        if (sit != m_sessionVec.constEnd())
-            dot += it.value() * sit.value();
-    }
-    for (auto it = m_sessionVec.constBegin(); it != m_sessionVec.constEnd(); ++it)
-        sesNorm += it.value() * it.value();
+    double imgNorm = 0.0;
+    for (auto it = img.constBegin(); it != img.constEnd(); ++it) imgNorm += it.value() * it.value();
     imgNorm = std::sqrt(imgNorm);
-    sesNorm = std::sqrt(sesNorm);
-    if (imgNorm < 1e-9 || sesNorm < 1e-9)
+    if (imgNorm < 1e-9)
         return 0.0;
-    return dot / (imgNorm * sesNorm);
+
+    double sim = 0.0;
+    if (!m_sessionVec.isEmpty()) {
+        double dot = 0.0, sesNorm = 0.0;
+        for (auto it = img.constBegin(); it != img.constEnd(); ++it) {
+            auto sit = m_sessionVec.constFind(it.key());
+            if (sit != m_sessionVec.constEnd())
+                dot += it.value() * sit.value();
+        }
+        for (auto it = m_sessionVec.constBegin(); it != m_sessionVec.constEnd(); ++it)
+            sesNorm += it.value() * it.value();
+        sesNorm = std::sqrt(sesNorm);
+        if (sesNorm > 1e-9)
+            sim = dot / (imgNorm * sesNorm);
+    }
+
+    // Active sway tags dominate: matching posts get boosted to at least the
+    // sway similarity, non-matching posts are pulled down.
+    if (!m_swayTags.isEmpty()) {
+        const QHash<QString, double> sway = tagVector(m_swayTags);
+        double dot = 0.0, swayNorm = 0.0;
+        for (auto it = img.constBegin(); it != img.constEnd(); ++it) {
+            auto sit = sway.constFind(it.key());
+            if (sit != sway.constEnd())
+                dot += it.value() * sit.value();
+        }
+        for (auto it = sway.constBegin(); it != sway.constEnd(); ++it)
+            swayNorm += it.value() * it.value();
+        swayNorm = std::sqrt(swayNorm);
+        if (swayNorm > 1e-9) {
+            const double swaySim = dot / (imgNorm * swayNorm);
+            sim = qMax(sim, swaySim) - 0.25 * (1.0 - swaySim);
+        }
+    }
+    return sim;
+}
+
+void FeedDatabase::setSwayTags(const QStringList& tags) {
+    QWriteLocker lock(&s_lock);
+    m_swayTags.clear();
+    for (const QString& raw : tags) {
+        const QString tag = raw.trimmed().toLower();
+        if (!tag.isEmpty() && !FeedRecommender::isGenericTag(tag))
+            m_swayTags << tag;
+    }
+}
+
+QStringList FeedDatabase::swayTags() const {
+    QReadLocker lock(&s_lock);
+    return m_swayTags;
 }
 
 // linger

@@ -54,6 +54,7 @@ class FeedRecommender {
         double learnedSamples = 0.0;
         double learnedBlend = 0.0;
         QList<double> learnedWeights;
+        QStringList swayTags;
     };
     ModelStats modelStats() const;
 
@@ -108,6 +109,9 @@ class FeedRecommender {
     QList<Candidate> candidatesPopular(const QStringList& sourceIds) const;
     QList<Candidate> candidatesExploration(const QList<FeedDatabase::Taste>& tastes,
                                            const QStringList& sourceIds) const;
+    // User-typed sway tags: a dedicated arm so swayed queries get real
+    // representation in the batch, not just a ranking nudge.
+    QList<Candidate> candidatesFromSway(const QStringList& sourceIds) const;
 
     // Builds a set of library-favorited content tags with their frequency counts
     QHash<QString, int> favoriteTagFrequencies() const;

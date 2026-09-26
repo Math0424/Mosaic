@@ -161,8 +161,14 @@ class FeedDatabase {
     QHash<QString, double> sessionWeights() const;
 
     // Cosine similarity of an image against the session vector (0 when the
-    // session vector is still empty).
+    // session vector is still empty). Active sway tags dominate the score.
     double sessionSimilarity(const QStringList& tags) const;
+
+    // Temporary user-typed tags steering the feed right now. Session-only:
+    // they bias ranking and candidate queries but never train the long-term
+    // model. Empty list clears the sway.
+    void setSwayTags(const QStringList& tags);
+    QStringList swayTags() const;
 
     // linger
 
@@ -256,6 +262,9 @@ class FeedDatabase {
     // Session vector (in-memory, fast EMA)
     QHash<QString, double> m_sessionVec;
     double m_sessionMass = 0.0;
+
+    // Temporary taste-sway tags (in-memory, session only)
+    QStringList m_swayTags;
 
     // Stage-2 learned user model (persisted on train)
     UserModel m_userModel;

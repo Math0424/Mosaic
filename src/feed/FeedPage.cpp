@@ -10,12 +10,15 @@
 #include "../sources/local/LibrarySource.h"
 
 #include <QDateTime>
+#include <QCompleter>
 #include <QDir>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
+#include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
 #include <QThreadPool>
@@ -244,6 +247,28 @@ void FeedPage::buildUi() {
 
     connect(m_softResetButton, &QPushButton::clicked, this, &FeedPage::onSoftReset);
     connect(m_hardResetButton, &QPushButton::clicked, this, &FeedPage::onHardReset);
+
+    // Taste sway: temporary tags steering the feed right now. Session-only,
+    // never trains the long-term model.
+    auto* swayRow = new QHBoxLayout();
+    swayRow->setSpacing(6);
+    m_swayEdit = new QLineEdit(m_debugPanel);
+    m_swayEdit->setPlaceholderText(QStringLiteral("sway tags (space separated)"));
+    m_swayEdit->setToolTip(
+        QStringLiteral("Temporarily steer the feed toward these tags. Does not change your "
+                       "learned profile - clear the box to go back."));
+    m_swayCompleter = new QCompleter(m_swayEdit);
+    m_swayCompleter->setCaseSensitivity(Qt::CaseInsensitive);
+    m_swayCompleter->setCompletionMode(QCompleter::PopupCompletion);
+    m_swayCompleter->setFilterMode(Qt::MatchStartsWith);
+    m_swayCompleter->setMaxVisibleItems(12);
+    m_swayEdit->setCompleter(m_swayCompleter);
+    m_swayButton = new QPushButton(QStringLiteral("Sway"), m_debugPanel);
+    swayRow->addWidget(m_swayEdit, 1);
+    swayRow->addWidget(m_swayButton);
+    debugLayout->addLayout(swayRow);
+    connect(m_swayButton, &QPushButton::clicked, this, &FeedPage::applySwayTags);
+    connect(m_swayEdit, &QLineEdit::returnPressed, this, &FeedPage::applySwayTags);
 
     m_debugPanel->hide();
     root->addWidget(m_debugPanel);
@@ -770,6 +795,39 @@ void FeedPage::onHardReset() {
     showNext();
 }
 
+void FeedPage::applySwayTags() {
+    const QStringList tags = m_swayEdit->text().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    m_db->setSwayTags(tags);
+    // Refresh the completer from the library tag list (same source the
+    // search bars use).
+    QPointer<FeedPage> self(this);
+    QThreadPool::globalInstance()->start([self]() {
+        LibrarySource library;
+        const QStringList names = library.allTagNames();
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, names]() {
+                if (!self || !self->m_swayCompleter)
+                    return;
+                self->m_swayCompleter->setModel(new QStringListModel(names, self->m_swayCompleter));
+            },
+            Qt::QueuedConnection);
+    });
+
+    // Drop the not-yet-shown part of the queue so the next posts come from
+    // the swayed ranking instead of the old one.
+    const int keep = qMax(m_position + 1, 0);
+    while (m_queue.size() > keep + 3) m_queue.removeLast();
+    m_statusLabel->setText(
+        tags.isEmpty()
+            ? QStringLiteral("Sway cleared.")
+            : QStringLiteral("Feed swayed toward: %1").arg(tags.join(QStringLiteral(", "))));
+    requestMore();
+    updateDebugPanel();
+}
+
 void FeedPage::onLikeClicked() {
     recordCurrent(FeedDatabase::Event::Like);
     m_likeButton->setText(QStringLiteral("Liked!"));
@@ -981,6 +1039,7 @@ void FeedPage::refreshHeavyStats() {
         double learnedSamples = 0.0;
         double learnedBlend = 0.0;
         QList<double> learnedWeights;
+        QStringList swayTags;
         FeedRecommender::FunnelStats funnel;
     };
 
@@ -1109,6 +1168,9 @@ void FeedPage::refreshHeavyStats() {
                 if (!stats.hardNegativeTags.isEmpty())
                     h += QStringLiteral("<span style='color:#e05a5a'>hard negatives: %1</span><br>")
                              .arg(stats.hardNegativeTags.join(QStringLiteral(", ")));
+                if (!stats.swayTags.isEmpty())
+                    h += QStringLiteral("<span style='color:#e8a33d'>sway active: %1</span><br>")
+                             .arg(stats.swayTags.join(QStringLiteral(", ")));
 
                 // self-learned tag specificity
                 h += QStringLiteral(

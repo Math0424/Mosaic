@@ -321,15 +321,25 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromTastes(
         if (tagsRanked.isEmpty())
             continue;
 
-        QString query;
-        if (tagsRanked.size() >= 3) {
-            query =
-                QStringLiteral("%1 ~%2 ~%3")
-                    .arg(tagsRanked.at(0).second, tagsRanked.at(1).second, tagsRanked.at(2).second);
-        } else if (tagsRanked.size() >= 2) {
-            query = tagsRanked.at(0).second + QLatin1Char(' ') + tagsRanked.at(1).second;
-        } else {
-            query = tagsRanked.at(0).second;
+        // Two query shapes per taste: the broad one (1 hard tag + optional
+        // OR-group) and a stricter one (2 hard tags) when the taste has
+        // enough strong tags. The stricter shape finds the specific
+        // intersection the broad one dilutes.
+        const QString anchor = tagsRanked.at(0).second;
+        QString optional;
+        if (tagsRanked.size() >= 2) {
+            QStringList opts;
+            for (int i = 1; i < qMin(5, tagsRanked.size()); ++i)
+                opts << QLatin1Char('~') + tagsRanked.at(i).second;
+            optional = QStringLiteral(" (%1)").arg(opts.join(QLatin1Char(' ')));
+        }
+        QString query = anchor + optional;
+        if (tagsRanked.size() >= 2) {
+            const QString strict = anchor + QLatin1Char(' ') + tagsRanked.at(1).second + optional;
+            const QString& strictSrc =
+                sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+            for (const SourceImage& img : fetchFromSource(strictSrc, strict, 20))
+                out.append({img, QStringLiteral("taste-strict"), taste.id});
         }
 
         const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
@@ -538,6 +548,25 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesExploration(
     const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
     const QList<SourceImage> imgs = fetchFromSource(src, QStringLiteral("order:random"), 10);
     for (const SourceImage& img : imgs) out.append({img, QStringLiteral("exploration"), 0});
+    return out;
+}
+
+QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromSway(
+    const QStringList& sourceIds) const {
+    QList<Candidate> out;
+    const QStringList sway = m_db.swayTags();
+    if (sway.isEmpty() || sourceIds.isEmpty())
+        return out;
+
+    // Two queries: the full sway ANDed, and a looser one with just the
+    // strongest tag, so the arm still returns something when the exact
+    // combination is rare on the source.
+    const QString full = sway.join(QLatin1Char(' '));
+    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+    QList<SourceImage> imgs = fetchFromSource(src, full, 20);
+    if (imgs.isEmpty() && sway.size() > 1)
+        imgs = fetchFromSource(src, sway.first(), 20);
+    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("sway"), 0});
     return out;
 }
 
@@ -903,6 +932,7 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
     candidates += candidatesRecent(sourceIds);
     candidates += candidatesPopular(sourceIds);
     candidates += candidatesExploration(tastes, sourceIds);
+    candidates += candidatesFromSway(sourceIds);
 
     // Skip-streak rescue: fetch extra trending posts when the mix goes stale.
     const int rescueStreak = m_db.recentSkipStreak();
@@ -1178,6 +1208,7 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
     stats.learnedSamples = m_db.userModelSamples();
     stats.learnedBlend = m_db.userModelBlend();
     stats.learnedWeights = m_db.userModelWeights();
+    stats.swayTags = m_db.swayTags();
     return stats;
 }
 

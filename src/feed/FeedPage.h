@@ -9,6 +9,8 @@
 #include <QWidget>
 
 class QLabel;
+class QCompleter;
+class QLineEdit;
 class QPushButton;
 class QStackedWidget;
 class QTextBrowser;
@@ -68,6 +70,7 @@ class FeedPage : public QWidget {
     void updateDebugPanel();
     void refreshHeavyStats();
     void seedFromFavorites();
+    void applySwayTags();
 
     SourceManager& m_sources;
     FeedDatabase* m_db = nullptr;
@@ -90,6 +93,9 @@ class FeedPage : public QWidget {
     QTextBrowser* m_debugText = nullptr;       // score breakdown / model stats
     QPushButton* m_softResetButton = nullptr;  // rebuild profile from favorites
     QPushButton* m_hardResetButton = nullptr;  // full wipe
+    QLineEdit* m_swayEdit = nullptr;           // temporary taste-sway tags
+    QPushButton* m_swayButton = nullptr;
+    QCompleter* m_swayCompleter = nullptr;
 
     // Feed state
     QList<SourceImage> m_queue;      // upcoming posts (already ranked)
