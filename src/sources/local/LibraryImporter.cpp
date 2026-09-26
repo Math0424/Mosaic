@@ -5,6 +5,7 @@
 #include "LibraryUtils.h"
 #include "../../core/AppState.h"
 #include "../../core/Paths.h"
+#include "../../core/Schema.h"
 #include "../SourceManager.h"
 
 #include <QCryptographicHash>
@@ -30,7 +31,7 @@ QList<SourceTag> parseLegacyTags(const QJsonObject& root) {
     for (auto it = tagGroups.begin(); it != tagGroups.end(); ++it) {
         const QString category = it.key().toLower();
         for (const auto& v : it.value().toArray()) {
-            const QString name = v.toString().trimmed().toLower();
+            const QString name = Schema::normalizeTagName(v.toString());
             if (!name.isEmpty())
                 tags.append(SourceTag{name, category});
         }
@@ -246,9 +247,9 @@ LibraryImporter::Outcome LibraryImporter::importOneFile(const QFileInfo& fi, boo
 
         const QStringList tagList = content.split(';', Qt::SkipEmptyParts);
         for (const QString& rawTag : tagList) {
-            const QString trimmedTag = rawTag.trimmed();
-            if (!trimmedTag.isEmpty())
-                tags.append(SourceTag{trimmedTag.toLower(), QStringLiteral("general")});
+            const QString normalizedTag = Schema::normalizeTagName(rawTag);
+            if (!normalizedTag.isEmpty())
+                tags.append(SourceTag{normalizedTag, QStringLiteral("general")});
         }
         if (!tags.isEmpty())
             match = true;

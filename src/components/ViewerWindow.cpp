@@ -5,6 +5,7 @@
 #include "ViewerWidget.h"
 #include "../core/AppState.h"
 #include "../core/Paths.h"
+#include "../core/Schema.h"
 #include "../media/ImageFingerprint.h"
 #include "../media/VideoDecoder.h"
 #include "../sources/local/LibrarySource.h"
@@ -1740,7 +1741,7 @@ void ViewerWindow::onVolumeChanged(int value) {
 }
 
 void ViewerWindow::onAddTag(const QString& tag) {
-    QString name = tag.trimmed().toLower();
+    QString name = Schema::normalizeTagName(tag);
     if (name.isEmpty() || m_current.md5.isEmpty())
         return;
     // Strip an optional "category:" prefix ("species:fox").

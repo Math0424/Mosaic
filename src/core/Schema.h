@@ -31,6 +31,15 @@ QString categoryToString(TagCategory c);
 
 bool isCategoryName(const QString& name);
 
+// Canonical tag form: lowercase, commas treated as separators, whitespace
+// collapsed to underscores. Empty string when nothing usable remains.
+QString normalizeTagName(const QString& name);
+
+// Repairs malformed stored tags (commas/spaces/mixed case): splits them
+// into normalized pieces, re-links affected images, deletes the broken
+// rows. Safe to run on every open; no-ops when nothing is malformed.
+bool sanitizeTags(DbConnection& conn, QString* error);
+
 // Creates all catalog tables if missing and records the schema version.
 bool ensureSchema(DbConnection& conn, QString* error);
 

@@ -139,6 +139,10 @@ bool Database::open() {
             m_db = nullptr;
             return false;
         }
+
+        QString sanitizeError;
+        if (!Schema::sanitizeTags(conn, &sanitizeError))
+            qWarning().noquote() << "Database: tag sanitize failed:" << sanitizeError;
     }
 
     qDebug().noquote() << "Database: schema ready";

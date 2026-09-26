@@ -4,8 +4,6 @@
 #include "../../core/Database.h"
 #include "../../core/Schema.h"
 
-#include <QRegularExpression>
-
 namespace Mosaic {
 
 using namespace LibrarySql;
@@ -69,9 +67,7 @@ QHash<QString, QString> LibraryTagService::allTagCategories() const {
 
 QString LibraryTagService::addTag(const QString& md5, const QString& tagName,
                                   QString* error) const {
-    QString name = tagName.trimmed().toLower();
-    name.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral("_"));
-    name.remove(QRegularExpression(QStringLiteral(",+$")));
+    QString name = Schema::normalizeTagName(tagName);
 
     if (name.isEmpty()) {
         if (error)

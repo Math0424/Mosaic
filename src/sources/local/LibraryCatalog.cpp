@@ -3,6 +3,7 @@
 #include "LibraryUtils.h"
 #include "../../core/Database.h"
 #include "../../core/Paths.h"
+#include "../../core/Schema.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -642,7 +643,8 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
     }
 
     for (const SourceTag& tag : meta.tags) {
-        if (tag.name.isEmpty())
+        const QString name = Schema::normalizeTagName(tag.name);
+        if (name.isEmpty())
             continue;
 
         const QString category =
@@ -652,7 +654,7 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
                                       "INSERT INTO tags(category, name) "
                                       "VALUES (%1, %2) "
                                       "ON CONFLICT (category, name) DO NOTHING")
-                                      .arg(quoted(category), quoted(tag.name));
+                                      .arg(quoted(category), quoted(name));
         if (!conn.execute(tagInsert, &dbError)) {
             result.error = dbError;
             return result;
@@ -667,7 +669,7 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
                                        " AND t.name = %3 "
                                        "WHERE i.md5 = %1 "
                                        "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                       .arg(quoted(md5), quoted(category), quoted(tag.name));
+                                       .arg(quoted(md5), quoted(category), quoted(name));
         if (!conn.execute(linkInsert, &dbError)) {
             result.error = dbError;
             return result;

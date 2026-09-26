@@ -186,16 +186,92 @@ void FeedPage::buildUi() {
     m_nextButton->setToolTip(QStringLiteral("Next post (Space / ↓ / scroll down)"));
     m_nextButton->setFocusPolicy(Qt::NoFocus);
 
-    actions->addStretch(1);
-    actions->addWidget(m_prevButton);  // back on the far left
-    actions->addWidget(m_dislikeButton);
-    actions->addWidget(m_nextButton);
-    actions->addWidget(m_likeButton);
-    actions->addWidget(m_saveButton);
-    actions->addStretch(1);
-    actions->addWidget(m_swayEdit);
-    actions->addWidget(m_swayButton);
-    stageLayout->addLayout(actions);
+    // Taste sway: temporary tags steering the feed right now. Session-only,
+    // never trains the long-term model. Sits at the right end of the action
+    // row - a first-class feature, not debug-only.
+    m_swayEdit = new QLineEdit(this);
+    m_swayEdit->setPlaceholderText(QStringLiteral("sway tags (space separated)"));
+    m_swayEdit->setToolTip(
+        QStringLiteral("Temporarily steer the feed toward these tags. Does not change your "
+                       "learned profile - clear the box to go back."));
+    m_swayEdit->setClearButtonEnabled(true);
+    m_swayEdit->setFixedWidth(220);
+    m_swayCompleter = new QCompleter(this);
+    m_swayCompleter->setCaseSensitivity(Qt::CaseInsensitive);
+    m_swayCompleter->setCompletionMode(QCompleter::PopupCompletion);
+    m_swayCompleter->setFilterMode(Qt::MatchStartsWith);
+    m_swayCompleter->setMaxVisibleItems(12);
+    m_swayCompleter->setWidget(m_swayEdit);
+    m_swayEdit->setCompleter(m_swayCompleter);
+    m_swayEdit->installEventFilter(this);
+    m_swayButton = new QPushButton(QStringLiteral("Sway"), this);
+    m_swayButton->setToolTip(
+        QStringLiteral("Apply the sway tags (Enter works too). Clear the box to go back."));
+    m_swayButton->setFocusPolicy(Qt::NoFocus);
+    connect(m_swayButton, &QPushButton::clicked, this, &FeedPage::applySwayTags);
+    connect(m_swayEdit, &QLineEdit::returnPressed, this, &FeedPage::applySwayTags);
+    // QCompleter matches the whole line text, so after the first space it
+    // stops suggesting. Complete the word under the cursor instead (same
+    // approach as the source-browser search box).
+    connect(m_swayEdit, &QLineEdit::textChanged, this, [this]() { updateSwayCompletion(); });
+    connect(m_swayEdit, &QLineEdit::cursorPositionChanged, this,
+            [this]() { updateSwayCompletion(); });
+    connect(m_swayCompleter, QOverload<const QString&>::of(&QCompleter::activated), this,
+            [this](const QString& completion) {
+                const int cursor = m_swayEdit->cursorPosition();
+                const QString text = m_swayEdit->text();
+                int start = cursor;
+                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
+                QString updated = text;
+                updated.replace(start, cursor - start, completion);
+                m_swayEdit->setText(updated);
+                m_swayEdit->setCursorPosition(start + completion.size() + 1);
+                m_swayCompleter->popup()->hide();
+            });
+    // Library tag list for completions (same source the search bars use).
+    QThreadPool::globalInstance()->start([self = QPointer<FeedPage>(this)]() {
+        LibrarySource library;
+        const QStringList names = library.allTagNames();
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, names]() {
+                if (!self)
+                    return;
+                self->m_swayTagNames = names;
+                self->m_swayCompleter->setModel(new QStringListModel(names, self->m_swayCompleter));
+            },
+            Qt::QueuedConnection);
+    });
+
+    // Two equal expanding spacers sandwich the button group, so it stays
+    // centered in the space left of the sway widgets. A mirror spacer on the
+    // left matches the sway group's width, keeping the buttons centered on
+    // the full row rather than just the leftover space.
+    auto* swayGroup = new QHBoxLayout();
+    swayGroup->setContentsMargins(0, 0, 0, 0);
+    swayGroup->setSpacing(6);
+    swayGroup->addWidget(m_swayEdit);
+    swayGroup->addWidget(m_swayButton);
+
+    auto* actionRow = new QHBoxLayout();
+    actionRow->setContentsMargins(0, 0, 0, 0);
+    actionRow->setSpacing(10);
+    auto* mirror = new QWidget(this);
+    mirror->setFixedWidth(m_swayEdit->width() + 6 + m_swayButton->sizeHint().width() + 10);
+    actionRow->addWidget(mirror);
+    actionRow->addSpacerItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Fixed));
+    actionRow->addWidget(m_prevButton);
+    actionRow->addWidget(m_dislikeButton);
+    actionRow->addWidget(m_nextButton);
+    actionRow->addWidget(m_likeButton);
+    actionRow->addWidget(m_saveButton);
+    actionRow->addSpacerItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Fixed));
+    actionRow->addLayout(swayGroup);
+    actionRow->setStretch(1, 1);
+    actionRow->setStretch(7, 1);
+    stageLayout->addLayout(actionRow);
 
     root->addWidget(m_stage, 1);
 
@@ -257,65 +333,6 @@ void FeedPage::buildUi() {
 
     m_debugPanel->hide();
     root->addWidget(m_debugPanel);
-
-    // Taste sway: temporary tags steering the feed right now. Session-only,
-    // never trains the long-term model. Lives in the action bar, not the
-    // debug panel - it is a first-class feature.
-    m_swayEdit = new QLineEdit(this);
-    m_swayEdit->setPlaceholderText(QStringLiteral("sway tags (space separated)"));
-    m_swayEdit->setToolTip(
-        QStringLiteral("Temporarily steer the feed toward these tags. Does not change your "
-                       "learned profile - clear the box to go back."));
-    m_swayEdit->setClearButtonEnabled(true);
-    m_swayEdit->setMaximumWidth(420);
-    m_swayCompleter = new QCompleter(this);
-    m_swayCompleter->setCaseSensitivity(Qt::CaseInsensitive);
-    m_swayCompleter->setCompletionMode(QCompleter::PopupCompletion);
-    m_swayCompleter->setFilterMode(Qt::MatchStartsWith);
-    m_swayCompleter->setMaxVisibleItems(12);
-    m_swayCompleter->setWidget(m_swayEdit);
-    m_swayEdit->setCompleter(m_swayCompleter);
-    m_swayEdit->installEventFilter(this);
-    m_swayButton = new QPushButton(QStringLiteral("Sway"), this);
-    m_swayButton->setToolTip(
-        QStringLiteral("Apply the sway tags (Enter works too). Clear the box to go back."));
-    m_swayButton->setFocusPolicy(Qt::NoFocus);
-    connect(m_swayButton, &QPushButton::clicked, this, &FeedPage::applySwayTags);
-    connect(m_swayEdit, &QLineEdit::returnPressed, this, &FeedPage::applySwayTags);
-    // QCompleter matches the whole line text, so after the first space it
-    // stops suggesting. Complete the word under the cursor instead (same
-    // approach as the source-browser search box).
-    connect(m_swayEdit, &QLineEdit::textChanged, this, [this]() { updateSwayCompletion(); });
-    connect(m_swayEdit, &QLineEdit::cursorPositionChanged, this,
-            [this]() { updateSwayCompletion(); });
-    connect(m_swayCompleter, QOverload<const QString&>::of(&QCompleter::activated), this,
-            [this](const QString& completion) {
-                const int cursor = m_swayEdit->cursorPosition();
-                const QString text = m_swayEdit->text();
-                int start = cursor;
-                while (start > 0 && text.at(start - 1) != QLatin1Char(' ')) --start;
-                QString updated = text;
-                updated.replace(start, cursor - start, completion);
-                m_swayEdit->setText(updated);
-                m_swayEdit->setCursorPosition(start + completion.size() + 1);
-                m_swayCompleter->popup()->hide();
-            });
-    // Library tag list for completions (same source the search bars use).
-    QThreadPool::globalInstance()->start([self = QPointer<FeedPage>(this)]() {
-        LibrarySource library;
-        const QStringList names = library.allTagNames();
-        if (!self)
-            return;
-        QMetaObject::invokeMethod(
-            self.data(),
-            [self, names]() {
-                if (!self)
-                    return;
-                self->m_swayTagNames = names;
-                self->m_swayCompleter->setModel(new QStringListModel(names, self->m_swayCompleter));
-            },
-            Qt::QueuedConnection);
-    });
 
     // Click anywhere to restore keyboard focus.
     setFocusPolicy(Qt::StrongFocus);
