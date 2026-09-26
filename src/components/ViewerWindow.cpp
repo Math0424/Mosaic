@@ -615,10 +615,7 @@ void ViewerWindow::loadMedia(const SourceImage& image) {
         if (!md5.isEmpty()) {
             LibrarySource library;
             if (library.hasImage(md5)) {
-                SourceImage local;
-                local.md5 = md5;
-                local.format = image.format;
-                bytes = library.fetch(local, FileKind::Full, &error);
+                bytes = library.fetch(image.withMd5(md5), FileKind::Full, &error);
             }
         }
         if (bytes.isEmpty())
@@ -706,10 +703,8 @@ void ViewerWindow::loadVideoProgressively(const SourceImage& image) {
         if (!md5.isEmpty()) {
             LibrarySource library;
             if (library.hasImage(md5)) {
-                SourceImage local;
-                local.md5 = md5;
-                local.format = image.format;
-                ok = library.downloadToFile(local, FileKind::Full, partPath, nullptr, &error);
+                ok = library.downloadToFile(image.withMd5(md5), FileKind::Full, partPath, nullptr,
+                                            &error);
             }
         }
 

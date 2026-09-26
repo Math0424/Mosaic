@@ -193,6 +193,8 @@ void FeedPage::buildUi() {
     actions->addWidget(m_likeButton);
     actions->addWidget(m_saveButton);
     actions->addStretch(1);
+    actions->addWidget(m_swayEdit);
+    actions->addWidget(m_swayButton);
     stageLayout->addLayout(actions);
 
     root->addWidget(m_stage, 1);
@@ -265,7 +267,7 @@ void FeedPage::buildUi() {
         QStringLiteral("Temporarily steer the feed toward these tags. Does not change your "
                        "learned profile - clear the box to go back."));
     m_swayEdit->setClearButtonEnabled(true);
-    m_swayEdit->setMinimumWidth(320);
+    m_swayEdit->setMaximumWidth(420);
     m_swayCompleter = new QCompleter(this);
     m_swayCompleter->setCaseSensitivity(Qt::CaseInsensitive);
     m_swayCompleter->setCompletionMode(QCompleter::PopupCompletion);
@@ -278,8 +280,6 @@ void FeedPage::buildUi() {
     m_swayButton->setToolTip(
         QStringLiteral("Apply the sway tags (Enter works too). Clear the box to go back."));
     m_swayButton->setFocusPolicy(Qt::NoFocus);
-    actions->addWidget(m_swayEdit, 1);
-    actions->addWidget(m_swayButton);
     connect(m_swayButton, &QPushButton::clicked, this, &FeedPage::applySwayTags);
     connect(m_swayEdit, &QLineEdit::returnPressed, this, &FeedPage::applySwayTags);
     // QCompleter matches the whole line text, so after the first space it

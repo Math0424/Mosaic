@@ -70,10 +70,7 @@ void MediaCache::fetchIntoCache(Source* source, const SourceImage& image, FileKi
         QByteArray bytes;
         LibrarySource library;
         if (!md5.isEmpty() && library.hasImage(md5)) {
-            SourceImage local;
-            local.md5 = md5;
-            local.format = image.format;
-            bytes = library.fetch(local, kind);
+            bytes = library.fetch(image.withMd5(md5), kind);
         }
         if (bytes.isEmpty())
             bytes = source->fetch(image, kind);
@@ -147,10 +144,7 @@ bool MediaCache::request(Source* source, const SourceImage& image,
         QByteArray bytes;
         LibrarySource library;
         if (!md5.isEmpty() && library.hasImage(md5)) {
-            SourceImage local;
-            local.md5 = md5;
-            local.format = image.format;
-            bytes = library.fetch(local, FileKind::Full, &error);
+            bytes = library.fetch(image.withMd5(md5), FileKind::Full, &error);
         }
         if (bytes.isEmpty())
             bytes = source->fetch(image, FileKind::Full, &error);

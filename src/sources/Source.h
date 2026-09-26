@@ -52,6 +52,15 @@ struct SourceImage {
     QString localPath;
     bool isLocal() const;
 
+    // Full copy of every attribute. Use this instead of hand-copying
+    // fields when re-targeting an image (e.g. fetching through the local
+    // library) - hand copies keep forgetting metadata.
+    SourceImage withMd5(const QString& newMd5) const {
+        SourceImage copy = *this;
+        copy.md5 = newMd5;
+        return copy;
+    }
+
     // Best URL for the given kind (falls back to the full file URL).
     QString urlFor(FileKind kind) const {
         switch (kind) {

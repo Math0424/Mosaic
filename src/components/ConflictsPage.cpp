@@ -225,22 +225,16 @@ void ConflictsPage::showPair(const DuplicatePair& pair) {
                 img.md5 = md5;
                 const QByteArray bytes = library.fetch(img, FileKind::Full);
                 img.fileSize = bytes.size();
-                // Catalog metrics via an exact md5 lookup.
+                // Full catalog metadata via an exact md5 lookup.
                 SourceQuery query;
                 query.tags = QStringLiteral("md5:%1").arg(md5);
                 query.limit = 1;
                 const SourceResult found = library.search(query);
                 if (!found.images.isEmpty()) {
-                    const SourceImage& meta = found.images.first();
-                    img.width = meta.width;
-                    img.sourceId = meta.sourceId;
-                    img.remoteId = meta.remoteId;
-                    img.tags = meta.tags;
-                    img.height = meta.height;
-                    img.format = meta.format;
-                    img.createdAt = meta.createdAt;
-                    if (meta.fileSize > 0)
-                        img.fileSize = meta.fileSize;
+                    const SourceImage meta = found.images.first();
+                    const bool saved = !img.localPath.isEmpty();
+                    img = meta.withMd5(md5);
+                    img.localPath = saved ? img.localPath : meta.localPath;
                 }
                 // QImage, not QPixmap: GUI-thread only.
                 QImage image;

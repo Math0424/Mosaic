@@ -55,7 +55,7 @@ constexpr double kMmrLambda = 0.75;
 constexpr double kExplorationFloor = 0.15;
 
 // Quality floor: minimum site score.
-constexpr int kMinPostScore = 2;
+constexpr int kMinPostScore = 0;
 
 // Candidate funnel sizes.
 constexpr int kFunnelTasteCount = 150;
@@ -1064,20 +1064,18 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
 
         // Stage 3: visual relevance via thumbnails
         if (m_embeddings && m_embeddings->isReady() && !shortlist.isEmpty()) {
-            QList<QPair<QString, QString>> jobs;
+            QList<SourceImage> jobs;
             for (const Candidate& c : shortlist) {
                 if (jobs.size() >= kMaxEmbeddingsPerBatch)
                     break;
                 if (m_db.embeddingFor(c.image.md5, m_embeddings->modelName(),
                                       m_embeddings->modelVersion())
                         .isEmpty()) {
-                    const QString url =
-                        !c.image.previewUrl.isEmpty() ? c.image.previewUrl : c.image.sampleUrl;
                     // Remote posts need a thumbnail URL; local library posts
                     // are embedded from the stored file (empty URL is fine).
-                    if (!url.isEmpty() || c.image.isLocal())
-                        jobs.append({c.image.sourceId, c.image.md5 + QLatin1Char('|') + url +
-                                                           QLatin1Char('|') + c.image.localPath});
+                    if (!c.image.previewUrl.isEmpty() || !c.image.sampleUrl.isEmpty() ||
+                        c.image.isLocal())
+                        jobs.append(c.image);
                 }
             }
             if (!jobs.isEmpty())

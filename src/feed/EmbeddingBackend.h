@@ -5,6 +5,8 @@
 #include <QStringList>
 #include <functional>
 
+#include "../sources/Source.h"
+
 class QImage;
 
 namespace Mosaic {
@@ -57,11 +59,10 @@ class EmbeddingBackend {
 
     // Computes and stores the embedding from the thumbnail if missing.
     // Returns true when one is available afterwards.
-    bool ensureEmbedding(const QString& sourceId, const QString& md5, const QString& thumbnailUrl,
-                         const QString& localPath = {});
+    bool ensureEmbedding(const SourceImage& image);
 
     // Synchronous batch version; worker threads only.
-    int ensureEmbeddings(const QList<QPair<QString, QString>>& sourceIdMd5Url);
+    int ensureEmbeddings(const QList<SourceImage>& images);
 
     void setConfig(const Config& config);
 

@@ -354,8 +354,8 @@ QByteArray EmbeddingBackend::runInference(const QImage& image) {
     }
 }
 
-bool EmbeddingBackend::ensureEmbedding(const QString& sourceId, const QString& md5,
-                                       const QString& thumbnailUrl, const QString& localPath) {
+bool EmbeddingBackend::ensureEmbedding(const SourceImage& image) {
+    const QString& md5 = image.md5;
     if (md5.isEmpty())
         return false;
 
@@ -364,35 +364,30 @@ bool EmbeddingBackend::ensureEmbedding(const QString& sourceId, const QString& m
 
     // Fetch the thumbnail (never the full image); local sources read the
     // stored file instead.
-    Source* source = m_sources.source(sourceId);
+    Source* source = m_sources.source(image.sourceId);
     if (!source)
         return false;
-    if (!m_ready || (thumbnailUrl.isEmpty() && !source->isLocal())) {
+    if (!m_ready || (image.previewUrl.isEmpty() && image.sampleUrl.isEmpty() &&
+                     !source->isLocal())) {
         qDebug().noquote() << "EmbeddingBackend: skip" << md5.left(12) << "| ready:" << m_ready
-                           << "| url:" << (thumbnailUrl.isEmpty() ? "none" : "ok");
+                           << "| url:" << (image.previewUrl.isEmpty() ? "none" : "ok");
         return false;
     }
-    SourceImage thumb;
-    thumb.md5 = md5;
-    thumb.sourceId = sourceId;
-    thumb.previewUrl = thumbnailUrl;
-    thumb.fileUrl = thumbnailUrl;
-    thumb.localPath = localPath;
     QString fetchError;
-    const QByteArray bytes = source->fetch(thumb, FileKind::Preview, &fetchError);
+    const QByteArray bytes = source->fetch(image, FileKind::Preview, &fetchError);
     if (bytes.isEmpty()) {
         qWarning().noquote() << "EmbeddingBackend: thumbnail fetch failed for" << md5 << ":"
                              << fetchError;
         return false;
     }
 
-    QImage image;
-    if (!image.loadFromData(bytes)) {
+    QImage decoded;
+    if (!decoded.loadFromData(bytes)) {
         qWarning().noquote() << "EmbeddingBackend: thumbnail decode failed for" << md5;
         return false;
     }
 
-    const QByteArray packed = runInference(image);
+    const QByteArray packed = runInference(decoded);
     if (packed.isEmpty()) {
         qWarning().noquote() << "EmbeddingBackend: inference produced no embedding for"
                              << md5.left(12);
@@ -405,22 +400,13 @@ bool EmbeddingBackend::ensureEmbedding(const QString& sourceId, const QString& m
     return true;
 }
 
-int EmbeddingBackend::ensureEmbeddings(const QList<QPair<QString, QString>>& sourceIdMd5Url) {
+int EmbeddingBackend::ensureEmbeddings(const QList<SourceImage>& images) {
     int done = 0;
-    for (const auto& [sourceId, md5Url] : sourceIdMd5Url) {
-        const int sep = md5Url.indexOf(QLatin1Char('|'));
-        if (sep <= 0)
-            continue;
-        const QString md5 = md5Url.left(sep);
-        const QString rest = md5Url.mid(sep + 1);
-        // Optional third field: local file path.
-        const int sep2 = md5Url.indexOf(QLatin1Char('|'), sep + 1);
-        const QString url = sep2 > 0 ? md5Url.mid(sep + 1, sep2 - sep - 1) : md5Url.mid(sep + 1);
-        const QString localPath = sep2 > 0 ? md5Url.mid(sep2 + 1) : QString();
-        if (ensureEmbedding(sourceId, md5, url, localPath))
+    for (const SourceImage& image : images) {
+        if (ensureEmbedding(image))
             ++done;
     }
-    qDebug().noquote() << "EmbeddingBackend: batch done |" << done << "of" << sourceIdMd5Url.size()
+    qDebug().noquote() << "EmbeddingBackend: batch done |" << done << "of" << images.size()
                        << "embedded";
     return done;
 }
