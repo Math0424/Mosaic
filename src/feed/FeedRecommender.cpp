@@ -979,17 +979,14 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
         }
         if (seen.contains(img.md5)) {
             ++dropDup;
-            recordDrop(img, "dup");
             continue;
         }
         if (m_db.wasShown(img.md5)) {
             ++dropShown;
-            recordDrop(img, "shown");
             continue;
         }
         if (isAnimated(img)) {
             ++dropAnimated;
-            recordDrop(img, "animated");
             continue;
         }
         if (img.score < kMinPostScore) {
@@ -1026,9 +1023,6 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
                              << dropAnimated << "score" << dropScore << "hardNeg" << dropHardNeg
                              << "nomd5" << dropNoMd5;
     funnel.stage1Filtered = filtered.size();
-    funnel.dropShown = dropShown;
-    funnel.dropDup = dropDup;
-    funnel.dropAnimated = dropAnimated;
     funnel.dropScore = dropScore;
     funnel.dropHardNeg = dropHardNeg;
     funnel.dropNoMd5 = dropNoMd5;
@@ -1061,6 +1055,16 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
             shortlist = filtered;
         }
         funnel.stage2Shortlist = shortlist.size();
+
+        // Stage-2 drops are real rejections (taste mismatch), so they show
+        // up in the dropped-images view.
+        if (filtered.size() > kFunnelTasteCount) {
+            QSet<QString> kept;
+            for (const Candidate& c : shortlist) kept.insert(c.image.md5);
+            for (const Candidate& c : filtered)
+                if (!kept.contains(c.image.md5))
+                    recordDrop(c.image, QStringLiteral("tasteFilter"));
+        }
 
         // Stage 3: visual relevance via thumbnails
         if (m_embeddings && m_embeddings->isReady() && !shortlist.isEmpty()) {
@@ -1104,6 +1108,12 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
                       });
             for (int i = 0; i < qMin(kFunnelVisualCount, visualRanked.size()); ++i)
                 finalists.append(shortlist.at(visualRanked.at(i).second));
+
+            QSet<QString> finalistMd5s;
+            for (const Candidate& c : finalists) finalistMd5s.insert(c.image.md5);
+            for (const Candidate& c : shortlist)
+                if (!finalistMd5s.contains(c.image.md5))
+                    recordDrop(c.image, QStringLiteral("visualRank"));
         } else {
             finalists = shortlist.mid(0, kFunnelVisualCount);
         }

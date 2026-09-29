@@ -1382,18 +1382,13 @@ void FeedPage::refreshHeavyStats() {
                 h += QStringLiteral(
                     "<b style='color:#e8a33d; margin-top:8px;'>Last funnel "
                     "run</b><br>");
-                const int stage1Drops = f.dropShown + f.dropDup + f.dropAnimated + f.dropScore +
-                                        f.dropHardNeg + f.dropNoMd5;
+                const int stage1Drops = f.dropScore + f.dropHardNeg + f.dropNoMd5;
                 h += QStringLiteral(
                          "<b>stage 1</b> fetch + dedup + cheap filter: %1 kept · %2 dropped<br>")
                          .arg(f.stage1Filtered)
                          .arg(stage1Drops);
                 h += QStringLiteral(
-                         "<span style='color:#999'>shown %1 · dup %2 · animated %3 · lowScore "
-                         "%4 · hardNeg %5 · noMd5 %6</span><br>")
-                         .arg(f.dropShown)
-                         .arg(f.dropDup)
-                         .arg(f.dropAnimated)
+                         "<span style='color:#999'>lowScore %1 · hardNeg %2 · noMd5 %3</span><br>")
                          .arg(f.dropScore)
                          .arg(f.dropHardNeg)
                          .arg(f.dropNoMd5);

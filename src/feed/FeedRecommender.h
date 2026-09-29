@@ -62,9 +62,11 @@ class FeedRecommender {
     struct FunnelStats {
         int stage1Candidates = 0;
         int stage1Filtered = 0;
-        int dropShown = 0, dropDup = 0, dropAnimated = 0, dropScore = 0, dropHardNeg = 0,
-            dropNoMd5 = 0, dropNegVisual = 0;
-        // (post, reason) of stage-1 drops, capped - debug "dropped images" view.
+        // Shown/dup/animated are mechanical dedup, not rejections - not
+        // counted here.
+        int dropScore = 0, dropHardNeg = 0, dropNoMd5 = 0, dropNegVisual = 0;
+        // (post, reason) of funnel drops, capped - debug "dropped images"
+        // view. Stage-1 rejections plus stage-2/3 visual drops.
         QList<QPair<SourceImage, QString>> dropped;
         int stage2Shortlist = 0;
         int stage3Finalists = 0;
