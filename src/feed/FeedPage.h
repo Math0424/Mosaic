@@ -125,8 +125,10 @@ class FeedPage : public QWidget {
     QString m_heavyStatsHtml;  // last rendered "Totals & profile" HTML
     bool m_heavyStatsPending = false;
     qint64 m_lastHeavyStatsLoad = 0;
-    QString m_lastDebugHtml;           // last fully-rendered debug panel HTML
-    bool m_debugStatsPending = false;  // debug snapshot job in flight
+    FeedRecommender::ModelStats::TasteDetails m_tasteDetails;  // hover tooltips
+    QHash<QString, QString> m_postTagTips;  // upcoming-post md5 prefix -> tag tooltip
+    QString m_lastDebugHtml;                // last fully-rendered debug panel HTML
+    bool m_debugStatsPending = false;       // debug snapshot job in flight
 };
 
 }  // namespace Mosaic

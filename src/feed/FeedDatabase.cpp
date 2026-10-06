@@ -115,26 +115,31 @@ constexpr int kMinTasteTags = 3;
 constexpr int kTasteTagLimit = 15;
 // Positive strength deltas shrink toward this ceiling.
 constexpr double kStrengthCeiling = 12.0;
-constexpr double kTasteHalfLifeDays = 60.0;
+constexpr double kTasteHalfLifeDays = 5.0;
 constexpr double kExposureHalfLifeDays = 3.0;
 constexpr double kConfidenceRamp = 3.0;
 // Tastes below this strength are deleted by decayTastes() so new ones can
-// replace them instead of a stale taste squatting a slot forever.
-constexpr double kTasteRetireStrength = 0.5;
+// replace them instead of a stale taste squatting a slot forever. Must sit
+// well below the weakest creation weight (a normal view creates strength
+// 0.05) or fresh tastes get retired before they can grow.
+constexpr double kTasteRetireStrength = 0.15;
 
-// Negative model constants. Hard negatives are deliberately SLOW to learn:
-// reaching the hard filter requires ~15+ consistent explicit dislikes.
+// Negative model constants. Dislikes accumulate confidence fast: the hard
+// filter arms after ~6-10 consistent dislikes of a specific tag.
 constexpr double kHardNegativePreference = -0.5;
-constexpr double kHardNegativeConfidence = 15.0;
-constexpr double kDislikeDelta = -0.20;
+constexpr double kHardNegativeConfidence = 6.0;
+constexpr double kDislikeDelta = -0.35;
 constexpr double kSkipDelta = -0.01;
 // Near-universal tags are structurally barred from vetoing the feed.
 constexpr double kMinNegativeSpecificity = 0.35;
-constexpr double kDislikeConfidenceDelta = 0.4;
+constexpr double kDislikeConfidenceDelta = 1.5;
 constexpr double kFavoriteDelta = 0.10;
 constexpr double kLikeDelta = 0.06;
 constexpr double kViewDelta = 0.01;
-constexpr double kPrefHalfLifeDays = 90.0;
+// Positives fade in 5 days; negatives never decay - a tag you always
+// dislike must stay vetoed, not resurface just because suppressing it
+// means it rarely gets re-sampled.
+constexpr double kPrefHalfLifeDays = 5.0;
 
 // Session EMA time constant (average over ~this many recent interactions).
 constexpr double kSessionTau = 12.0;
@@ -399,7 +404,7 @@ void FeedDatabase::repairSkipPoisonedConfidence() {
     }
     if (alreadyDone)
         return;
-    // The hard filter needs confidence >= 15; old skip-poisoned rows sat far
+    // The hard filter needs confidence >= 6; old skip-poisoned rows sat far
     // above what real dislike evidence could produce. Cap at 4 - enough to
     // keep a tag eligible as a query exclusion, never enough to veto.
     conn.execute(
@@ -607,7 +612,9 @@ void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QStrin
                 }
                 duckdb_destroy_result(&res);
             }
-            const double decay = updated > 0 ? decayFactor(updated, kPrefHalfLifeDays) : 1.0;
+            // Decay only positive preferences; negatives persist forever.
+            const double decay =
+                updated > 0 && pref > 0.0 ? decayFactor(updated, kPrefHalfLifeDays) : 1.0;
             pref *= decay;
             conf *= decay;
             pref += tagPrefDelta;

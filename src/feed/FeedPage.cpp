@@ -32,6 +32,7 @@
 #include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
+#include <QToolTip>
 #include <QThreadPool>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -306,7 +307,70 @@ void FeedPage::buildUi() {
     auto* debugLayout = new QVBoxLayout(m_debugPanel);
     debugLayout->setContentsMargins(6, 6, 6, 6);
     m_debugText = new QTextBrowser(m_debugPanel);
+    m_debugText->setOpenLinks(false);
     debugLayout->addWidget(m_debugText, 1);
+
+    // Hovering a taste-profile line shows its full tag-weight breakdown.
+    connect(m_debugText, &QTextBrowser::highlighted, this, [this](const QUrl& url) {
+        const QString link = url.toString();
+        if (link.startsWith(QLatin1String("post:"))) {
+            const QString md5 = link.mid(5);
+            const QString tip = m_postTagTips.value(md5);
+            if (tip.isEmpty()) {
+                QToolTip::hideText();
+                return;
+            }
+            QToolTip::showText(
+                QCursor::pos(),
+                QStringLiteral("<b style='color:#e8a33d;'>%1</b><br>%2").arg(md5, tip),
+                m_debugText);
+            return;
+        }
+        if (!link.startsWith(QLatin1String("taste:"))) {
+            QToolTip::hideText();
+            return;
+        }
+        bool ok = false;
+        const int index = link.mid(6).toInt(&ok);
+        if (!ok || index < 0 || index >= m_tasteDetails.size()) {
+            QToolTip::hideText();
+            return;
+        }
+        const auto& t = m_tasteDetails.at(index);
+        QString tip = QStringLiteral(
+                          "<b style='color:#e8a33d;'>Taste #%1</b> %2<br>"
+                          "<span style='color:#999;'>strength %3 · confidence %4 · "
+                          "exposure %5 · engagement %6</span><br>")
+                          .arg(t.id)
+                          .arg(t.visual ? QStringLiteral("[visual]") : QStringLiteral("[tags]"))
+                          .arg(t.strength, 0, 'f', 2)
+                          .arg(t.confidence, 0, 'f', 2)
+                          .arg(t.exposure, 0, 'f', 2)
+                          .arg(t.engagement, 0, 'f', 2);
+        if (t.tags.isEmpty()) {
+            tip += QStringLiteral(
+                "<span style='color:#999;'>no tag vector (visual-only "
+                "taste)</span>");
+        } else {
+            tip += QStringLiteral(
+                "<b>Tags</b> <span style='color:#999;'>(niche = query "
+                "rank score, w = taste vector weight)</span><br>");
+            QStringList rows;
+            for (int i = 0; i < t.tags.size(); ++i) {
+                const auto& tag = t.tags.at(i);
+                // The top-niche tag is the query anchor for this taste.
+                const char* color = i == 0 ? "#e8a33d" : (tag.weight >= 0 ? "#5fbf6f" : "#e05a5a");
+                rows << QStringLiteral(
+                            "<span style='color:%1'>%2</span> "
+                            "<span style='color:#999;'>niche %3 · w %4</span>")
+                            .arg(QLatin1String(color), tag.name.toHtmlEscaped())
+                            .arg(tag.niche, 0, 'f', 3)
+                            .arg(tag.weight, 0, 'f', 3);
+            }
+            tip += rows.join(QStringLiteral("<br>"));
+        }
+        QToolTip::showText(QCursor::pos(), tip, m_debugText);
+    });
 
     m_droppedButton = new QPushButton(QStringLiteral("Dropped images"), m_debugPanel);
     m_droppedButton->setToolTip(
@@ -1022,8 +1086,9 @@ void FeedPage::updateDebugPanel() {
         qint64 sessionMs = 0;
         int queueSize = 0;
         QList<QPair<QString, QString>> recent;
-        QString currentHtml;   // pre-rendered current-post section
-        QString upcomingHtml;  // pre-rendered upcoming-queue section
+        QString currentHtml;                  // pre-rendered current-post section
+        QString upcomingHtml;                 // pre-rendered upcoming-queue section
+        QHash<QString, QString> postTagTips;  // md5-prefix -> tag tooltip html
     };
 
     const int position = m_position;
@@ -1130,18 +1195,23 @@ void FeedPage::updateDebugPanel() {
         // upcoming queue, with the total fed count on the header line.
         // The visual-model verdict lives here too: it predicts whether the
         // user will like each upcoming post, which is the actionable
-        // question (the current post is already on screen).
+        // question (the current post is already on screen). Each line is a
+        // link; hovering shows the post's tags with learned ratings.
         html += QStringLiteral("<b style='%1'>Upcoming</b> · total fed %2<br>")
                     .arg(kTitle)
                     .arg(static_cast<qint64>(db->totalImpressions()));
+        const auto prefRows = db->tagPreferenceRows();
+        auto shrunk = [](double pref, double conf) { return pref * (conf / (conf + 3.0)); };
         for (int i = position + 1; i < qMin(position + 6, queue.size()); ++i) {
-            const FeedDatabase::RecommendationRow bd = rec->explainPost(queue.at(i));
+            const SourceImage& img = queue.at(i);
+            const FeedDatabase::RecommendationRow bd = rec->explainPost(img);
             const QString scoreColor = bd.finalScore >= 0 ? kPos : kNeg;
-            html += QStringLiteral("%1… <span style='%2'>score %3</span>")
-                        .arg(queue.at(i).md5.left(8))
-                        .arg(scoreColor)
+            html += QStringLiteral(
+                        "<a href='post:%1' style='color:#cccccc; "
+                        "text-decoration:none;'>%1…</a> <span style='%2'>score %3</span>")
+                        .arg(img.md5.left(8), scoreColor)
                         .arg(bd.finalScore, 0, 'f', 2);
-            const FeedRecommender::VisualVerdict vv = rec->explainVisual(queue.at(i));
+            const FeedRecommender::VisualVerdict vv = rec->explainVisual(img);
             if (vv.available) {
                 const char* verdictColor =
                     vv.bestSim >= 0.5 ? kPos : (vv.bestSim >= 0.3 ? kDim : kNeg);
@@ -1153,16 +1223,45 @@ void FeedPage::updateDebugPanel() {
                             .arg(vv.bestSim, 0, 'f', 2);
             }
             html += QStringLiteral("<br>");
+
+            // Cache the tag breakdown for the hover tooltip, strongest first.
+            struct TagRow {
+                QString tag;
+                double w;
+            };
+            QList<TagRow> ranked;
+            for (const SourceTag& t : img.tags) {
+                const QString tag = t.name.trimmed().toLower();
+                auto it = prefRows.constFind(tag);
+                const double w = it != prefRows.constEnd()
+                                     ? shrunk(it.value().preference, it.value().confidence)
+                                     : 0.0;
+                ranked.append({tag, w});
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const TagRow& a, const TagRow& b) { return a.w > b.w; });
+            QStringList tagRows;
+            for (const TagRow& r : ranked) {
+                const char* color = r.w < -0.05 ? kNeg : (r.w > 0.05 ? kPos : kDim);
+                tagRows << QStringLiteral("<span style='color:%1'>%2 %3</span>")
+                               .arg(QLatin1String(color), r.tag.toHtmlEscaped())
+                               .arg(r.w, 0, 'f', 2);
+            }
+            snap.postTagTips.insert(img.md5.left(8),
+                                    tagRows.isEmpty()
+                                        ? QStringLiteral("<span style='color:#999;'>no tags</span>")
+                                        : tagRows.join(QStringLiteral("<br>")));
         }
 
         if (!self)
             return;
         QMetaObject::invokeMethod(
             self.data(),
-            [self, html]() {
+            [self, html, snap]() {
                 if (!self)
                     return;
                 self->m_debugStatsPending = false;
+                self->m_postTagTips = snap.postTagTips;
                 if (!self->m_debugPanel || !self->m_debugPanel->isVisible())
                     return;
                 // Heavy stats are cached HTML built by the heavy loader.
@@ -1195,8 +1294,10 @@ void FeedPage::refreshHeavyStats() {
         QHash<QString, qint64> lingers;
         QHash<QString, int> interactions;
         QStringList tasteSummary;
+        FeedRecommender::ModelStats::TasteDetails tasteDetails;
         QList<QPair<QString, double>> likedTags;
         QList<QPair<QString, double>> dislikedTags;
+        FeedRecommender::ModelStats::TagNegs dislikedTagsFull;
         int tasteCount = 0;
         int hardNegatives = 0;
         QStringList hardNegativeTags;
@@ -1221,8 +1322,10 @@ void FeedPage::refreshHeavyStats() {
         {
             const FeedRecommender::ModelStats ms = rec->modelStats();
             stats.tasteSummary = ms.tasteSummary;
+            stats.tasteDetails = ms.tasteDetails;
             stats.likedTags = ms.likedTags;
             stats.dislikedTags = ms.dislikedTags;
+            stats.dislikedTagsFull = ms.dislikedTagsFull;
             stats.tasteCount = ms.tasteCount;
             stats.hardNegatives = ms.hardNegatives;
             stats.hardNegativeTags = ms.hardNegativeTags;
@@ -1245,6 +1348,7 @@ void FeedPage::refreshHeavyStats() {
                     return;
                 self->m_heavyStatsPending = false;
                 self->m_lastHeavyStatsLoad = QDateTime::currentMSecsSinceEpoch();
+                self->m_tasteDetails = stats.tasteDetails;
 
                 QString h;
                 // Interactions, compact: positives on one line, negatives on
@@ -1290,15 +1394,21 @@ void FeedPage::refreshHeavyStats() {
                                                   : parts.join(QStringLiteral(", ")));
                 }
 
-                // Taste profiles, capped at 12 lines.
+                // Taste profiles, capped at 12 lines. Each line is a link
+                // with a hover tooltip showing the full tag-weight breakdown.
                 h += QStringLiteral(
                     "<b style='color:#e8a33d; margin-top:8px;'>Taste profiles</b><br>");
                 if (stats.tasteSummary.isEmpty()) {
                     h += QStringLiteral("<span style='color:#999'>(none learned yet)</span><br>");
                 } else {
                     const int shown = qMin(12, stats.tasteSummary.size());
-                    for (int i = 0; i < shown; ++i)
-                        h += stats.tasteSummary.at(i).toHtmlEscaped() + QStringLiteral("<br>");
+                    for (int i = 0; i < shown; ++i) {
+                        h += QStringLiteral(
+                                 "<a href='taste:%1' style='color:#cccccc; "
+                                 "text-decoration:none;'>%2</a><br>")
+                                 .arg(i)
+                                 .arg(stats.tasteSummary.at(i).toHtmlEscaped());
+                    }
                     if (stats.tasteSummary.size() > shown)
                         h += QStringLiteral("<span style='color:#999'>… +%1 more</span><br>")
                                  .arg(stats.tasteSummary.size() - shown);

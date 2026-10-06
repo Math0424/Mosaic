@@ -28,8 +28,7 @@ QString SourceImage::tooltipHtml() const {
                        .arg(tag.name.toHtmlEscaped());
     }
 
-    const QString tagSection =
-        tags.isEmpty() ? QString() : QStringLiteral("<br><br>Tags: ") + tagHtml;
+    const QString tagSection = tags.isEmpty() ? QString() : QStringLiteral("<br>Tags: ") + tagHtml;
 
     return QStringLiteral(
                "<div style=\"width:80ch; text-align:justify;\">"

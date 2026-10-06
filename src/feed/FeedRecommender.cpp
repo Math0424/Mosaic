@@ -33,7 +33,7 @@ constexpr double kNoveltyWeight = 0.04;
 constexpr double kExplorationWeight = 0.03;
 constexpr double kPopularityWeight = 0.03;
 // Soft penalty for resembling a learned negative visual anchor.
-constexpr double kNegAnchorWeight = 0.12;
+constexpr double kNegAnchorWeight = 0.30;
 
 // Per-batch diversity guard: no taste may claim more than this share.
 constexpr double kMaxShareOfBatchPerTaste = 0.5;
@@ -1156,21 +1156,35 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
     const QList<FeedDatabase::Taste> tastes = m_db.tastes();
     stats.tasteCount = tastes.size();
     for (const FeedDatabase::Taste& t : tastes) {
+        ModelStats::TasteDetail detail;
         QString topTags;
+        detail.id = t.id;
+        detail.strength = t.strength;
+        detail.confidence = t.confidence;
+        detail.exposure = t.exposure;
+        detail.engagement = t.engagement;
+        detail.visual = !t.visual.isEmpty();
         if (!t.embedding.isEmpty()) {
-            QList<QPair<double, QString>> ranked;
-            for (auto it = t.embedding.constBegin(); it != t.embedding.constEnd(); ++it)
-                ranked.append({it.value(), it.key()});
+            const QHash<QString, double> specificity = m_db.tagSpecificities();
+            QList<ModelStats::TasteDetail::Tag> ranked;
+            for (auto it = t.embedding.constBegin(); it != t.embedding.constEnd(); ++it) {
+                ModelStats::TasteDetail::Tag tag;
+                tag.name = it.key();
+                tag.weight = it.value();
+                tag.niche = queryNicheScore(it.key(), it.value(), specificity);
+                ranked.append(tag);
+            }
             std::sort(ranked.begin(), ranked.end(),
-                      [](const QPair<double, QString>& a, const QPair<double, QString>& b) {
-                          return a.first > b.first;
-                      });
+                      [](const ModelStats::TasteDetail::Tag& a,
+                         const ModelStats::TasteDetail::Tag& b) { return a.niche > b.niche; });
             QStringList names;
-            for (int i = 0; i < qMin(3, ranked.size()); ++i) names << ranked.at(i).second;
+            for (int i = 0; i < qMin(3, ranked.size()); ++i) names << ranked.at(i).name;
             topTags = names.join(QLatin1Char('/'));
+            detail.tags = ranked;
         } else {
             topTags = QStringLiteral("[visual]");
         }
+        stats.tasteDetails.append(detail);
         stats.tasteSummary
             << QStringLiteral("t%1 (%2) %3").arg(t.id).arg(t.strength, 0, 'f', 1).arg(topTags);
     }
@@ -1202,6 +1216,16 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
             stats.likedTags.append({pos.at(i).second, pos.at(i).first});
         for (int i = 0; i < qMin(10, neg.size()); ++i)
             stats.dislikedTags.append({neg.at(i).second, neg.at(i).first});
+        // Full negative list with confidence, for debugging resurfacing tags.
+        for (auto it = rows.constBegin(); it != rows.constEnd(); ++it) {
+            if (it.value().preference < 0.0)
+                stats.dislikedTagsFull.append(
+                    {it.key(), it.value().preference, it.value().confidence});
+        }
+        std::sort(stats.dislikedTagsFull.begin(), stats.dislikedTagsFull.end(),
+                  [](const ModelStats::TagNeg& a, const ModelStats::TagNeg& b) {
+                      return a.pref < b.pref;
+                  });
     }
     stats.sessionBlend = sessionBlendFor(stats.skipStreak);
     {

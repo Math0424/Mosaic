@@ -38,6 +38,24 @@ class FeedRecommender {
     static QStringList contentTags(const SourceImage& image);
 
     struct ModelStats {
+        // Full per-taste breakdown for the debug-panel hover tooltip.
+        struct TasteDetail {
+            qint64 id = 0;
+            double strength = 0.0;
+            double confidence = 0.0;
+            double exposure = 0.0;
+            double engagement = 0.0;
+            bool visual = false;  // has a visual embedding vector
+            // Per-tag: taste vector weight + query niche score (what the
+            // candidate-generation arm actually ranks by).
+            struct Tag {
+                QString name;
+                double weight = 0.0;
+                double niche = 0.0;
+            };
+            QList<Tag> tags;  // ranked by niche score
+        };
+        using TasteDetails = QList<TasteDetail>;
         int tasteCount = 0;
         int totalShown = 0;
         int favPosts = 0;
@@ -46,8 +64,18 @@ class FeedRecommender {
         int skipStreak = 0;
         double sessionBlend = 0.0;
         QStringList tasteSummary;
+        QList<TasteDetail> tasteDetails;
         QList<QPair<QString, double>> likedTags;
         QList<QPair<QString, double>> dislikedTags;
+        // Every negatively-scored tag with raw preference + confidence,
+        // for debugging tags that keep resurfacing.
+        struct TagNeg {
+            QString tag;
+            double pref = 0.0;
+            double conf = 0.0;
+        };
+        using TagNegs = QList<TagNeg>;
+        TagNegs dislikedTagsFull;
         int negativeAnchors = 0;
         double totalImpressions = 0.0;
         QStringList lowSpecificityTags;
