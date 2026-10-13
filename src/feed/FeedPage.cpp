@@ -15,6 +15,7 @@
 
 #include <QAbstractItemView>
 #include <QDateTime>
+#include <QApplication>
 #include <QCompleter>
 #include <QDialog>
 #include <QDir>
@@ -29,6 +30,10 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSet>
+#include <QDebug>
+#include <QLoggingCategory>
+Q_DECLARE_LOGGING_CATEGORY(lcFeed)
 #include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
@@ -203,7 +208,9 @@ void FeedPage::buildUi() {
     m_swayCompleter->setFilterMode(Qt::MatchStartsWith);
     m_swayCompleter->setMaxVisibleItems(12);
     m_swayCompleter->setWidget(m_swayEdit);
-    m_swayEdit->setCompleter(m_swayCompleter);
+    // Do NOT also call m_swayEdit->setCompleter(): QLineEdit's built-in
+    // completer handling then suppresses our manual complete() calls after
+    // the first popup (suggestions die after a space until re-click).
     m_swayEdit->installEventFilter(this);
     m_swayButton = new QPushButton(QStringLiteral("Sway"), this);
     m_swayButton->setToolTip(
@@ -405,8 +412,14 @@ void FeedPage::buildUi() {
 
 bool FeedPage::eventFilter(QObject* watched, QEvent* event) {
     // Click anywhere to restore keyboard focus; double-click likes + advances.
+    // Never steal focus from widgets that take keyboard input themselves
+    // (e.g. the sway line edit) - otherwise typed keys fall through to
+    // keyPressEvent and navigate the feed, and QCompleter::complete()
+    // silently no-ops because its widget lost focus.
     if (event->type() == QEvent::MouseButtonPress && watched != m_tagSidebar) {
-        setFocus();
+        auto* w = qobject_cast<QWidget*>(watched);
+        if (!w || w->focusPolicy() == Qt::NoFocus)
+            setFocus();
     }
     if (event->type() == QEvent::MouseButtonDblClick && watched == m_stage) {
         onLikeClicked();
@@ -436,6 +449,16 @@ bool FeedPage::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void FeedPage::keyPressEvent(QKeyEvent* event) {
+    // Defensive: if the sway edit (or its completer popup) somehow holds
+    // focus, let it handle the key instead of navigating the feed.
+    QWidget* focus = QApplication::focusWidget();
+    if (focus && focus != this && (focus == m_swayEdit || focus->isAncestorOf(m_swayEdit) ||
+                                    (m_swayCompleter->popup() &&
+                                     (focus == m_swayCompleter->popup() ||
+                                      focus->isAncestorOf(m_swayCompleter->popup()))))) {
+        QWidget::keyPressEvent(event);
+        return;
+    }
     if (event->isAutoRepeat()) {
         event->accept();
         return;
@@ -1038,6 +1061,11 @@ void FeedPage::updateSwayCompletion() {
         const int leftX = m_swayEdit->fontMetrics().horizontalAdvance(text.left(start)) +
                           m_swayEdit->rect().left();
         rect.setLeft(leftX);
+        // QCompleter skips complete() when it thinks the popup is already
+        // up; hide it first so suggestions reliably reappear (e.g. after a
+        // space splits the token).
+        if (m_swayCompleter->popup() && m_swayCompleter->popup()->isVisible())
+            m_swayCompleter->popup()->hide();
         m_swayCompleter->complete(rect);
     } else if (m_swayCompleter->popup()) {
         m_swayCompleter->popup()->hide();

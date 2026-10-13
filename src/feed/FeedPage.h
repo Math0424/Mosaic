@@ -52,6 +52,8 @@ class FeedPage : public QWidget {
     void onSoftReset();
     void onHardReset();
 
+   private:
+
    signals:
     void tagSearchRequested(const QString& tag, const QString& sourceId);
 

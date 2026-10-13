@@ -194,6 +194,10 @@ class FeedDatabase {
     // The most recent interactions, newest first ("kind", "md5").
     QList<QPair<QString, QString>> recentInteractions(int limit = 5) const;
 
+    // Debug: every md5 the user reacted positively to (like/favorite),
+    // newest first. Distinct - one entry per post.
+    QList<QPair<QString, QString>> likedInteractions(int limit = 500) const;
+
     // recommendation debug
 
     // One ranked candidate's full score breakdown.
@@ -235,7 +239,6 @@ class FeedDatabase {
     // Forgets everything (tastes, preferences, history). Used by a reset.
     void reset(QString* error = nullptr);
 
-   private:
     void ensureSchema();
     // One-time repair of tag confidence poisoned by skip events.
     void repairSkipPoisonedConfidence();

@@ -1665,8 +1665,38 @@ QList<QPair<QString, QString>> FeedDatabase::recentInteractions(int limit) const
     return out;
 }
 
-// recommendation debug
+QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit) const {
+    QList<QPair<QString, QString>> out;
+    if (!m_db)
+        return out;
 
+    QReadLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return out;
+
+    duckdb_result res{};
+    if (!conn.query(QStringLiteral("SELECT md5, max(source_id) FROM feed_events "
+                                   "WHERE event_type IN ('like', 'favorite') "
+                                   "GROUP BY md5 ORDER BY max(\"timestamp\") DESC LIMIT %1")
+                        .arg(limit),
+                    &res))
+        return out;
+    for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
+        char* md5Value = duckdb_value_varchar(&res, 0, row);
+        char* srcValue = duckdb_value_varchar(&res, 1, row);
+        const QString md5 = md5Value ? QString::fromUtf8(md5Value) : QString();
+        const QString src = srcValue ? QString::fromUtf8(srcValue) : QString();
+        duckdb_free(md5Value);
+        duckdb_free(srcValue);
+        if (!md5.isEmpty())
+            out.append({md5, src});
+    }
+    duckdb_destroy_result(&res);
+    return out;
+}
+
+// recommendation debug
 void FeedDatabase::recordRecommendations(const QList<RecommendationRow>& rows) {
     if (!m_db || rows.isEmpty())
         return;
