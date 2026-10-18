@@ -28,6 +28,12 @@ class LibraryImporter {
     int scanLibrary(const std::function<void(int, int)>& progress = nullptr,
                     QString* error = nullptr);
 
+    // Re-attempts remote md5 lookups for cataloged images still carrying the
+    // "usergroup:notags" marker; on a match the marker is replaced by the
+    // resolved tags and metadata. Synchronous - call from a worker thread.
+    int refreshUntagged(const std::function<void(int, int)>& progress = nullptr,
+                        QString* error = nullptr);
+
    private:
     // Shared by importFolder and scanLibrary; with removeOriginal the
     // source file is deleted once its md5-named copy exists.

@@ -27,6 +27,11 @@ class LibraryCatalog {
 
     bool hasImage(const QString& md5) const;
 
+    // All cataloged images carrying the given tag (exact name, optional
+    // category); used for the startup notags refresh pass.
+    QList<SourceImage> imagesWithTag(const QString& tagName,
+                                     const QString& category = QString()) const;
+
     // files
 
     static QString filePathFor(const QString& md5, const QString& format);

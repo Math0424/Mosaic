@@ -71,6 +71,8 @@ class LibrarySource : public Source {
                             const QString& userTag = QString());
     int scanLibrary(const std::function<void(int, int)>& progress = nullptr,
                     QString* error = nullptr);
+    int refreshUntagged(const std::function<void(int, int)>& progress = nullptr,
+                        QString* error = nullptr);
 
    private:
     // Maps a ghost md5 (deleted side of a resolved pair) onto the

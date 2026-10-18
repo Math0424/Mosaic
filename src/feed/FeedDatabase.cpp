@@ -139,7 +139,7 @@ constexpr double kViewDelta = 0.01;
 // Positives fade in 5 days; negatives never decay - a tag you always
 // dislike must stay vetoed, not resurface just because suppressing it
 // means it rarely gets re-sampled.
-constexpr double kPrefHalfLifeDays = 5.0;
+constexpr double kPrefHalfLifeDays = 15.0;
 
 // Session EMA time constant (average over ~this many recent interactions).
 constexpr double kSessionTau = 12.0;

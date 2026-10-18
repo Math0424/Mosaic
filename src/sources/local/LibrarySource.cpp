@@ -177,4 +177,9 @@ int LibrarySource::scanLibrary(const std::function<void(int, int)>& progress, QS
     return importer.scanLibrary(progress, error);
 }
 
+int LibrarySource::refreshUntagged(const std::function<void(int, int)>& progress, QString* error) {
+    LibraryImporter importer;
+    return importer.refreshUntagged(progress, error);
+}
+
 }  // namespace Mosaic

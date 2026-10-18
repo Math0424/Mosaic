@@ -319,6 +319,57 @@ bool LibraryCatalog::hasImage(const QString& md5) const {
 
 // files
 
+QList<SourceImage> LibraryCatalog::imagesWithTag(const QString& tagName,
+                                                 const QString& category) const {
+    using namespace LibrarySql;
+
+    QList<SourceImage> images;
+    const QString name = tagName.trimmed().toLower();
+    if (name.isEmpty())
+        return images;
+
+    Database& db = Database::instance();
+    if (!db.isOpen())
+        return images;
+    DbConnection conn = db.connection();
+    if (!conn.isOpen())
+        return images;
+
+    QString sql = QStringLiteral(
+        "SELECT i.md5, i.width, i.height, i.file_size, i.format, i.rating, "
+        "       i.source_id, i.remote_id, i.id, epoch(i.created_at), "
+        "       epoch(i.imported_at), i.parent_id, i.source_url, "
+        "       EXISTS (SELECT 1 FROM images c WHERE c.parent_id = i.id) "
+        "FROM images i "
+        "WHERE EXISTS ("
+        "  SELECT 1 FROM image_tags it "
+        "  JOIN tags t ON t.id = it.tag_id "
+        "  WHERE it.image_id = i.id AND lower(t.name) = %1");
+    if (!category.isEmpty())
+        sql += QStringLiteral(" AND t.category = %2").arg(quoted(category));
+    sql += QStringLiteral(")");
+
+    duckdb_result res{};
+    QString error;
+    if (!conn.query(sql, &res, &error))
+        return images;
+    const idx_t rowCount = duckdb_row_count(&res);
+    images.reserve(static_cast<int>(rowCount));
+    QStringList md5s;
+    md5s.reserve(static_cast<int>(rowCount));
+    for (idx_t row = 0; row < rowCount; ++row) {
+        SourceImage img = readImageRow(&res, row);
+        img.localPath = filePathFor(img.md5, img.format);
+        img.status = QStringLiteral("active");
+        images.append(img);
+        md5s << quoted(img.md5);
+    }
+    duckdb_destroy_result(&res);
+    if (!images.isEmpty())
+        attachTags(conn, images, md5s);
+    return images;
+}
+
 QString LibraryCatalog::filePathFor(const QString& md5, const QString& format) {
     const QString dir = Paths::libraryDir();
     if (!format.isEmpty()) {
@@ -539,51 +590,63 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
     using namespace LibrarySql;
 
     ImportResult result;
+    QString md5;
+    QString ext;
     if (data.isEmpty()) {
-        result.error = QStringLiteral("No image data to save");
-        return result;
-    }
-
-    Paths::ensureCreated();
-
-    // Content-addressed name: the MD5 of the bytes is the primary key.
-    const QString md5 =
-        QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Md5).toHex());
-
-    QString ext = meta.format.toLower();
-    if (ext.isEmpty() && !meta.fileUrl.isEmpty()) {
-        const int dot = meta.fileUrl.lastIndexOf(QLatin1Char('.'));
-        if (dot >= 0)
-            ext = meta.fileUrl.mid(dot + 1).toLower();
-    }
-    if (ext.isEmpty())
-        ext = QStringLiteral("bin");
-
-    const QString filePath = Paths::libraryDir() + QLatin1Char('/') + md5 + QLatin1Char('.') + ext;
-
-    if (QFile::exists(filePath)) {
+        // Tag-refresh pass: the image is already stored; only update its
+        // catalog row and tags. The md5 must match an existing entry.
+        if (meta.md5.isEmpty() || !hasImage(meta.md5)) {
+            result.error = QStringLiteral("No image data to save");
+            return result;
+        }
         result.ok = true;
         result.alreadyExisted = true;
-        result.filePath = filePath;
+        md5 = meta.md5;
+        SourceImage existing;
+        lookupByMd5(meta.md5, &existing);
+        result.filePath = existing.localPath;
+        ext = existing.format;
     } else {
-        QSaveFile file(filePath);
-        if (!file.open(QIODevice::WriteOnly)) {
-            result.error = file.errorString();
-            return result;
-        }
-        file.write(data);
-        if (!file.commit()) {
-            result.error = file.errorString();
-            return result;
-        }
-        result.filePath = filePath;
-    }
+        Paths::ensureCreated();
 
-    // Ensure the on-disk file timestamps reflect the original creation time
-    // when provided by the source (or now when absent).
-    const qint64 ts =
-        meta.createdAt > 0 ? meta.createdAt : QDateTime::currentDateTime().toSecsSinceEpoch();
-    LibraryUtils::setFileTimestamps(result.filePath, ts);
+        // Content-addressed name: the MD5 of the bytes is the primary key.
+        md5 = QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Md5).toHex());
+
+        ext = meta.format.toLower();
+        if (ext.isEmpty() && !meta.fileUrl.isEmpty()) {
+            const int dot = meta.fileUrl.lastIndexOf(QLatin1Char('.'));
+            if (dot >= 0)
+                ext = meta.fileUrl.mid(dot + 1).toLower();
+        }
+        if (ext.isEmpty())
+            ext = QStringLiteral("bin");
+
+        const QString filePath = Paths::libraryDir() + QLatin1Char('/') + md5 + QLatin1Char('.') + ext;
+
+        if (QFile::exists(filePath)) {
+            result.ok = true;
+            result.alreadyExisted = true;
+            result.filePath = filePath;
+        } else {
+            QSaveFile file(filePath);
+            if (!file.open(QIODevice::WriteOnly)) {
+                result.error = file.errorString();
+                return result;
+            }
+            file.write(data);
+            if (!file.commit()) {
+                result.error = file.errorString();
+                return result;
+            }
+            result.filePath = filePath;
+        }
+
+        // Ensure the on-disk file timestamps reflect the original creation time
+        // when provided by the source (or now when absent).
+        const qint64 ts =
+            meta.createdAt > 0 ? meta.createdAt : QDateTime::currentDateTime().toSecsSinceEpoch();
+        LibraryUtils::setFileTimestamps(result.filePath, ts);
+    }
 
     // Catalog entry. Keep the original creation timestamp from the source;
     // imported_at is stamped now by the schema default.
@@ -635,7 +698,6 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
             .arg(meta.remoteId)
             .arg(quoted(meta.sourceUrl))
             .arg(createdAtSql);
-
     QString dbError;
     if (!conn.execute(upsert, &dbError)) {
         result.error = dbError;

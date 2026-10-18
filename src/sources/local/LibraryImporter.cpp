@@ -135,6 +135,76 @@ int LibraryImporter::scanLibrary(const std::function<void(int, int)>& progress, 
     return imported;
 }
 
+int LibraryImporter::refreshUntagged(const std::function<void(int, int)>& progress,
+                                     QString* error) {
+    LibraryCatalog catalog;
+    LibraryTagService tagService;
+
+    // All cataloged images still carrying the notags marker.
+    const QList<SourceImage> untagged =
+        catalog.imagesWithTag(QStringLiteral("notags"), QStringLiteral("usergroup"));
+    const int total = untagged.size();
+    int refreshed = 0;
+    int done = 0;
+
+    SourceManager manager;
+    manager.applyGelbooruCredentials(AppState::readSiteCredentials());
+    const QList<Source*> remotes = manager.remoteSources();
+
+    for (const SourceImage& img : untagged) {
+        if (progress)
+            progress(++done, total);
+
+        // Skip entries whose md5 is missing or malformed - they cannot be
+        // looked up remotely. Ghost md5s of resolved duplicate pairs are
+        // naturally skipped here too, since their surviving counterpart is
+        // the image that actually exists in the catalog.
+        const QString md5 = img.md5;
+        if (md5.isEmpty() || !LibraryUtils::isValidMd5(md5))
+            continue;
+
+        bool match = false;
+        QList<SourceTag> tags;
+        SourceImage meta;
+
+        for (Source* s : remotes) {
+            SourceQuery q;
+            q.tags = QStringLiteral("md5:%1").arg(md5);
+            q.page = 1;
+            q.limit = 1;
+            const SourceResult lookup = s->search(q);
+            if (lookup.ok && !lookup.images.isEmpty()) {
+                meta = lookup.images.first();
+                tags = meta.tags;
+                match = true;
+                break;
+            }
+        }
+
+        if (!match)
+            continue;
+
+        // Replace the notags marker with the resolved tags and metadata.
+        meta.md5 = md5;
+        meta.tags = tags;
+        const ImportResult result = catalog.importImage(meta, QByteArray());
+        if (!result.ok) {
+            const QString msg = QStringLiteral("Tag refresh failed for %1: %2")
+                                    .arg(md5)
+                                    .arg(result.error);
+            qWarning().noquote() << msg;
+            LibraryUtils::logImportFailure(msg);
+            continue;
+        }
+        tagService.removeTag(md5, QStringLiteral("notags"));
+        ++refreshed;
+    }
+
+    if (progress)
+        progress(total, total);
+    return refreshed;
+}
+
 LibraryImporter::Outcome LibraryImporter::importOneFile(const QFileInfo& fi, bool markFavorite,
                                                         const QString& userTag,
                                                         bool removeOriginal) {

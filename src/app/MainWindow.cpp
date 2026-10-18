@@ -705,11 +705,29 @@ void MainWindow::startLibraryScan() {
                     Qt::QueuedConnection);
             },
             &error);
+        int refreshed = 0;
+        if (error.isEmpty()) {
+            refreshed = library.refreshUntagged(
+                [self](int done, int total) {
+                    if (!self)
+                        return;
+                    QMetaObject::invokeMethod(
+                        self.data(),
+                        [self, done, total]() {
+                            if (self)
+                                self->setStatus(QStringLiteral("Refreshing tags… %1 / %2")
+                                                    .arg(done)
+                                                    .arg(total));
+                        },
+                        Qt::QueuedConnection);
+                },
+                &error);
+        }
         if (!self)
             return;
         QMetaObject::invokeMethod(
             self.data(),
-            [self, imported, error]() {
+            [self, imported, refreshed, error]() {
                 if (!self)
                     return;
                 if (!error.isEmpty()) {
@@ -717,10 +735,13 @@ void MainWindow::startLibraryScan() {
                     return;
                 }
                 self->setStatus(
-                    imported > 0
-                        ? QStringLiteral("Library scan: imported %1 new file(s)").arg(imported)
+                    imported > 0 || refreshed > 0
+                        ? QStringLiteral("Library scan: imported %1 new file(s), refreshed tags on "
+                                         "%2 image(s)")
+                              .arg(imported)
+                              .arg(refreshed)
                         : QStringLiteral("Library scan: nothing new"));
-                if (imported > 0) {
+                if (imported > 0 || refreshed > 0) {
                     for (int i = 0; i < self->m_tabs->count(); ++i) {
                         auto* browser = qobject_cast<SourceBrowser*>(self->m_tabs->widget(i));
                         if (browser && browser->source() && browser->source()->isLocal() &&
