@@ -85,4 +85,9 @@ See the **[build guide](src/README.md)** for prerequisites and commands.
 | `Ctrl+S` | Save to library and advance |
 | `F12` | Toggle debug info |
 
+The debug sidebar also has **Dropped images** (why the funnel rejected posts)
+and **Liked posts**, which opens every liked/saved post in the viewer. Liked
+posts are paged in as you walk toward the end of the loaded list, so a profile
+with thousands of likes never loads all at once.
+
 ---

@@ -4,7 +4,9 @@
 #include "FeedRecommender.h"
 
 #include "../components/MediaCache.h"
+#include "../components/ViewerWindow.h"
 
+#include <QPointer>
 #include <QSet>
 #include <QWidget>
 
@@ -23,6 +25,7 @@ class EmbeddingBackend;
 class AppState;
 class SourceManager;
 class TagSidebar;
+class MultiSource;
 
 // TikTok-style vertical feed of recommended posts. One post fills the
 // viewport; wheel/Space/Next advance. Interactions (watch, like, save,
@@ -49,6 +52,7 @@ class FeedPage : public QWidget {
     void onDislikeClicked();
     void onSaveClicked();
     void toggleDebug();
+    void toggleLiked();
     void onSoftReset();
     void onHardReset();
 
@@ -75,6 +79,10 @@ class FeedPage : public QWidget {
     void applySwayTags();
     void updateSwayCompletion();
     void toggleDropped();
+    // Debug: opens every liked/favorited post in a viewer, paging the DB
+    // as the user walks toward the end of the loaded window.
+    void openLikedViewer();
+    void loadLikedPage();
 
     SourceManager& m_sources;
     FeedDatabase* m_db = nullptr;
@@ -97,6 +105,7 @@ class FeedPage : public QWidget {
     QPushButton* m_softResetButton = nullptr;  // rebuild profile from favorites
     QPushButton* m_hardResetButton = nullptr;  // full wipe
     QPushButton* m_droppedButton = nullptr;    // debug: list stage-1 dropped images
+    QPushButton* m_likedButton = nullptr;      // debug: view every liked post
     QLineEdit* m_swayEdit = nullptr;           // temporary taste-sway tags
     QPushButton* m_swayButton = nullptr;
     QCompleter* m_swayCompleter = nullptr;
@@ -131,6 +140,19 @@ class FeedPage : public QWidget {
     QHash<QString, QString> m_postTagTips;  // upcoming-post md5 prefix -> tag tooltip
     QString m_lastDebugHtml;                // last fully-rendered debug panel HTML
     bool m_debugStatsPending = false;       // debug snapshot job in flight
+
+    // Debug "liked posts" viewer: pages the DB as the user walks the list.
+    QPointer<ViewerWindow> m_likedViewer;
+    MultiSource* m_likedSource = nullptr;  // routes fetches back per sourceId
+    int m_likedOffset = 0;                 // DB rows already handed to the viewer
+    int m_likedTotal = 0;                  // distinct liked posts (0 = not counted yet)
+    bool m_likedLoading = false;
+    bool m_likedDone = false;
+    int m_likedGeneration = 0;  // invalidates pages from a closed viewer
+    // Shuffle seed for the liked-posts walk. Generated once per session so
+    // each launch surfaces a different subset first, while paging within a
+    // session stays consistent.
+    quint32 m_likedSeed = 0;
 };
 
 }  // namespace Mosaic

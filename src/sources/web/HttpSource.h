@@ -23,6 +23,9 @@ class HttpSource : public Source {
     // Override for sites that reject the Mosaic agent (Cloudflare).
     virtual QByteArray userAgent() const;
 
+    // Extra request headers (e.g. client hints for Cloudflare-fronted sites).
+    virtual void addHeaders(QNetworkRequest& request) const;
+
     QByteArray httpGet(const QString& url, QString* error = nullptr) const;
 
     bool httpDownload(const QString& url, const QString& path,

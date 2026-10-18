@@ -90,10 +90,9 @@ void SettingsDialog::buildUi() {
         m_credFields.insert(sourceId, qMakePair(userId, apiKey));
     };
     addCredRow(QStringLiteral("gelbooru"), QStringLiteral("gelbooru.com:"));
-    addCredRow(QStringLiteral("rule34xxx"), QStringLiteral("rule34.xxx:"));
     addCredRow(QStringLiteral("safebooru"), QStringLiteral("safebooru.org:"));
     auto* credHint =
-        new QLabel(QStringLiteral("rule34.xxx requires an API key (see api.rule34.xxx)."), credBox);
+        new QLabel(QStringLiteral("gelbooru.com and safebooru.org require an API key."), credBox);
     credHint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
     credLayout->addRow(credHint);
     root->addWidget(credBox);

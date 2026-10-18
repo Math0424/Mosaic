@@ -58,6 +58,18 @@ QString cacheKey(const QString& md5, FileKind kind) {
     return md5 + QLatin1Char(':') + QString::number(static_cast<int>(kind));
 }
 
+// Display name of the site a post came from; merged sources resolve to the
+// member that supplied it.
+QString sourceLabel(Source* source, const SourceImage& image) {
+    if (!source)
+        return {};
+    for (Source* member : source->members()) {
+        if (member->id() == image.sourceId)
+            return member->displayName();
+    }
+    return source->displayName();
+}
+
 QString formatBytes(qint64 bytes) {
     if (bytes <= 0)
         return QStringLiteral("?");
@@ -189,6 +201,40 @@ void ViewerWindow::setImages(Source* source, const QList<SourceImage>& images, i
     m_index = qBound(0, index, qMax(0, static_cast<int>(m_images.size()) - 1));
     if (!m_images.isEmpty())
         showAt(m_index);
+}
+
+void ViewerWindow::appendImages(const QList<SourceImage>& images) {
+    if (images.isEmpty())
+        return;
+    const bool wasEmpty = m_images.isEmpty();
+    m_images.append(images);
+    if (wasEmpty) {
+        // First page: honour a jump the user attempted while it loaded.
+        const int target = m_pendingIndex >= 0 ? m_pendingIndex : 0;
+        m_pendingIndex = -1;
+        showAt(qBound(0, target, m_images.size() - 1));
+        return;
+    }
+    // The user walked past the end while this page was loading: continue
+    // from where they wanted to go.
+    if (m_pendingIndex >= 0 && m_pendingIndex < m_images.size()) {
+        const int target = m_pendingIndex;
+        m_pendingIndex = -1;
+        showAt(target);
+        return;
+    }
+    // Refresh the "(X/XX)" counter without reloading the current post.
+    if (m_index >= 0 && m_index < m_images.size()) {
+        const SourceImage& current = m_images.at(m_index);
+        QString ext = current.format.toLower();
+        if (ext.isEmpty() && !current.localPath.isEmpty())
+            ext = QFileInfo(current.localPath).suffix().toLower();
+        const QString stem = current.md5.isEmpty() ? QStringLiteral("post") : current.md5;
+        setWindowTitle(QStringLiteral("%1.%2 (%3/%4) - Mosaic Viewer")
+                           .arg(stem, ext.isEmpty() ? QStringLiteral("img") : ext)
+                           .arg(m_index + 1)
+                           .arg(m_images.size()));
+    }
 }
 
 void ViewerWindow::closeEvent(QCloseEvent* event) {
@@ -391,8 +437,16 @@ void ViewerWindow::buildUi() {
 // navigation
 
 void ViewerWindow::showAt(int index) {
-    if (index < 0 || index >= m_images.size())
+    if (index < 0)
         return;
+    // Walking past the end of a progressively-filled list: ask for more and
+    // remember where the user wanted to go.
+    if (index >= m_images.size()) {
+        m_pendingIndex = index;
+        emit nearEnd(m_images.size());
+        return;
+    }
+    m_pendingIndex = -1;
 
     if (m_slideshow) {
         m_slideshowTimer->stop();
@@ -423,6 +477,10 @@ void ViewerWindow::showAt(int index) {
     loadMedia(m_current);
     preloadAround(index);
     evictDistantCache();
+
+    // Progressive lists: ask for the next page before the user runs out.
+    if (m_images.size() - index <= 3)
+        emit nearEnd(index);
 }
 
 void ViewerWindow::checkLibraryStatus() {
@@ -1108,16 +1166,22 @@ void ViewerWindow::evictCache() {
 }
 
 void ViewerWindow::evictDistantCache() {
-    // Unload media of posts far from the one on screen.
-    QHash<QString, int> indexOfMd5;
-    for (int i = 0; i < m_images.size(); ++i) indexOfMd5.insert(m_images.at(i).md5, i);
-
+    // Unload media of posts far from the one on screen. The cache holds
+    // only a handful of entries, so probe the small window around the
+    // current index instead of indexing the whole (possibly huge) list.
     QStringList kept;
     kept.reserve(m_cacheOrder.size());
     for (const QString& key : m_cacheOrder) {
         const QString md5 = key.section(QLatin1Char(':'), 0, 0);
-        const auto it = indexOfMd5.constFind(md5);
-        const bool near = it != indexOfMd5.constEnd() && qAbs(it.value() - m_index) <= kCacheRadius;
+        bool near = false;
+        const int from = qMax(0, m_index - kCacheRadius);
+        const int to = qMin(m_images.size() - 1, m_index + kCacheRadius);
+        for (int i = from; i <= to; ++i) {
+            if (m_images.at(i).md5 == md5) {
+                near = true;
+                break;
+            }
+        }
         if (near) {
             kept.append(key);
         } else {
@@ -1134,6 +1198,9 @@ void ViewerWindow::setInfo(const SourceImage& image) {
     QString html;
     if (image.remoteId > 0)
         html += QStringLiteral("<b>#%1</b>&nbsp; ").arg(image.remoteId);
+    const QString sourceName = sourceLabel(m_source, image);
+    if (!sourceName.isEmpty())
+        html += QStringLiteral("%1 · ").arg(sourceName.toHtmlEscaped());
     html += QStringLiteral("%1x%2 · %3 · %4")
                 .arg(image.width)
                 .arg(image.height)

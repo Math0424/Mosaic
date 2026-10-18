@@ -12,6 +12,7 @@
 #include "local/LibrarySource.h"
 #include "MultiSource.h"
 #include "web/R34Source.h"
+#include "web/Rule34XxxSource.h"
 #include "Source.h"
 
 namespace Mosaic {
@@ -41,7 +42,7 @@ class SourceManager {
     std::unique_ptr<E621Source> m_e621;
     std::unique_ptr<R34Source> m_r34;
     std::unique_ptr<GelbooruSource> m_gelbooru;
-    std::unique_ptr<GelbooruSource> m_rule34xxx;
+    std::unique_ptr<Rule34XxxSource> m_rule34xxx;
     std::unique_ptr<GelbooruSource> m_safebooru;
     std::vector<std::unique_ptr<MultiSource>> m_multis;
     QList<Source*> m_sources;  // non-owning, stable pointers

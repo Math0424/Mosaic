@@ -11,6 +11,7 @@
 #include "../components/TagSidebar.h"
 #include "../components/ViewerWindow.h"
 #include "../sources/SourceManager.h"
+#include "../sources/local/LibraryCatalog.h"
 #include "../sources/local/LibrarySource.h"
 
 #include <QAbstractItemView>
@@ -29,6 +30,7 @@
 #include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
+#include <QRandomGenerator>
 #include <QScrollArea>
 #include <QSet>
 #include <QDebug>
@@ -93,10 +95,20 @@ QImage decodeBytes(const SourceImage& img, const QByteArray& bytes) {
     return decoded;
 }
 
+// Display name of the site a post came from. Posts carry the id of the
+// member source that supplied them, even inside a merged "All sources" tab.
+QString sourceLabel(SourceManager& sources, const SourceImage& image) {
+    Source* source = sources.source(image.sourceId);
+    return source ? source->displayName() : QString();
+}
+
 }  // namespace
 
 FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* parent)
     : QWidget(parent), m_sources(sources) {
+    // One shuffle seed per launch: the liked-posts walk starts somewhere
+    // different every boot, but stays consistent while paging this session.
+    m_likedSeed = QRandomGenerator::global()->generate() | 1u;
     m_media = new MediaCache(this);
     m_media->setMaxEntries(24);
     m_db = new FeedDatabase();
@@ -385,6 +397,13 @@ void FeedPage::buildUi() {
     debugLayout->addWidget(m_droppedButton);
     connect(m_droppedButton, &QPushButton::clicked, this, &FeedPage::toggleDropped);
 
+    m_likedButton = new QPushButton(QStringLiteral("Liked posts"), m_debugPanel);
+    m_likedButton->setToolTip(
+        QStringLiteral("Open every post you liked or saved in the viewer, loaded as you "
+                       "scroll through them"));
+    debugLayout->addWidget(m_likedButton);
+    connect(m_likedButton, &QPushButton::clicked, this, &FeedPage::toggleLiked);
+
     // Profile resets: soft re-learns from the user's library favorites,
     // hard wipes everything for a truly fresh start.
     auto* resetRow = new QHBoxLayout();
@@ -452,10 +471,10 @@ void FeedPage::keyPressEvent(QKeyEvent* event) {
     // Defensive: if the sway edit (or its completer popup) somehow holds
     // focus, let it handle the key instead of navigating the feed.
     QWidget* focus = QApplication::focusWidget();
-    if (focus && focus != this && (focus == m_swayEdit || focus->isAncestorOf(m_swayEdit) ||
-                                    (m_swayCompleter->popup() &&
-                                     (focus == m_swayCompleter->popup() ||
-                                      focus->isAncestorOf(m_swayCompleter->popup()))))) {
+    if (focus && focus != this &&
+        (focus == m_swayEdit || focus->isAncestorOf(m_swayEdit) ||
+         (m_swayCompleter->popup() &&
+          (focus == m_swayCompleter->popup() || focus->isAncestorOf(m_swayCompleter->popup()))))) {
         QWidget::keyPressEvent(event);
         return;
     }
@@ -631,8 +650,9 @@ void FeedPage::showPost(const SourceImage& image) {
     updateDebugPanel();
 
     m_infoLabel->setText(
-        QStringLiteral("<b>%1</b> · %2 · ★%3")
-            .arg(image.md5.left(12), image.format.isEmpty() ? QStringLiteral("?") : image.format)
+        QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
+            .arg(image.md5.left(12), image.format.isEmpty() ? QStringLiteral("?") : image.format,
+                 sourceLabel(m_sources, image).toHtmlEscaped())
             .arg(image.score));
     m_mediaLabel->setText(QStringLiteral("…"));
     m_mediaLabel->setPixmap(QPixmap());
@@ -776,8 +796,9 @@ void FeedPage::applyDecodedMedia(const SourceImage& img, const QImage& decoded) 
     QStringList tags;
     for (const SourceTag& t : img.tags) tags << t.name.toHtmlEscaped();
     m_infoLabel->setText(
-        QStringLiteral("<b>%1</b> · %2 · ★%3")
-            .arg(img.md5.left(12), img.format.isEmpty() ? QStringLiteral("?") : img.format)
+        QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
+            .arg(img.md5.left(12), img.format.isEmpty() ? QStringLiteral("?") : img.format,
+                 sourceLabel(m_sources, img).toHtmlEscaped())
             .arg(img.score));
     m_statusLabel->clear();
 }
@@ -1041,6 +1062,161 @@ void FeedPage::toggleDropped() {
     }
 
     dialog->show();
+}
+
+void FeedPage::toggleLiked() {
+    if (m_likedViewer) {
+        m_likedViewer->raise();
+        m_likedViewer->activateWindow();
+        return;
+    }
+    openLikedViewer();
+}
+
+void FeedPage::openLikedViewer() {
+    // One merged source so fetches route back to whichever site (or the
+    // library) each liked post came from.
+    if (!m_likedSource)
+        m_likedSource = m_sources.createMultiSource(m_sources.sources());
+    if (!m_likedSource)
+        return;
+
+    m_likedOffset = 0;
+    m_likedTotal = 0;
+    m_likedLoading = false;
+    m_likedDone = false;
+    ++m_likedGeneration;
+
+    auto* viewer = new ViewerWindow(m_likedSource, {}, 0);
+    viewer->setAttribute(Qt::WA_DeleteOnClose);
+    m_likedViewer = viewer;
+    connect(viewer, &ViewerWindow::nearEnd, this, [this](int) { loadLikedPage(); });
+    connect(viewer, &QObject::destroyed, this, [this]() {
+        m_likedViewer = nullptr;
+        m_likedLoading = false;
+        ++m_likedGeneration;  // drop pages still in flight
+    });
+
+    // Shown once the first page arrives, so an empty profile never flashes
+    // an empty window.
+    loadLikedPage();
+}
+
+void FeedPage::loadLikedPage() {
+    if (m_likedLoading || m_likedDone || !m_likedViewer || !m_db)
+        return;
+    m_likedLoading = true;
+
+    // Small pages keep the first post on screen fast: each remote post
+    // needs an md5 lookup to recover its URLs, and a profile can hold
+    // thousands of likes. Posts are handed to the viewer one at a time as
+    // they resolve, so the first one shows immediately.
+    constexpr int kPageSize = 20;
+    const int offset = m_likedOffset;
+    const int generation = m_likedGeneration;
+    const quint32 seed = m_likedSeed;
+    FeedDatabase* db = m_db;
+    SourceManager* sources = &m_sources;
+    QPointer<FeedPage> self(this);
+
+    QThreadPool::globalInstance()->start([self, db, sources, offset, generation, seed]() {
+        const int total = offset == 0 ? db->likedInteractionCount() : -1;
+        const auto rows = db->likedInteractions(kPageSize, offset, seed);
+
+        LibraryCatalog catalog;
+        int resolved = 0;
+        for (const auto& [md5, sourceId] : rows) {
+            SourceImage img;
+            // Saved posts resolve straight from the library catalog.
+            if (!catalog.lookupByMd5(md5, &img)) {
+                // Otherwise ask the site the like came from, then the others.
+                QList<Source*> candidates;
+                if (Source* s = sources->source(sourceId))
+                    candidates.append(s);
+                for (Source* s : sources->remoteSources()) {
+                    if (!candidates.contains(s))
+                        candidates.append(s);
+                }
+                bool found = false;
+                for (Source* s : candidates) {
+                    SourceQuery q;
+                    q.tags = QStringLiteral("md5:%1").arg(md5);
+                    q.limit = 1;
+                    const SourceResult result = s->search(q);
+                    if (!result.ok || result.images.isEmpty())
+                        continue;
+                    img = result.images.first();
+                    img.md5 = md5;
+                    if (img.sourceId.isEmpty())
+                        img.sourceId = s->id();
+                    found = true;
+                    break;
+                }
+                if (!found) {
+                    // Keep it in the list so the gap is visible rather than
+                    // silently dropping a liked post. Route fetches through
+                    // a real source so the viewer can still try.
+                    img.md5 = md5;
+                    img.sourceId = sourceId;
+                    if (sources->source(img.sourceId) == nullptr) {
+                        const QList<Source*> remotes = sources->remoteSources();
+                        if (!remotes.isEmpty())
+                            img.sourceId = remotes.first()->id();
+                    }
+                }
+            }
+            ++resolved;
+
+            if (!self)
+                return;
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self, img, generation]() {
+                    if (!self || self->m_likedGeneration != generation)
+                        return;
+                    ViewerWindow* viewer = self->m_likedViewer;
+                    if (!viewer)
+                        return;
+                    viewer->appendImages({img});
+                    if (!viewer->isVisible()) {
+                        viewer->show();
+                        viewer->raise();
+                        viewer->activateWindow();
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, total, offset, resolved, generation]() {
+                if (!self || self->m_likedGeneration != generation)
+                    return;
+                self->m_likedLoading = false;
+                if (total >= 0)
+                    self->m_likedTotal = total;
+                ViewerWindow* viewer = self->m_likedViewer;
+                if (!viewer)
+                    return;
+                if (resolved == 0) {
+                    self->m_likedDone = true;
+                    if (offset == 0) {
+                        // Never shown: drop it without touching the saved
+                        // viewer geometry (closeEvent would persist it).
+                        viewer->deleteLater();
+                        self->m_statusLabel->setText(
+                            QStringLiteral("No liked posts yet - like or save a few first."));
+                    }
+                    return;
+                }
+                self->m_likedOffset = offset + resolved;
+                if (self->m_likedTotal > 0 && self->m_likedOffset >= self->m_likedTotal)
+                    self->m_likedDone = true;
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 void FeedPage::updateSwayCompletion() {

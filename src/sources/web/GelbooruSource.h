@@ -6,9 +6,9 @@
 
 namespace Mosaic {
 
-// Source for Gelbooru 0.2 API sites (gelbooru.com, rule34.xxx,
-// safebooru.org), all sharing the JSON dapi endpoint. `pid` is a 0-based
-// post offset. Older installs answer with a bare JSON array of posts.
+// Source for Gelbooru 0.2 API sites (gelbooru.com, safebooru.org), all
+// sharing the JSON dapi endpoint. `pid` is a 0-based post offset. Older
+// installs answer with a bare JSON array of posts.
 class GelbooruSource : public HttpSource {
    public:
     static constexpr int kMaxLimit = 100;
@@ -23,7 +23,7 @@ class GelbooruSource : public HttpSource {
     SourceImage parentOf(const SourceImage& image, QString* error = nullptr) override;
     QList<SourceImage> childrenOf(const SourceImage& image, QString* error = nullptr) override;
 
-    // Optional dapi credentials (rule34.xxx requires them).
+    // Optional dapi credentials (gelbooru.com and safebooru.org require them).
     void setCredentials(const QString& userId, const QString& apiKey) {
         m_userId = userId;
         m_apiKey = apiKey;

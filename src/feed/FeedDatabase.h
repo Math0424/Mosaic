@@ -195,8 +195,16 @@ class FeedDatabase {
     QList<QPair<QString, QString>> recentInteractions(int limit = 5) const;
 
     // Debug: every md5 the user reacted positively to (like/favorite),
-    // newest first. Distinct - one entry per post.
-    QList<QPair<QString, QString>> likedInteractions(int limit = 500) const;
+    // newest first. Distinct - one entry per post. Paged so a profile with
+    // thousands of likes can be walked without loading them all at once.
+    // `seed` shuffles the order deterministically: the same seed always
+    // yields the same sequence (so paging stays consistent), a new seed
+    // gives a different walk through the same set.
+    QList<QPair<QString, QString>> likedInteractions(int limit = 500, int offset = 0,
+                                                     quint32 seed = 0) const;
+
+    // Total distinct liked/favorited posts (progress reporting).
+    int likedInteractionCount() const;
 
     // recommendation debug
 

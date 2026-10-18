@@ -42,6 +42,10 @@ class ViewerWindow : public QWidget {
     // Re-points an open viewer at a new result list and jumps to `index`.
     void setImages(Source* source, const QList<SourceImage>& images, int index);
 
+    // Appends posts to the end of the list without disturbing the current
+    // one; used by progressive lists (e.g. the feed's liked-posts viewer).
+    void appendImages(const QList<SourceImage>& images);
+
    protected:
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
@@ -52,6 +56,9 @@ class ViewerWindow : public QWidget {
 
    signals:
     void tagSearchRequested(const QString& tag);
+    // Emitted when the shown post is within a few of the end of the list,
+    // so a progressively-filled list can fetch the next page.
+    void nearEnd(int index);
 
    private slots:
     void onSaveClicked();
@@ -128,6 +135,9 @@ class ViewerWindow : public QWidget {
     Source* m_source = nullptr;
     QList<SourceImage> m_images;
     int m_index = 0;
+    // Index the user asked for while the list was still loading (progressive
+    // lists); -1 when nothing is pending.
+    int m_pendingIndex = -1;
 
     // Breadcrumb stack for parent/child chain navigation.
     QList<SourceImage> m_chainStack;

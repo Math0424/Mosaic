@@ -50,9 +50,7 @@ SourceManager::SourceManager() {
     m_gelbooru = std::make_unique<GelbooruSource>(
         QStringLiteral("gelbooru"), QStringLiteral("gelbooru.com"),
         QStringLiteral("https://gelbooru.com"), QStringLiteral("https://gelbooru.com"));
-    m_rule34xxx = std::make_unique<GelbooruSource>(
-        QStringLiteral("r34xxx"), QStringLiteral("rule34.xxx"),
-        QStringLiteral("https://api.rule34.xxx"), QStringLiteral("https://rule34.xxx"));
+    m_rule34xxx = std::make_unique<Rule34XxxSource>();
     m_safebooru = std::make_unique<GelbooruSource>(
         QStringLiteral("safebooru"), QStringLiteral("safebooru.org"),
         QStringLiteral("https://safebooru.org"), QStringLiteral("https://safebooru.org"));
@@ -84,9 +82,8 @@ MultiSource* SourceManager::createMultiSource(const QList<Source*>& members) {
 
 void SourceManager::applyGelbooruCredentials(
     const QHash<QString, QPair<QString, QString>>& credentials) {
-    for (Source* source :
-         {static_cast<Source*>(m_gelbooru.get()), static_cast<Source*>(m_rule34xxx.get()),
-          static_cast<Source*>(m_safebooru.get())}) {
+    for (Source* source : {static_cast<Source*>(m_gelbooru.get()),
+                           static_cast<Source*>(m_safebooru.get())}) {
         const auto it = credentials.find(source->id());
         if (it != credentials.end())
             static_cast<GelbooruSource*>(source)->setCredentials(it.value().first,

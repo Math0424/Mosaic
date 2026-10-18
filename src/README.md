@@ -268,8 +268,9 @@ Mosaic/
 │   │   ├── web/
 │   │   │   ├── HttpSource.*# shared HTTP/JSON plumbing
 │   │   │   ├── E621Source.*# e621.net JSON API source
-│   │   │   ├── R34Source.* # Rule34 source
-│   │   │   └── GelbooruSource.* # gelbooru / rule34.xxx / safebooru (dapi)
+│   │   │   ├── R34Source.* # rule34.us source
+│   │   │   ├── Rule34XxxSource.* # rule34.xxx source
+│   │   │   └── GelbooruSource.* # gelbooru / safebooru (dapi)
 │   │   └── local/
 │   │       ├── LibrarySource.* # local library source + save
 │   │       ├── LibraryCatalog.*# catalog read/write over DuckDB

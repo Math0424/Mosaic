@@ -255,14 +255,20 @@ QList<SourceImage> FeedRecommender::fetchFromSource(const QString& sourceId, con
         }
     }
 
-    if (sourceId == QLatin1String("r34")) {
-        // rule34.us uses "sort:random" instead of "order:random", and supports
-        // no other "order:*" or "score:>N" syntax — strip/translate them.
+    if (sourceId == QLatin1String("r34") || sourceId == QLatin1String("r34xxx")) {
+        // Both rule34 sites use "sort:*" instead of "order:*". rule34.us only
+        // understands "sort:random" and no "score:>N" filter; rule34.xxx
+        // supports the full sort set plus score filters.
         QString r34Query = trimmed;
-        r34Query.replace(QRegularExpression(QStringLiteral("\\border:random\\b")),
-                         QStringLiteral("sort:random"));
-        r34Query.remove(QRegularExpression(QStringLiteral("\\border:[a-z_]+\\b")));
-        r34Query.remove(QRegularExpression(QStringLiteral("\\bscore:>?=?-?\\d+\\b")));
+        if (sourceId == QLatin1String("r34")) {
+            r34Query.replace(QRegularExpression(QStringLiteral("\\border:random\\b")),
+                             QStringLiteral("sort:random"));
+            r34Query.remove(QRegularExpression(QStringLiteral("\\border:[a-z_]+\\b")));
+            r34Query.remove(QRegularExpression(QStringLiteral("\\bscore:>?=?-?\\d+\\b")));
+        } else {
+            r34Query.replace(QRegularExpression(QStringLiteral("\\border:")),
+                             QStringLiteral("sort:"));
+        }
         r34Query = r34Query.simplified();
 
         QString fullTags = r34Query.isEmpty() ? QStringLiteral("-animated")

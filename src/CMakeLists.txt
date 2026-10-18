@@ -88,6 +88,8 @@ add_executable(Mosaic
     sources/web/GelbooruSource.cpp
     sources/web/R34Source.h
     sources/web/R34Source.cpp
+    sources/web/Rule34XxxSource.h
+    sources/web/Rule34XxxSource.cpp
     sources/local/LibrarySql.h
     sources/local/LibrarySql.cpp
     sources/local/LibraryCatalog.h

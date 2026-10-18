@@ -32,12 +32,15 @@ void HttpSource::addAuth(QUrlQuery& params) const { Q_UNUSED(params); }
 
 QByteArray HttpSource::userAgent() const { return QByteArray(kDefaultUserAgent); }
 
+void HttpSource::addHeaders(QNetworkRequest& request) const { Q_UNUSED(request); }
+
 QNetworkRequest HttpSource::makeRequest(const QString& url) const {
     QNetworkRequest request(QUrl{url});
     request.setHeader(QNetworkRequest::UserAgentHeader, userAgent());
     request.setRawHeader("Accept", "*/*");
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
+    addHeaders(request);
     return request;
 }
 

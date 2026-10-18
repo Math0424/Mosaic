@@ -1665,7 +1665,8 @@ QList<QPair<QString, QString>> FeedDatabase::recentInteractions(int limit) const
     return out;
 }
 
-QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit) const {
+QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit, int offset,
+                                                              quint32 seed) const {
     QList<QPair<QString, QString>> out;
     if (!m_db)
         return out;
@@ -1675,11 +1676,22 @@ QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit) const 
     if (!conn.ok())
         return out;
 
+    // A non-zero seed shuffles the set deterministically: hash(md5 || seed)
+    // is stable across queries, so paging stays consistent while a new seed
+    // gives a different walk through the same posts. Seed 0 keeps the
+    // newest-first order.
+    const QString order =
+        seed == 0 ? QStringLiteral("max(\"timestamp\") DESC, md5")
+                  : QStringLiteral("hash(md5 || %1), md5").arg(quoted(QString::number(seed)));
+
     duckdb_result res{};
     if (!conn.query(QStringLiteral("SELECT md5, max(source_id) FROM feed_events "
                                    "WHERE event_type IN ('like', 'favorite') "
-                                   "GROUP BY md5 ORDER BY max(\"timestamp\") DESC LIMIT %1")
-                        .arg(limit),
+                                   "GROUP BY md5 ORDER BY %1 "
+                                   "LIMIT %2 OFFSET %3")
+                        .arg(order)
+                        .arg(qMax(1, limit))
+                        .arg(qMax(0, offset)),
                     &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
@@ -1694,6 +1706,32 @@ QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit) const 
     }
     duckdb_destroy_result(&res);
     return out;
+}
+
+int FeedDatabase::likedInteractionCount() const {
+    if (!m_db)
+        return 0;
+
+    QReadLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return 0;
+
+    duckdb_result res{};
+    if (!conn.query(QStringLiteral("SELECT count(DISTINCT md5) FROM feed_events "
+                                   "WHERE event_type IN ('like', 'favorite')"),
+                    &res))
+        return 0;
+    int count = 0;
+    if (duckdb_row_count(&res) > 0) {
+        char* value = duckdb_value_varchar(&res, 0, 0);
+        if (value) {
+            count = QString::fromUtf8(value).toInt();
+            duckdb_free(value);
+        }
+    }
+    duckdb_destroy_result(&res);
+    return count;
 }
 
 // recommendation debug
