@@ -492,18 +492,15 @@ void FeedPage::keyPressEvent(QKeyEvent* event) {
             goBack();
             break;
         case Qt::Key_Up:
-            if (!(event->modifiers() & Qt::ControlModifier)) {
-                // break;
-            }
         case Qt::Key_L:
             onLikeClicked();
             advance(false);
             break;
-        case Qt::Key_Down:
-            if (!(event->modifiers() & Qt::ControlModifier)) {
-                // break;
-            }
         case Qt::Key_D:
+            if (!(event->modifiers() & Qt::ControlModifier)) {
+                break;
+            }
+        case Qt::Key_Down:
             onDislikeClicked();
             advance(false);
             break;
@@ -649,11 +646,11 @@ void FeedPage::showPost(const SourceImage& image) {
     m_tagSidebar->setImage(image, /*editable=*/false);
     updateDebugPanel();
 
-    m_infoLabel->setText(
-        QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
-            .arg(image.md5.left(12), image.format.isEmpty() ? QStringLiteral("?") : image.format,
-                 sourceLabel(m_sources, image).toHtmlEscaped())
-            .arg(image.score));
+    m_infoLabel->setText(QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
+                             .arg(image.md5.left(12),
+                                  image.format.isEmpty() ? QStringLiteral("?") : image.format,
+                                  sourceLabel(m_sources, image).toHtmlEscaped())
+                             .arg(image.score));
     m_mediaLabel->setText(QStringLiteral("…"));
     m_mediaLabel->setPixmap(QPixmap());
 
@@ -795,11 +792,11 @@ void FeedPage::applyDecodedMedia(const SourceImage& img, const QImage& decoded) 
         QPixmap::fromImage(decoded.scaled(avail, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
     QStringList tags;
     for (const SourceTag& t : img.tags) tags << t.name.toHtmlEscaped();
-    m_infoLabel->setText(
-        QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
-            .arg(img.md5.left(12), img.format.isEmpty() ? QStringLiteral("?") : img.format,
-                 sourceLabel(m_sources, img).toHtmlEscaped())
-            .arg(img.score));
+    m_infoLabel->setText(QStringLiteral("<b>%1</b> · %2 · %3 · ★%4")
+                             .arg(img.md5.left(12),
+                                  img.format.isEmpty() ? QStringLiteral("?") : img.format,
+                                  sourceLabel(m_sources, img).toHtmlEscaped())
+                             .arg(img.score));
     m_statusLabel->clear();
 }
 
