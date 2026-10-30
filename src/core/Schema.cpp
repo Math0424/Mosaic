@@ -72,10 +72,13 @@ bool sanitizeTags(DbConnection& conn, QString* error) {
         return false;
     }
 
+    // A tag stored un-normalized ("League of Legends") is renamed to its
+    // normalized form ("league_of_legends"), merging into that tag when it
+    // already exists. Never split into words: "of" is not a tag.
     struct Repair {
         qint64 id;
         QString category;
-        QStringList pieces;
+        QString normalized;
     };
     QList<Repair> repairs;
     const idx_t rowCount = duckdb_row_count(&res);
@@ -86,15 +89,9 @@ bool sanitizeTags(DbConnection& conn, QString* error) {
         if (idValue && categoryValue && nameValue) {
             const QString raw = QString::fromUtf8(nameValue);
             const QString normalized = normalizeTagName(raw);
-            if (normalized.isEmpty() || normalized == raw)
-                continue;
-            QStringList pieces;
-            for (const QString& piece : normalized.split(QLatin1Char('_')))
-                if (!piece.isEmpty())
-                    pieces << piece;
-            if (!pieces.isEmpty())
+            if (normalized != raw)
                 repairs.append({QString::fromUtf8(idValue).toLongLong(),
-                                QString::fromUtf8(categoryValue), pieces});
+                                QString::fromUtf8(categoryValue), normalized});
         }
         if (idValue)
             duckdb_free(idValue);
@@ -106,37 +103,39 @@ bool sanitizeTags(DbConnection& conn, QString* error) {
     duckdb_destroy_result(&res);
 
     for (const Repair& repair : repairs) {
-        for (const QString& piece : repair.pieces) {
-            const QString insertTag = QStringLiteral(
-                                          "INSERT INTO tags(category, name) "
-                                          "VALUES (%1, %2) "
-                                          "ON CONFLICT (category, name) DO NOTHING")
-                                          .arg(quoted(repair.category), quoted(piece));
-            if (!conn.execute(insertTag, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return false;
-            }
-            const QString linkSql = QStringLiteral(
-                                        "INSERT INTO image_tags(image_id, tag_id) "
-                                        "SELECT it.image_id, t.id "
-                                        "FROM image_tags it "
-                                        "JOIN tags t ON t.id = %2 "
-                                        "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                        .arg(repair.id)
-                                        .arg(quoted(piece));
-            if (!conn.execute(linkSql, &dbError)) {
+        QStringList statements;
+        if (!repair.normalized.isEmpty()) {
+            statements << QStringLiteral(
+                              "INSERT INTO tags(category, name) VALUES (%1, %2) "
+                              "ON CONFLICT (category, name) DO NOTHING")
+                              .arg(quoted(repair.category), quoted(repair.normalized))
+                       << QStringLiteral(
+                              "INSERT INTO image_tags(image_id, tag_id) "
+                              "SELECT it.image_id, t.id FROM image_tags it "
+                              "JOIN tags t ON t.category = %2 AND t.name = %3 "
+                              "WHERE it.tag_id = %1 "
+                              "ON CONFLICT (image_id, tag_id) DO NOTHING")
+                              .arg(QString::number(repair.id), quoted(repair.category),
+                                   quoted(repair.normalized));
+        }
+        statements << QStringLiteral("DELETE FROM image_tags WHERE tag_id = %1").arg(repair.id)
+                   << QStringLiteral("DELETE FROM tags WHERE id = %1").arg(repair.id);
+        for (const QString& sql : statements) {
+            if (!conn.execute(sql, &dbError)) {
                 if (error)
                     *error = dbError;
                 return false;
             }
         }
-        const QString deleteSql = QStringLiteral("DELETE FROM tags WHERE id = %1").arg(repair.id);
-        if (!conn.execute(deleteSql, &dbError)) {
-            if (error)
-                *error = dbError;
-            return false;
-        }
+    }
+
+    // Links to tags that no longer exist (left behind by older builds).
+    if (!conn.execute(QStringLiteral("DELETE FROM image_tags "
+                                     "WHERE tag_id NOT IN (SELECT id FROM tags)"),
+                      &dbError)) {
+        if (error)
+            *error = dbError;
+        return false;
     }
     return true;
 }

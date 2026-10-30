@@ -259,7 +259,10 @@ Mosaic/
 │   │   └── ImageFingerprint.* # pHash / SIFT fingerprints for duplicate detection
 │   ├── feed/               # "For You" recommender (self-contained)
 │   │   ├── FeedPage.*      # TikTok-style vertical feed UI
-│   │   ├── FeedRecommender.* # Bayesian tag-preference scoring + bandit
+│   │   ├── FeedRecommender.* # candidate arms, scoring, tangent slots, MMR
+│   │   ├── FeedModel.*     # learned Bayesian model + Thompson sampling + arm bandit
+│   │   ├── VisualFeatures.* # lightweight visual style descriptor (no ONNX)
+│   │   ├── FeedWarmStart.* # seeds the model from history on first run
 │   │   └── FeedDatabase.*  # learning state (feed.duckdb)
 │   ├── sources/            # pluggable image sources (remote + local)
 │   │   ├── Source.h        # shared query/search/fetch interface
@@ -349,24 +352,41 @@ near-duplicate images for resolution in the Conflicts page.
 
 ### "For You" recommender
 
-`feed/FeedRecommender` is a Bayesian, two-speed tag-preference model:
+The feed starts on a fixed heuristic formula and hands over to a learned
+model as the model proves itself:
 
-```
-weight(key) = (1 - b) * longTerm(key) + b * session(key)
-```
+- **`feed/FeedModel`**: online Bayesian probit regression (AdPredictor-style)
+  with a Gaussian belief (mean + variance) per feature. The features are the
+  post's tags, a 32-dimension visual style descriptor, and the heuristic's
+  own signals (taste similarity, session, boredom, ...). Every reaction (like,
+  save, long view, skip, dislike) is one weighted update.
+- **Exploration through uncertainty**: ranking draws one weight vector from
+  the posterior per batch (Thompson sampling). Unseen tags start wide, so the
+  feed tries them. Variance slowly grows back toward the prior, so settled
+  beliefs keep getting re-checked instead of locking the feed onto one path.
+- **Evidence-gated handover**: before learning from each live reaction, both
+  the heuristic (Platt-calibrated) and the model predict it. The running
+  log-loss decides the blend, so the model only takes over while it actually
+  predicts this user better, and backs off if it starts losing.
+- **Tangents**: a share of each batch, set by the **Explore** slider on the
+  feed page, goes to plausible but uncertain posts (optimism = mean + k ·
+  uncertainty). A dedicated query arm probes "tangent" tags: tags seen on
+  liked posts that no taste pursues yet. A liked tangent is promoted into
+  its own taste.
+- **Candidate arms** (taste, broad, combo, similar-to-liked, recent, popular,
+  exploration, tangent, sway) get their network budget from a discounted
+  Beta-Bernoulli bandit over how often each arm's posts are engaged with.
+- **`feed/VisualFeatures`** computes the style descriptor (palette, tone,
+  contrast, colorfulness, line density, detail, composition, aspect) from a
+  thumbnail in plain C++. No pretrained network or ONNX runtime is shipped.
+- **`feed/FeedWarmStart`** runs once in the background: the heuristic's tag
+  preferences become model priors, library favorites replay as positives,
+  and past reactions replay from `feed_events` (tags resolved by md5,
+  rate-limited). It resumes across launches.
 
-- `longTerm` — shrunk log-odds of a tag's (decayed, IDF-damped) like/dislike
-  counts: *who the user is*.
-- `session` — the same form over the last ~15 interactions: *what the user is
-  into right now*.
-- `b` — 0.15 baseline, rising toward 0.5 as the skip streak grows, so a stale
-  feed pivots immediately.
-
-Candidate generation is a **UCB1 strategy bandit** over four query arms
-(`or_group`, `pair`, `wildcard`, `hot`); the wildcard arm keeps a floor
-allocation so the model keeps discovering new taste. Every interaction
-(watched / liked / saved / skipped) trains the model, and all state lives in
-`feed.duckdb`.
+The heuristic stack (tag tastes, session vector, hard-negative filter) stays
+in place: it is the cold-start prior and supplies inputs to the model. All
+state lives in `feed.duckdb`.
 
 ### Sources
 

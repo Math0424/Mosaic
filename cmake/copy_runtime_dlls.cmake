@@ -34,14 +34,6 @@ if(DEFINED DUCKDB_ROOT AND EXISTS "${DUCKDB_ROOT}")
     list(APPEND ALL_DLLS ${DUCKDB_DLLS})
 endif()
 
-# ONNX Runtime
-if(DEFINED ONNXRUNTIME_ROOT AND EXISTS "${ONNXRUNTIME_ROOT}")
-    file(GLOB ONNX_DLLS
-        "${ONNXRUNTIME_ROOT}/lib/*.dll"
-    )
-    list(APPEND ALL_DLLS ${ONNX_DLLS})
-endif()
-
 # Clean up the list: remove empty items, system files, and weird paths
 set(CLEAN_DLLS "")
 foreach(DLL IN LISTS ALL_DLLS)

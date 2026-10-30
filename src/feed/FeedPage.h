@@ -6,14 +6,18 @@
 #include "../components/MediaCache.h"
 #include "../components/ViewerWindow.h"
 
+#include <QFuture>
 #include <QPointer>
 #include <QSet>
 #include <QWidget>
+
+#include <atomic>
 
 class QLabel;
 class QCompleter;
 class QLineEdit;
 class QPushButton;
+class QSlider;
 class QStackedWidget;
 class QTextBrowser;
 
@@ -21,7 +25,7 @@ namespace Mosaic {
 
 class FeedDatabase;
 class FeedRecommender;
-class EmbeddingBackend;
+class VisualFeatures;
 class AppState;
 class SourceManager;
 class TagSidebar;
@@ -57,7 +61,6 @@ class FeedPage : public QWidget {
     void onHardReset();
 
    private:
-
    signals:
     void tagSearchRequested(const QString& tag, const QString& sourceId);
 
@@ -75,8 +78,12 @@ class FeedPage : public QWidget {
     void recordCurrent(FeedDatabase::Event event);
     void updateDebugPanel();
     void refreshHeavyStats();
-    void seedFromFavorites();
+    // Runs the learned model's warm start in the background (no-op once
+    // it has completed).
+    void startWarmStart();
     void applySwayTags();
+    void applyExplorationLevel();
+    void updateExplorationLabel();
     void updateSwayCompletion();
     void toggleDropped();
     // Debug: opens every liked/favorited post in a viewer, paging the DB
@@ -86,8 +93,10 @@ class FeedPage : public QWidget {
 
     SourceManager& m_sources;
     FeedDatabase* m_db = nullptr;
-    EmbeddingBackend* m_embeddings = nullptr;  // visual embeddings (optional)
+    VisualFeatures* m_visual = nullptr;  // visual style descriptors
     FeedRecommender* m_recommender = nullptr;
+    QFuture<void> m_warmStart;
+    std::atomic<bool> m_cancelWarmStart{false};
 
     // UI
     TagSidebar* m_tagSidebar = nullptr;  // collapsible tags, left of the stage
@@ -109,11 +118,13 @@ class FeedPage : public QWidget {
     QLineEdit* m_swayEdit = nullptr;           // temporary taste-sway tags
     QPushButton* m_swayButton = nullptr;
     QCompleter* m_swayCompleter = nullptr;
-    QStringList m_swayTagNames;  // full library tag list, filtered per word
+    QStringList m_swayTagNames;              // full library tag list, filtered per word
+    QSlider* m_explorationSlider = nullptr;  // comfort .. adventurous
+    QLabel* m_explorationLabel = nullptr;
 
     // Feed state
     QList<SourceImage> m_queue;      // upcoming posts (already ranked)
-    QSet<QString> m_seenMd5s;        // shown this session (dedup against DB too)
+    QSet<QString> m_seenMd5s;        // md5s + "source:id" keys queued this session
     QSet<QString> m_interactedMd5s;  // posts that already recorded a signal -
                                      // going BACK must never double-train them
     int m_position = -1;             // index into m_queue of the current post

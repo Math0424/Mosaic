@@ -27,6 +27,10 @@ class LibraryCatalog {
 
     bool hasImage(const QString& md5) const;
 
+    // md5 of the cataloged image saved from this source's post, or empty
+    // when that post is not in the library.
+    QString md5ForPost(const QString& sourceId, qint64 remoteId) const;
+
     // All cataloged images carrying the given tag (exact name, optional
     // category); used for the startup notags refresh pass.
     QList<SourceImage> imagesWithTag(const QString& tagName,

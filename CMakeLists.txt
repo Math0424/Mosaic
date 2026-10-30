@@ -60,11 +60,6 @@ set(DUCKDB_ROOT
     CACHE PATH "Root of DuckDB release contents"
 )
 
-set(ONNXRUNTIME_ROOT
-    "${THIRDPARTY_ROOT}/onnxruntime"
-    CACHE PATH "Root of ONNX Runtime release contents"
-)
-
 # ---------------------------------------------------------------------------
 # Qt
 # ---------------------------------------------------------------------------
@@ -225,45 +220,6 @@ message(STATUS "DuckDB include: ${DUCKDB_INCLUDE_DIR}")
 message(STATUS "DuckDB library: ${DUCKDB_LIB}")
 
 # ---------------------------------------------------------------------------
-# ONNX Runtime (visual embeddings for the feed)
-# ---------------------------------------------------------------------------
-
-set(ONNXRUNTIME_INCLUDE_DIR
-    "${ONNXRUNTIME_ROOT}/include"
-)
-
-set(ONNXRUNTIME_LIB
-    "${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib"
-)
-
-if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h")
-    message(FATAL_ERROR
-        "ONNX Runtime header not found: ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h"
-    )
-endif()
-
-if(NOT EXISTS "${ONNXRUNTIME_LIB}")
-    message(FATAL_ERROR
-        "ONNX Runtime library not found: ${ONNXRUNTIME_LIB}"
-    )
-endif()
-
-add_library(onnxruntime INTERFACE)
-
-target_include_directories(onnxruntime
-    SYSTEM INTERFACE
-        "${ONNXRUNTIME_INCLUDE_DIR}"
-)
-
-target_link_libraries(onnxruntime
-    INTERFACE
-        "${ONNXRUNTIME_LIB}"
-)
-
-message(STATUS "ONNX Runtime include: ${ONNXRUNTIME_INCLUDE_DIR}")
-message(STATUS "ONNX Runtime library: ${ONNXRUNTIME_LIB}")
-
-# ---------------------------------------------------------------------------
 # Mosaic
 # ---------------------------------------------------------------------------
 
@@ -271,11 +227,3 @@ add_subdirectory(src)
 
 include("${CMAKE_SOURCE_DIR}/cmake/format.cmake")
 include("${CMAKE_SOURCE_DIR}/cmake/package.cmake")
-
-add_custom_target(download_vision_model
-    COMMAND ${CMAKE_COMMAND}
-        -DMODEL_DIR="${CMAKE_SOURCE_DIR}/assets/onnx/v1"
-        -P "${CMAKE_SOURCE_DIR}/cmake/download_vision_model.cmake"
-    COMMENT "Downloading vision model..."
-    VERBATIM
-)

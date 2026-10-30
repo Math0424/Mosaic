@@ -1,9 +1,9 @@
 #include "FeedRecommender.h"
 #include "FeedDatabase.h"
-#include "UserModel.h"
-#include "EmbeddingBackend.h"
+#include "VisualFeatures.h"
 #include "../sources/SourceManager.h"
 #include "../sources/local/LibrarySource.h"
+#include "../sources/web/HttpSource.h"
 
 #include <QDateTime>
 #include <QDebug>
@@ -13,7 +13,9 @@
 #include <QSet>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <random>
 
 // Dedicated logging category; enable per-batch traces with
 // QT_LOGGING_RULES="mosaic.feed.debug=true".
@@ -23,7 +25,7 @@ namespace Mosaic {
 
 namespace {
 
-// Ranking coefficients.
+// Heuristic ranking coefficients (the cold-start prior).
 constexpr double kUserSimWeight = 0.35;
 constexpr double kSessionSimWeight = 0.2;
 constexpr double kTagPrefWeight = 0.10;
@@ -32,8 +34,7 @@ constexpr double kFreshnessWeight = 0.05;
 constexpr double kNoveltyWeight = 0.04;
 constexpr double kExplorationWeight = 0.03;
 constexpr double kPopularityWeight = 0.03;
-// Soft penalty for resembling a learned negative visual anchor.
-constexpr double kNegAnchorWeight = 0.30;
+constexpr double kBoredomWeight = 0.15;
 
 // Per-batch diversity guard: no taste may claim more than this share.
 constexpr double kMaxShareOfBatchPerTaste = 0.5;
@@ -51,17 +52,41 @@ double sessionBlendFor(int skipStreak) {
 // MMR lambda: relevance dominates, redundancy penalized.
 constexpr double kMmrLambda = 0.75;
 
-// Exploration floor: minimum fraction of exploration candidates per batch.
-constexpr double kExplorationFloor = 0.15;
+// Exploration slider mapping (level in [0, 1]):
+// Thompson temperature - how far ranking strays from the posterior mean.
+double thompsonTemperature(double level) { return 0.3 + 1.7 * level; }
+// Share of each batch reserved for tangent slots.
+double tangentShare(double level) { return 0.05 + 0.30 * level; }
+// Optimism bonus per unit of uncertainty when picking tangents.
+double tangentOptimism(double level) { return 0.5 + 1.5 * level; }
+// Minimum predicted engagement for a tangent: plausible, not random.
+double tangentFloor(double level) { return 0.30 - 0.20 * level; }
 
 // Quality floor: minimum site score.
 constexpr int kMinPostScore = 0;
 
 // Candidate funnel sizes.
 constexpr int kFunnelTasteCount = 150;
-constexpr int kFunnelVisualCount = 50;
-// Max thumbnails embedded per batch - keeps the first post appearing fast.
-constexpr int kMaxEmbeddingsPerBatch = 24;
+// Exploratory candidates that survive the shortlist regardless of score.
+constexpr int kProtectedExploratory = 24;
+// Max thumbnails analyzed per batch - keeps the first post appearing fast.
+constexpr int kMaxVisualsPerBatch = 24;
+
+// Recent impressions compared for the boredom signal.
+constexpr int kBoredomWindow = 12;
+
+const QStringList& armNames() {
+    static const QStringList arms = {
+        QStringLiteral("taste"),   QStringLiteral("taste-strict"),     QStringLiteral("broad"),
+        QStringLiteral("combo"),   QStringLiteral("similar-to-liked"), QStringLiteral("recent"),
+        QStringLiteral("popular"), QStringLiteral("exploration"),      QStringLiteral("tangent"),
+    };
+    return arms;
+}
+
+bool isExploratorySource(const QString& source) {
+    return source == QLatin1String("exploration") || source == QLatin1String("tangent");
+}
 
 // Animated content is excluded from the feed entirely.
 bool isAnimated(const SourceImage& img) {
@@ -128,33 +153,85 @@ const QSet<QString>& genericTagSet() {
     return tags;
 }
 
-// Jaccard-style tag overlap, used by MMR as a cheap similarity proxy.
-double tagOverlap(const SourceImage& a, const SourceImage& b) {
-    QSet<QString> tagsA, tagsB;
-    for (const SourceTag& t : a.tags) {
-        if (!FeedRecommender::isGenericTag(t.name))
-            tagsA.insert(t.name.toLower());
-    }
-    for (const SourceTag& t : b.tags) {
-        if (!FeedRecommender::isGenericTag(t.name))
-            tagsB.insert(t.name.toLower());
-    }
-    if (tagsA.isEmpty() || tagsB.isEmpty())
+// Jaccard overlap of two content-tag sets.
+double jaccard(const QSet<QString>& a, const QSet<QString>& b) {
+    if (a.isEmpty() || b.isEmpty())
         return 0.0;
+    const QSet<QString>& small = a.size() <= b.size() ? a : b;
+    const QSet<QString>& large = a.size() <= b.size() ? b : a;
     int inter = 0;
-    for (const QString& t : tagsA) {
-        if (tagsB.contains(t))
+    for (const QString& t : small) {
+        if (large.contains(t))
             ++inter;
     }
-    const int unionSize = tagsA.size() + tagsB.size() - inter;
+    const int unionSize = a.size() + b.size() - inter;
     return unionSize > 0 ? static_cast<double>(inter) / unionSize : 0.0;
+}
+
+QSet<QString> toSet(const QStringList& list) { return QSet<QString>(list.begin(), list.end()); }
+
+// Positive tag prefs are tanh-compressed; negatives are shrunk by evidence.
+constexpr double kTagPrefCeiling = 8.0;
+
+// Bayesian shrinkage prior for negative tag preferences.
+constexpr double kTagPrefPrior = 3.0;
+
+// Query-tag selection: prefer NICHE tags. A tag seen on few impressions
+// (high specificity) identifies content much more precisely than a
+// near-universal one, so query seeds are ranked by
+// preference x specificity instead of raw preference alone.
+double queryNicheScore(const QString& tag, double preference,
+                       const QHash<QString, double>& specificity) {
+    auto it = specificity.constFind(tag);
+    // Unseen tags default to 0.6 (same neutral value the ranker uses).
+    const double spec = it != specificity.constEnd() ? it.value() : 0.6;
+    return preference * (0.35 + 0.65 * spec);
+}
+
+// The opposite strategy: BROAD tags. High preference x low specificity
+// (near-universal tags) cast a wide net - they pull in lots of content
+// the taste model can then filter, and keep the feed from collapsing
+// into one narrow niche.
+double queryBroadScore(const QString& tag, double preference,
+                       const QHash<QString, double>& specificity) {
+    auto it = specificity.constFind(tag);
+    const double spec = it != specificity.constEnd() ? it.value() : 0.6;
+    return preference * (1.35 - spec);
+}
+
+// Who made it / who is in it says more about taste than descriptive tags.
+double categoryBoost(const QString& category) {
+    if (category == QLatin1String("artist"))
+        return 2.0;
+    if (category == QLatin1String("character"))
+        return 1.6;
+    if (category == QLatin1String("copyright"))
+        return 1.4;
+    if (category == QLatin1String("species"))
+        return 1.2;
+    return 1.0;  // general / meta / unknown
+}
+
+// Mean / standard deviation, for blending scores on a common scale.
+void meanStd(const QList<double>& values, double* mean, double* sd) {
+    *mean = 0.0;
+    *sd = 1.0;
+    if (values.isEmpty())
+        return;
+    double sum = 0.0;
+    for (double v : values) sum += v;
+    *mean = sum / values.size();
+    double var = 0.0;
+    for (double v : values) var += (v - *mean) * (v - *mean);
+    var /= values.size();
+    *sd = var > 1e-12 ? std::sqrt(var) : 1.0;
 }
 
 }  // namespace
 
 FeedRecommender::FeedRecommender(FeedDatabase& db, SourceManager& sources,
-                                 const QStringList& feedSourceIds, EmbeddingBackend* embeddings)
-    : m_db(db), m_sources(sources), m_feedSourceIds(feedSourceIds), m_embeddings(embeddings) {}
+                                 const QStringList& feedSourceIds, VisualFeatures* visual)
+    : m_db(db), m_sources(sources), m_visual(visual), m_feedSourceIds(feedSourceIds) {}
 
 bool FeedRecommender::isGenericTag(const QString& tag) {
     const QString t = tag.trimmed().toLower();
@@ -181,58 +258,12 @@ QStringList FeedRecommender::contentTags(const SourceImage& image) {
     return tags;
 }
 
-// Positive tag prefs are tanh-compressed; negatives stay linear.
-constexpr double kTagPrefCeiling = 8.0;
-
-// Bayesian shrinkage prior for tag preferences.
-constexpr double kTagPrefPrior = 3.0;
-
-// Query-tag selection: prefer NICHE tags. A tag seen on few impressions
-// (high specificity) identifies content much more precisely than a
-// near-universal one, so query seeds are ranked by
-// preference x specificity instead of raw preference alone.
-double queryNicheScore(const QString& tag, double preference,
-                       const QHash<QString, double>& specificity) {
-    auto it = specificity.constFind(tag);
-    // Unseen tags default to 0.6 (same neutral value the ranker uses).
-    const double spec = it != specificity.constEnd() ? it.value() : 0.6;
-    return preference * (0.35 + 0.65 * spec);
-}
-
-// The opposite strategy: BROAD tags. High preference x low specificity
-// (near-universal tags) cast a wide net - they pull in lots of content
-// the taste model can then filter, and keep the feed from collapsing
-// into one narrow niche.
-double queryBroadScore(const QString& tag, double preference,
-                       const QHash<QString, double>& specificity) {
-    auto it = specificity.constFind(tag);
-    const double spec = it != specificity.constEnd() ? it.value() : 0.6;
-    return preference * (1.35 - spec);
-}
-
-double saturateTagPref(double w) {
-    if (w <= 0.0)
-        return w;
-    return kTagPrefCeiling * std::tanh(w / kTagPrefCeiling);
-}
-
-// Bayesian shrinkage toward zero by evidence mass: weak opinions stay
-// weak until consistent evidence accumulates.
-double shrinkTagPref(double preference, double confidence) {
+double FeedRecommender::tagPreferenceWeight(double preference, double confidence) {
+    // Confidence only accumulates from dislikes, so it gates negatives:
+    // shrinking positives by it would zero every liked tag.
+    if (preference >= 0.0)
+        return kTagPrefCeiling * std::tanh(preference / kTagPrefCeiling);
     return preference * (confidence / (confidence + kTagPrefPrior));
-}
-
-// Who made it / who is in it says more about taste than descriptive tags.
-double categoryBoost(const QString& category) {
-    if (category == QLatin1String("artist"))
-        return 2.0;
-    if (category == QLatin1String("character"))
-        return 1.6;
-    if (category == QLatin1String("copyright"))
-        return 1.4;
-    if (category == QLatin1String("species"))
-        return 1.2;
-    return 1.0;  // general / meta / unknown
 }
 
 // candidate arms
@@ -240,7 +271,7 @@ double categoryBoost(const QString& category) {
 QList<SourceImage> FeedRecommender::fetchFromSource(const QString& sourceId, const QString& query,
                                                     int limit) const {
     Source* source = m_sources.source(sourceId);
-    if (!source || !source->isEnabled())
+    if (!source || !source->isEnabled() || limit <= 0)
         return {};
 
     SourceQuery q;
@@ -290,7 +321,44 @@ QList<SourceImage> FeedRecommender::fetchFromSource(const QString& sourceId, con
     q.limit = limit;
     q.page = 1;
     const SourceResult result = source->search(q);
-    return result.ok ? result.images : QList<SourceImage>{};
+    if (result.ok)
+        return result.images;
+
+    // A throttled site is skipped for the rest of the batch and the query
+    // goes to another feed site instead of coming back empty.
+    if (!source->isLocal() && HttpSource::lastRequestRateLimited()) {
+        m_throttled.insert(sourceId);
+        qCInfo(lcFeed).noquote() << sourceId << "is rate limiting - skipping it this batch";
+        const QString fallback = pickSource(m_feedSourceIdsThisBatch);
+        if (!fallback.isEmpty() && !m_throttled.contains(fallback))
+            return fetchFromSource(fallback, query, limit);
+    }
+    return {};
+}
+
+const QString& FeedRecommender::pickSource(const QStringList& sourceIds) const {
+    QStringList usable;
+    for (const QString& id : sourceIds)
+        if (!m_throttled.contains(id))
+            usable << id;
+    // Everything throttled: any pick fails fast anyway.
+    const QStringList& pool = usable.isEmpty() ? sourceIds : usable;
+    static const QString kNone;
+    if (pool.isEmpty())
+        return kNone;
+    const QString& picked = pool.at(QRandomGenerator::global()->bounded(pool.size()));
+    // Return a reference into the caller's list, which outlives the call.
+    return sourceIds.at(sourceIds.indexOf(picked));
+}
+
+int FeedRecommender::armLimit(const QString& arm, int base) const {
+    double m = m_armMultipliers.value(arm, 1.0);
+    // The slider scales the exploratory arms on top of the bandit's view.
+    if (isExploratorySource(arm))
+        m *= 0.4 + 1.2 * m_exploration;
+    const int limit = static_cast<int>(std::lround(base * m));
+    // Below a handful of results a query is not worth the request.
+    return limit >= 4 ? limit : 0;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromTastes(
@@ -298,6 +366,16 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromTastes(
     QList<Candidate> out;
     if (tastes.isEmpty() || sourceIds.isEmpty())
         return out;
+
+    const int broadLimit = armLimit(QStringLiteral("taste"), 30);
+    const int strictLimit = armLimit(QStringLiteral("taste-strict"), 20);
+    if (broadLimit == 0 && strictLimit == 0)
+        return out;
+    // The bandit's opinion of the taste arm also sets how many tastes get
+    // their own query this batch.
+    const int tasteQueries = qBound(
+        1, static_cast<int>(std::lround(5 * m_armMultipliers.value(QStringLiteral("taste"), 1.0))),
+        5);
 
     const QHash<QString, double> specificity = m_db.tagSpecificities();
     int totalExposure = 0;
@@ -314,7 +392,7 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromTastes(
     std::sort(
         ranked.begin(), ranked.end(),
         [](const QPair<double, int>& a, const QPair<double, int>& b) { return a.first > b.first; });
-    for (int rank = 0; rank < qMin(5, ranked.size()); ++rank) {
+    for (int rank = 0; rank < qMin(tasteQueries, ranked.size()); ++rank) {
         const FeedDatabase::Taste& taste = tastes.at(ranked.at(rank).second);
         QList<QPair<double, QString>> tagsRanked;
         for (auto it = taste.embedding.constBegin(); it != taste.embedding.constEnd(); ++it)
@@ -339,35 +417,43 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromTastes(
                 opts << QLatin1Char('~') + tagsRanked.at(i).second;
             optional = QStringLiteral(" (%1)").arg(opts.join(QLatin1Char(' ')));
         }
-        QString query = anchor + optional;
-        if (tagsRanked.size() >= 2) {
+        if (tagsRanked.size() >= 2 && strictLimit > 0) {
             const QString strict = anchor + QLatin1Char(' ') + tagsRanked.at(1).second + optional;
-            const QString& strictSrc =
-                sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-            for (const SourceImage& img : fetchFromSource(strictSrc, strict, 20))
+            const QString& strictSrc = pickSource(sourceIds);
+            for (const SourceImage& img : fetchFromSource(strictSrc, strict, strictLimit))
                 out.append({img, QStringLiteral("taste-strict"), taste.id});
         }
 
-        const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-        const QList<SourceImage> imgs = fetchFromSource(src, query, 30);
-        for (const SourceImage& img : imgs) out.append({img, QStringLiteral("taste"), taste.id});
+        if (broadLimit > 0) {
+            const QString& src = pickSource(sourceIds);
+            for (const SourceImage& img : fetchFromSource(src, anchor + optional, broadLimit))
+                out.append({img, QStringLiteral("taste"), taste.id});
+        }
     }
     return out;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromCombos(
-    const QStringList& sourceIds) const {
+    const FeedModel& model, const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("combo"), 20);
+    if (sourceIds.isEmpty() || limit == 0)
         return out;
 
+    // Pairs of tags the model is confidently positive about, ranked by
+    // learned weight x specificity.
     const QHash<QString, double> specificity = m_db.tagSpecificities();
-    const auto prefRows = m_db.tagPreferenceRows();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     QList<QPair<double, QString>> strong;
-    for (auto it = prefRows.constBegin(); it != prefRows.constEnd(); ++it) {
-        const double w = shrinkTagPref(it.value().preference, it.value().confidence);
-        if (w > 0.5 && !isGenericTag(it.key()))
-            strong.append({queryNicheScore(it.key(), w, specificity), it.key()});
+    for (auto it = model.beliefs().constBegin(); it != model.beliefs().constEnd(); ++it) {
+        if (!it.key().startsWith(QLatin1String("t:")))
+            continue;
+        const FeedModel::Belief b = model.belief(it.key(), nowMs);
+        if (b.mean < 0.3 || b.positive < 2.0)
+            continue;
+        const QString tag = it.key().mid(2);
+        if (!isGenericTag(tag))
+            strong.append({queryNicheScore(tag, b.mean, specificity), tag});
     }
     if (strong.size() < 2)
         return out;
@@ -376,23 +462,24 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromCombos(
                   return a.first > b.first;
               });
 
-    // Random pick among the top 6 so queries vary between batches.
-    const int pool = qMin(6, strong.size());
+    // Random pick among the top 8 so queries vary between batches.
+    const int pool = qMin(8, strong.size());
     const int a = QRandomGenerator::global()->bounded(pool);
     int b = QRandomGenerator::global()->bounded(pool);
     if (b == a)
         b = (b + 1) % pool;
     const QString query = strong.at(a).second + QLatin1Char(' ') + strong.at(b).second;
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-    const QList<SourceImage> imgs = fetchFromSource(src, query, 20);
-    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("combo"), 0});
+    const QString& src = pickSource(sourceIds);
+    for (const SourceImage& img : fetchFromSource(src, query, limit))
+        out.append({img, QStringLiteral("combo"), 0});
     return out;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesBroad(
     const QList<FeedDatabase::Taste>& tastes, const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (tastes.isEmpty() || sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("broad"), 30);
+    if (tastes.isEmpty() || sourceIds.isEmpty() || limit == 0)
         return out;
 
     // Broad-reach arm: seed queries with the most GENERIC liked tags
@@ -429,9 +516,9 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesBroad(
         else
             query = ranked.at(0).second;
 
-        const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-        const QList<SourceImage> imgs = fetchFromSource(src, query, 30);
-        for (const SourceImage& img : imgs) out.append({img, QStringLiteral("broad"), taste.id});
+        const QString& src = pickSource(sourceIds);
+        for (const SourceImage& img : fetchFromSource(src, query, limit))
+            out.append({img, QStringLiteral("broad"), taste.id});
     }
     return out;
 }
@@ -461,7 +548,8 @@ QHash<QString, int> FeedRecommender::favoriteTagFrequencies() const {
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromFavorites(
     const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("similar-to-liked"), 25);
+    if (sourceIds.isEmpty() || limit == 0)
         return out;
 
     // Query the tags of a random library favorite on the remote sources.
@@ -483,41 +571,44 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromFavorites(
     if (seedTags.isEmpty())
         return out;
 
-    // AND the two strongest seed tags for a high-precision query.
+    // AND two random seed tags for a high-precision query.
     std::shuffle(seedTags.begin(), seedTags.end(), *QRandomGenerator::global());
     const QString query = seedTags.mid(0, 2).join(QLatin1Char(' '));
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-    const QList<SourceImage> imgs = fetchFromSource(src, query, 25);
-    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("similar-to-liked"), 0});
+    const QString& src = pickSource(sourceIds);
+    for (const SourceImage& img : fetchFromSource(src, query, limit))
+        out.append({img, QStringLiteral("similar-to-liked"), 0});
     return out;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesRecent(
     const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("recent"), 15);
+    if (sourceIds.isEmpty() || limit == 0)
         return out;
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-    const QList<SourceImage> imgs = fetchFromSource(src, QStringLiteral("order:score"), 15);
-    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("recent"), 0});
+    const QString& src = pickSource(sourceIds);
+    for (const SourceImage& img : fetchFromSource(src, QStringLiteral("order:score"), limit))
+        out.append({img, QStringLiteral("recent"), 0});
     return out;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesPopular(
     const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("popular"), 15);
+    if (sourceIds.isEmpty() || limit == 0)
         return out;
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-    const QList<SourceImage> imgs = fetchFromSource(src, QStringLiteral("order:hot"), 15);
-    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("popular"), 0});
+    const QString& src = pickSource(sourceIds);
+    for (const SourceImage& img : fetchFromSource(src, QStringLiteral("order:hot"), limit))
+        out.append({img, QStringLiteral("popular"), 0});
     return out;
 }
 
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesExploration(
     const QList<FeedDatabase::Taste>& tastes, const QStringList& sourceIds) const {
     QList<Candidate> out;
-    if (sourceIds.isEmpty())
+    const int limit = armLimit(QStringLiteral("exploration"), 15);
+    if (sourceIds.isEmpty() || limit == 0)
         return out;
 
     // Exploration must not be random garbage: wildcard-expand a
@@ -539,10 +630,9 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesExploration(
             const QString& tag = ranked.first().second;
             const int underscore = tag.lastIndexOf(QLatin1Char('_'));
             if (underscore > 0) {
-                const QString& src =
-                    sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+                const QString& src = pickSource(sourceIds);
                 const QList<SourceImage> imgs =
-                    fetchFromSource(src, tag.left(underscore) + QStringLiteral("_*"), 15);
+                    fetchFromSource(src, tag.left(underscore) + QStringLiteral("_*"), limit);
                 for (const SourceImage& img : imgs)
                     out.append({img, QStringLiteral("exploration"), 0});
                 return out;
@@ -551,9 +641,116 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesExploration(
     }
 
     // Fallback: a small amount of pure random.
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
-    const QList<SourceImage> imgs = fetchFromSource(src, QStringLiteral("order:random"), 10);
-    for (const SourceImage& img : imgs) out.append({img, QStringLiteral("exploration"), 0});
+    const QString& src = pickSource(sourceIds);
+    for (const SourceImage& img :
+         fetchFromSource(src, QStringLiteral("order:random"), qMax(4, limit * 2 / 3)))
+        out.append({img, QStringLiteral("exploration"), 0});
+    return out;
+}
+
+QList<FeedRecommender::ModelStats::LearnedTag> FeedRecommender::tangentTags(const FeedModel& model,
+                                                                            double exploration,
+                                                                            int limit) const {
+    // A tangent tag looks promising but nothing pursues it yet: it rode
+    // along on posts the user engaged with (positive learned weight) and
+    // is not already a query anchor of a taste. Optimism (mean + k * sd)
+    // ranks them - the classic way to go looking where the payoff is
+    // uncertain. Ranking by uncertainty alone would chase the hundreds of
+    // tags that appeared on a single liked post by chance.
+    const QSet<QString> hardNegs = [this]() {
+        const QStringList list = m_db.hardNegativeTags();
+        return QSet<QString>(list.begin(), list.end());
+    }();
+    // Tags the taste arms already query (each taste's top tags).
+    QSet<QString> anchored;
+    for (const FeedDatabase::Taste& t : m_db.tastes()) {
+        QList<QPair<double, QString>> top;
+        for (auto it = t.embedding.constBegin(); it != t.embedding.constEnd(); ++it)
+            top.append({it.value(), it.key()});
+        std::sort(top.begin(), top.end(), std::greater<QPair<double, QString>>());
+        for (int i = 0; i < qMin(5, top.size()); ++i) anchored.insert(top.at(i).second);
+    }
+    const QStringList sway = m_db.swayTags();
+    const double k = 0.3 + 0.9 * exploration;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QList<QPair<double, ModelStats::LearnedTag>> ranked;
+    for (auto it = model.beliefs().constBegin(); it != model.beliefs().constEnd(); ++it) {
+        if (!it.key().startsWith(QLatin1String("t:")))
+            continue;
+        const FeedModel::Belief b = model.belief(it.key(), nowMs);
+        const double evidence = b.positive + b.negative;
+        // Well-established tags (lots of evidence) are not tangents either.
+        if (b.positive <= 0.0 || b.mean <= 0.0 || evidence >= 25.0)
+            continue;
+        const QString tag = it.key().mid(2);
+        if (isGenericTag(tag) || hardNegs.contains(tag) || sway.contains(tag) ||
+            anchored.contains(tag))
+            continue;
+        const double sd = std::sqrt(b.variance);
+        ranked.append({b.mean + k * sd, {tag, b.mean, sd, evidence}});
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    QList<ModelStats::LearnedTag> out;
+    for (int i = 0; i < qMin(limit, ranked.size()); ++i) out.append(ranked.at(i).second);
+    return out;
+}
+
+QList<FeedRecommender::Candidate> FeedRecommender::candidatesTangent(
+    const FeedModel& model, const QStringList& sourceIds) const {
+    QList<Candidate> out;
+    const int limit = armLimit(QStringLiteral("tangent"), 20);
+    if (sourceIds.isEmpty() || limit == 0)
+        return out;
+
+    const QList<ModelStats::LearnedTag> pool = tangentTags(model, m_exploration, 10);
+    if (pool.isEmpty())
+        return out;
+
+    // Established anchor: a tag the model is confidently positive about.
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QList<QPair<double, QString>> anchors;
+    for (auto it = model.beliefs().constBegin(); it != model.beliefs().constEnd(); ++it) {
+        if (!it.key().startsWith(QLatin1String("t:")))
+            continue;
+        const FeedModel::Belief b = model.belief(it.key(), nowMs);
+        if (b.positive >= 3.0 && b.mean > 0.2 && !isGenericTag(it.key().mid(2)))
+            anchors.append({b.mean, it.key().mid(2)});
+    }
+    std::sort(anchors.begin(), anchors.end(),
+              [](const QPair<double, QString>& a, const QPair<double, QString>& b) {
+                  return a.first > b.first;
+              });
+
+    // Two probes, biased toward the most optimistic tags: one tangent on
+    // its own (step sideways), one next to a known love (step out from
+    // home ground).
+    auto pickTangent = [&pool]() {
+        const int top = qMin(pool.size(), 5);
+        const int a = QRandomGenerator::global()->bounded(top);
+        const int b = QRandomGenerator::global()->bounded(top);
+        return pool.at(qMin(a, b)).tag;
+    };
+    const QString solo = pickTangent();
+    QString paired = pickTangent();
+    if (paired == solo && pool.size() > 1)
+        paired = pool.at(pool.first().tag == solo ? 1 : 0).tag;
+
+    QStringList queries{solo};
+    if (!anchors.isEmpty()) {
+        const QString anchor =
+            anchors.at(QRandomGenerator::global()->bounded(qMin(5, anchors.size()))).second;
+        if (anchor != paired)
+            queries << anchor + QLatin1Char(' ') + paired;
+    } else if (paired != solo) {
+        queries << paired;
+    }
+    for (const QString& query : queries) {
+        const QString& src = pickSource(sourceIds);
+        for (const SourceImage& img : fetchFromSource(src, query, limit))
+            out.append({img, QStringLiteral("tangent"), 0});
+    }
+    qCDebug(lcFeed).noquote() << "tangent queries:" << queries.join(QStringLiteral(" | "));
     return out;
 }
 
@@ -568,7 +765,7 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesFromSway(
     // strongest tag, so the arm still returns something when the exact
     // combination is rare on the source.
     const QString full = sway.join(QLatin1Char(' '));
-    const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+    const QString& src = pickSource(sourceIds);
     QList<SourceImage> imgs = fetchFromSource(src, full, 20);
     if (imgs.isEmpty() && sway.size() > 1)
         imgs = fetchFromSource(src, sway.first(), 20);
@@ -589,310 +786,362 @@ double FeedRecommender::tastePriority(const FeedDatabase::Taste& taste, int tota
     return strength * underexposure * engagement;
 }
 
+// scoring
+
+FeedRecommender::ScoringContext FeedRecommender::buildContext() const {
+    ScoringContext ctx;
+    ctx.tastes = m_db.tastes();
+    int total = 0;
+    for (const FeedDatabase::Taste& t : ctx.tastes) total += static_cast<int>(t.exposure);
+    ctx.totalExposure = qMax(1, total);
+    const auto prefRows = m_db.tagPreferenceRows();
+    ctx.prefs.reserve(prefRows.size());
+    for (auto it = prefRows.constBegin(); it != prefRows.constEnd(); ++it)
+        ctx.prefs.insert(it.key(),
+                         tagPreferenceWeight(it.value().preference, it.value().confidence));
+    ctx.specificity = m_db.tagSpecificities();
+    ctx.favTagFreqs = favoriteTagFrequencies();
+    ctx.recentTags = m_db.recentImpressionTags();
+    ctx.sessionBlend = sessionBlendFor(m_db.recentSkipStreak());
+    ctx.exploration = m_db.explorationLevel();
+    return ctx;
+}
+
+double FeedRecommender::computeSignals(const ScoringContext& ctx, const FeedModel& model,
+                                       const SourceImage& image, const QString& source,
+                                       double* signalValues, qint64* tasteId,
+                                       double* tastePriorityOut) const {
+    const QStringList tags = contentTags(image);
+    for (int i = 0; i < kSignalCount; ++i) signalValues[i] = 0.0;
+
+    // Taste similarity: max over tastes of similarity x strength - the
+    // strongest relevant taste drives the score, interests never dilute
+    // each other by averaging.
+    double bestSim = 0.0;
+    qint64 bestTaste = 0;
+    double bestPriority = 0.0;
+    for (const FeedDatabase::Taste& t : ctx.tastes) {
+        const double sim = FeedDatabase::similarity(t.embedding, tags);
+        const double weighted = sim * (0.5 + qMin(1.0, t.strength) * 0.5);
+        if (weighted > bestSim) {
+            bestSim = weighted;
+            bestTaste = t.id;
+            bestPriority = tastePriority(t, ctx.totalExposure);
+        }
+    }
+    signalValues[kSignalTaste] = bestSim;
+    if (tasteId)
+        *tasteId = bestTaste;
+    if (tastePriorityOut)
+        *tastePriorityOut = bestPriority;
+
+    signalValues[kSignalSession] = m_db.sessionSimilarity(tags);
+
+    // Tag preference + library-favorite overlap, weighted by tag category
+    // x self-learned specificity.
+    double tagSum = 0.0, weightSum = 0.0, favMatches = 0.0;
+    for (const SourceTag& t : image.tags) {
+        if (isGenericTag(t.name))
+            continue;
+        const QString tag = t.name.trimmed().toLower();
+        auto sit = ctx.specificity.constFind(tag);
+        const double boost =
+            categoryBoost(t.category) * (sit != ctx.specificity.constEnd() ? sit.value() : 0.6);
+        auto it = ctx.prefs.constFind(tag);
+        if (it != ctx.prefs.constEnd())
+            tagSum += it.value() * boost;
+        weightSum += boost;
+        auto fit = ctx.favTagFreqs.constFind(tag);
+        if (fit != ctx.favTagFreqs.constEnd())
+            favMatches += std::log1p(static_cast<double>(fit.value())) * boost;
+    }
+    signalValues[kSignalTagPref] = weightSum > 0.0 ? tagSum / weightSum : 0.0;
+    signalValues[kSignalFavorite] =
+        weightSum > 0.0 ? qMin(1.0, favMatches / (weightSum * 1.5)) : 0.0;
+
+    if (image.createdAt > 0) {
+        const double ageDays = (QDateTime::currentSecsSinceEpoch() - image.createdAt) / 86400.0;
+        signalValues[kSignalFresh] = std::exp(-ageDays / 30.0);
+    }
+
+    // Novelty: share of tags the model has never seen a reaction to.
+    int unknown = 0;
+    for (const QString& tag : tags) {
+        const FeedModel::Belief b = model.belief(QStringLiteral("t:") + tag);
+        if (b.positive + b.negative < 0.5)
+            ++unknown;
+    }
+    signalValues[kSignalNovelty] =
+        tags.isEmpty() ? 0.0 : static_cast<double>(unknown) / tags.size();
+
+    signalValues[kSignalPopularity] =
+        image.score > 0 ? std::log1p(static_cast<double>(image.score)) / 10.0 : 0.0;
+
+    // Boredom: mean of the three closest matches among what was just shown.
+    const QSet<QString> tagSet = toSet(tags);
+    QList<double> overlaps;
+    for (int i = 0; i < qMin(kBoredomWindow, ctx.recentTags.size()); ++i)
+        overlaps.append(jaccard(tagSet, toSet(ctx.recentTags.at(i))));
+    std::sort(overlaps.begin(), overlaps.end(), std::greater<double>());
+    double bored = 0.0;
+    for (int i = 0; i < qMin(3, overlaps.size()); ++i) bored += overlaps.at(i);
+    signalValues[kSignalBoredom] = overlaps.isEmpty() ? 0.0 : bored / qMin(3, overlaps.size());
+
+    signalValues[kSignalExplore] = isExploratorySource(source) ? 1.0 : 0.0;
+
+    // The heuristic score itself. The slider leans its curiosity terms.
+    const double curiosity = 0.5 + ctx.exploration;
+    const double blendedTaste = (1.0 - ctx.sessionBlend) * signalValues[kSignalTaste] +
+                                ctx.sessionBlend * signalValues[kSignalSession];
+    return kUserSimWeight * blendedTaste + kSessionSimWeight * signalValues[kSignalSession] +
+           kTagPrefWeight * signalValues[kSignalTagPref] +
+           kFavOverlapWeight * signalValues[kSignalFavorite] +
+           kFreshnessWeight * signalValues[kSignalFresh] +
+           kNoveltyWeight * curiosity * signalValues[kSignalNovelty] +
+           kExplorationWeight * curiosity * signalValues[kSignalExplore] +
+           kPopularityWeight * signalValues[kSignalPopularity] -
+           kBoredomWeight * signalValues[kSignalBoredom];
+}
+
 // allocation + MMR
 
-QList<SourceImage> FeedRecommender::allocateAndDiversify(QList<Candidate>& candidates,
-                                                         int count) const {
+QList<SourceImage> FeedRecommender::allocateAndDiversify(QList<Candidate>& candidates, int count,
+                                                         const FeedModel& model,
+                                                         FunnelStats* funnel) {
     QList<SourceImage> batch;
     if (candidates.isEmpty() || count <= 0)
         return batch;
 
-    const QList<FeedDatabase::Taste> tastes = m_db.tastes();
-    const int totalExposure = [tastes]() {
-        int total = 0;
-        for (const FeedDatabase::Taste& t : tastes) total += static_cast<int>(t.exposure);
-        return qMax(1, total);
-    }();
+    const ScoringContext ctx = buildContext();
+    const double level = m_exploration;
+    const double blend = model.blendWeight();
 
-    // Score every candidate once (pre-diversity relevance).
-    const auto prefRows = m_db.tagPreferenceRows();
-    QHash<QString, double> prefs;
-    prefs.reserve(prefRows.size());
-    for (auto it = prefRows.constBegin(); it != prefRows.constEnd(); ++it)
-        prefs.insert(it.key(),
-                     saturateTagPref(shrinkTagPref(it.value().preference, it.value().confidence)));
-    const int skipStreak = m_db.recentSkipStreak();
-    const double blend = sessionBlendFor(skipStreak);
-
-    const QSet<QString> hardNegs = [this]() {
-        const QStringList list = m_db.hardNegativeTags();
-        return QSet<QString>(list.begin(), list.end());
-    }();
-    const QHash<QString, int> favTagFreqs = favoriteTagFrequencies();
-    // Self-learned specificity; neutral 0.6 for unseen tags (cold start).
-    const QHash<QString, double> specificity = m_db.tagSpecificities();
-    auto specificityOf = [&specificity](const QString& tag) {
-        auto it = specificity.constFind(tag);
-        return it != specificity.constEnd() ? it.value() : 0.6;
-    };
-    const QList<FeedDatabase::NegativeAnchor> negAnchors = m_db.negativeAnchors();
+    QStringList md5s;
+    for (const Candidate& c : candidates) md5s << c.image.md5;
+    const QHash<QString, QList<float>> rawVisuals = m_db.visualsFor(md5s);
 
     struct Scored {
         Candidate candidate;
-        double userSim = 0.0;
-        double sessionSim = 0.0;
-        double tagScore = 0.0;
-        double favOverlapScore = 0.0;
-        double freshness = 0.0;
-        double novelty = 0.0;
-        double exploration = 0.0;
-        double negAnchorSim = 0.0;
-        double popularity = 0.0;
+        QStringList tags;
+        QSet<QString> tagSet;
+        QList<double> visual;
+        double signalValues[kSignalCount] = {};
+        double heuristic = 0.0;
+        double meanLogit = 0.0;
+        double uncertainty = 0.0;
+        double probability = 0.5;
+        double sampled = 0.0;
         double relevance = 0.0;
-        double learnedProb = 0.5;
-        double features[UserModel::kFeatureCount] = {};
         qint64 tasteId = 0;
         double tastePriority = 0.0;
+        bool tangent = false;
     };
 
-    // Embeddings cached once for both the anchor penalty and MMR.
-    QHash<QString, QByteArray> embeddings;
-    if (m_embeddings && m_embeddings->isReady()) {
-        for (const Candidate& c : candidates) {
-            if (!embeddings.contains(c.image.md5)) {
-                embeddings.insert(c.image.md5,
-                                  m_db.embeddingFor(c.image.md5, m_embeddings->modelName(),
-                                                    m_embeddings->modelVersion()));
-            }
-        }
-    }
+    // One posterior draw for the whole batch (Thompson sampling).
+    ThompsonDraw draw(model, thompsonTemperature(level), QRandomGenerator::global()->generate64());
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
     QList<Scored> scored;
     scored.reserve(candidates.size());
     for (const Candidate& c : candidates) {
-        if (!hardNegs.isEmpty()) {
-            bool hasHardNeg = false;
-            for (const SourceTag& t : c.image.tags) {
-                if (hardNegs.contains(t.name.trimmed().toLower())) {
-                    hasHardNeg = true;
-                    break;
-                }
-            }
-            if (hasHardNeg)
-                continue;
-        }
-
         Scored s;
         s.candidate = c;
-        const QStringList tags = contentTags(c.image);
-
-        // User similarity: max over tastes of
-        // similarity × strength - the strongest relevant taste drives the
-        // score, interests never dilute each other by averaging.
-        double bestSim = 0.0;
-        qint64 bestTaste = 0;
-        double bestPriority = 0.0;
-        for (const FeedDatabase::Taste& t : tastes) {
-            const double sim = FeedDatabase::similarity(t.embedding, tags);
-            const double weighted = sim * (0.5 + qMin(1.0, t.strength) * 0.5);
-            if (weighted > bestSim) {
-                bestSim = weighted;
-                bestTaste = t.id;
-                bestPriority = tastePriority(t, totalExposure);
-            }
-        }
-        s.userSim = bestSim;
-        s.tasteId = bestTaste;
-        s.tastePriority = bestPriority;
-
-        // Session similarity (what the user wants right now).
-        s.sessionSim = m_db.sessionSimilarity(tags);
-
-        // Tag preference: supporting signal, weighted by tag category.
-        double tagSum = 0.0;
-        double weightSum = 0.0;
-        double favMatches = 0.0;
-        for (const SourceTag& t : c.image.tags) {
-            if (isGenericTag(t.name))
-                continue;
-            const QString tag = t.name.trimmed().toLower();
-            // Category boost x self-learned specificity.
-            const double boost = categoryBoost(t.category) * specificityOf(tag);
-            auto it = prefs.constFind(tag);
-            if (it != prefs.constEnd())
-                tagSum += it.value() * boost;
-            weightSum += boost;
-
-            if (favTagFreqs.contains(tag)) {
-                favMatches += std::log1p(static_cast<double>(favTagFreqs.value(tag))) * boost;
-            }
-        }
-        s.tagScore = weightSum > 0.0 ? tagSum / weightSum : 0.0;
-        s.favOverlapScore = weightSum > 0.0 ? qMin(1.0, favMatches / (weightSum * 1.5)) : 0.0;
-
-        if (c.image.createdAt > 0) {
-            const double ageDays =
-                (QDateTime::currentSecsSinceEpoch() - c.image.createdAt) / 86400.0;
-            s.freshness = std::exp(-ageDays / 30.0);
-        }
-
-        int unknown = 0;
-        for (const QString& tag : tags) {
-            if (!prefs.contains(tag))
-                ++unknown;
-        }
-        s.novelty = tags.isEmpty() ? 0.0 : static_cast<double>(unknown) / tags.size();
-
-        // Exploration: candidates from the exploration arm get a boost.
-        s.exploration = c.source == QLatin1String("exploration") ? 1.0 : 0.0;
-
-        s.popularity =
-            c.image.score > 0 ? std::log1p(static_cast<double>(c.image.score)) / 10.0 : 0.0;
-
-        // Negative visual anchors: soft look-based penalty.
-        if (!negAnchors.isEmpty()) {
-            const QByteArray& emb = embeddings.value(c.image.md5);
-            if (!emb.isEmpty())
-                s.negAnchorSim = m_db.maxNegativeAnchorSimilarity(emb);
-        }
-
-        // Blend long-term taste with session taste.
-        const double blendedTasteSim = (1.0 - blend) * s.userSim + blend * s.sessionSim;
-        const double bayesian =
-            kUserSimWeight * blendedTasteSim + kSessionSimWeight * s.sessionSim +
-            kTagPrefWeight * s.tagScore + kFavOverlapWeight * s.favOverlapScore +
-            kFreshnessWeight * s.freshness + kNoveltyWeight * s.novelty +
-            kExplorationWeight * s.exploration + kPopularityWeight * s.popularity -
-            kNegAnchorWeight * s.negAnchorSim;
-
-        // Stage-2 learned model over the same signals.
-        s.features[0] = s.userSim;
-        s.features[1] = s.sessionSim;
-        s.features[2] = s.tagScore;
-        s.features[3] = s.favOverlapScore;
-        s.features[4] = s.freshness;
-        s.features[5] = s.novelty;
-        s.features[6] = s.exploration;
-        s.features[7] = s.popularity;
-        s.features[8] = s.negAnchorSim;
-        s.features[UserModel::kBiasIndex] = 1.0;
-        s.learnedProb = m_db.userModelPredict(s.features);
-        const double learnedBlend = m_db.userModelBlend();
-        s.relevance = (1.0 - learnedBlend) * bayesian + learnedBlend * (s.learnedProb - 0.5);
-
+        s.tags = contentTags(c.image);
+        s.tagSet = toSet(s.tags);
+        s.visual = model.standardizeVisual(rawVisuals.value(c.image.md5));
+        s.heuristic = computeSignals(ctx, model, c.image, c.source, s.signalValues, &s.tasteId,
+                                     &s.tastePriority);
+        const FeatureVector x = buildModelFeatures(s.tags, s.visual, s.signalValues);
+        s.meanLogit = model.meanScore(x, nowMs);
+        s.uncertainty = model.uncertainty(x, nowMs);
+        s.probability = model.predict(x, nowMs);
+        s.sampled = draw.score(x);
         scored.append(s);
     }
 
-    // taste allocation
-    // Quotas per taste from dynamic priority; exploration keeps a floor.
-    QHash<qint64, double> prioritySum;
-    double totalPriority = 0.0;
-    for (const Scored& s : scored) {
-        if (s.tasteId > 0) {
-            prioritySum[s.tasteId] += s.tastePriority;
-            totalPriority += s.tastePriority;
+    // Blend on a common scale: z-scores within this candidate set. The
+    // learned share is exactly as large as the model has earned.
+    {
+        QList<double> h, m;
+        for (const Scored& s : scored) {
+            h << s.heuristic;
+            m << s.sampled;
         }
+        double hMean, hSd, mMean, mSd;
+        meanStd(h, &hMean, &hSd);
+        meanStd(m, &mMean, &mSd);
+        for (Scored& s : scored)
+            s.relevance =
+                (1.0 - blend) * (s.heuristic - hMean) / hSd + blend * (s.sampled - mMean) / mSd;
     }
 
+    auto similarity = [](const Scored& a, const Scored& b) {
+        const double tag = jaccard(a.tagSet, b.tagSet);
+        const double look = qMax(0.0, VisualFeatures::similarity(a.visual, b.visual));
+        return qMax(tag, 0.6 * look);
+    };
+
+    // tangent slots
+    // What would the model learn the most from that the user might well
+    // enjoy? Optimistic score (mean + k * uncertainty) among plausible
+    // candidates; posts the exploratory arms found deliberately get extra
+    // credit. Two tangents never cover the same ground.
+    const int tangentTarget =
+        level <= 0.0 ? 0
+                     : qBound(1, static_cast<int>(std::lround(count * tangentShare(level))),
+                              qMax(1, count / 2));
+    const double optimism = tangentOptimism(level);
+    const double floor = tangentFloor(level);
+    QList<Scored> tangents;
+    {
+        QList<QPair<double, int>> ranked;
+        for (int i = 0; i < scored.size(); ++i) {
+            const Scored& s = scored.at(i);
+            if (s.probability < floor)
+                continue;
+            const double bonus = isExploratorySource(s.candidate.source) ? 0.5 : 0.0;
+            ranked.append({s.meanLogit + optimism * (1.0 + bonus) * s.uncertainty, i});
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const QPair<double, int>& a, const QPair<double, int>& b) {
+                      return a.first > b.first;
+                  });
+        QSet<int> taken;
+        for (const auto& [score, index] : ranked) {
+            if (tangents.size() >= tangentTarget)
+                break;
+            bool redundant = false;
+            for (const Scored& t : tangents) {
+                if (similarity(t, scored.at(index)) > 0.5) {
+                    redundant = true;
+                    break;
+                }
+            }
+            if (redundant)
+                continue;
+            Scored pick = scored.at(index);
+            pick.tangent = true;
+            tangents.append(pick);
+            taken.insert(index);
+        }
+        QList<Scored> rest;
+        rest.reserve(scored.size());
+        for (int i = 0; i < scored.size(); ++i)
+            if (!taken.contains(i))
+                rest.append(scored.at(i));
+        scored = rest;
+    }
+
+    // taste quotas: shares from dynamic priority, plus a hard cap
+    const int mainCount = count - tangents.size();
     QHash<qint64, int> quota;
-    if (totalPriority > 0 && !tastes.isEmpty()) {
-        int allocated = 0;
-        for (const FeedDatabase::Taste& t : tastes) {
-            const double share = prioritySum.value(t.id, 0.0) / totalPriority;
-            const int q = static_cast<int>(share * count * 1.2);  // headroom
-            quota[t.id] = q;
-            allocated += q;
+    {
+        QHash<qint64, double> prioritySum;
+        double totalPriority = 0.0;
+        for (const Scored& s : scored) {
+            if (s.tasteId > 0) {
+                prioritySum[s.tasteId] += s.tastePriority;
+                totalPriority += s.tastePriority;
+            }
         }
-        const int explorationQuota = qMax(1, static_cast<int>(count * kExplorationFloor));
-        Q_UNUSED(explorationQuota);
-        Q_UNUSED(allocated);
+        if (totalPriority > 0.0) {
+            for (auto it = prioritySum.constBegin(); it != prioritySum.constEnd(); ++it) {
+                const int q =
+                    static_cast<int>(std::ceil(it.value() / totalPriority * mainCount * 1.2));
+                quota.insert(it.key(), qMax(1, q));
+            }
+        }
     }
+    const int hardCap = qMax(2, static_cast<int>(mainCount * kMaxShareOfBatchPerTaste));
 
-    QHash<qint64, int> used;
-    used.reserve(quota.size());
-
-    std::sort(scored.begin(), scored.end(),
-              [](const Scored& a, const Scored& b) { return a.relevance > b.relevance; });
-
-    // Embeddings built above are reused as the MMR redundancy signal.
-
+    // Greedy MMR: each pick maximizes relevance minus redundancy with what
+    // is already in the batch (tangents included).
     QList<Scored> selected;
-    QList<Scored> deferred;
-    for (Scored& s : scored) {
-        if (selected.size() >= count)
+    QHash<qint64, int> used;
+    QList<bool> picked(scored.size(), false);
+    for (int round = 0; round < mainCount; ++round) {
+        int best = -1, fallback = -1;
+        double bestScore = -std::numeric_limits<double>::infinity();
+        double fallbackScore = -std::numeric_limits<double>::infinity();
+        for (int i = 0; i < scored.size(); ++i) {
+            if (picked.at(i))
+                continue;
+            const Scored& s = scored.at(i);
+            double maxSim = 0.0;
+            for (const Scored& sel : selected) maxSim = qMax(maxSim, similarity(s, sel));
+            for (const Scored& t : tangents) maxSim = qMax(maxSim, similarity(s, t));
+            const double mmr = kMmrLambda * s.relevance - (1.0 - kMmrLambda) * maxSim;
+            const bool capped =
+                s.tasteId > 0 &&
+                (used.value(s.tasteId) >= hardCap ||
+                 (quota.contains(s.tasteId) && used.value(s.tasteId) >= quota.value(s.tasteId)));
+            if (!capped && mmr > bestScore) {
+                bestScore = mmr;
+                best = i;
+            }
+            if (mmr > fallbackScore) {
+                fallbackScore = mmr;
+                fallback = i;
+            }
+        }
+        // Quotas left us short: backfill with the best capped candidate.
+        if (best < 0)
+            best = fallback;
+        if (best < 0)
             break;
-
-        // Taste quota check (only when quotas exist).
-        if (s.tasteId > 0 && !quota.isEmpty()) {
-            const int q = quota.value(s.tasteId, 0);
-            if (used.value(s.tasteId, 0) >= q && q > 0) {
-                deferred.append(s);
-                continue;
-            }
-        }
-
-        // Per-taste batch cap, independent of the quota system above.
-        if (s.tasteId > 0) {
-            const int hardCap = qMax(2, static_cast<int>(count * kMaxShareOfBatchPerTaste));
-            if (used.value(s.tasteId, 0) >= hardCap) {
-                deferred.append(s);
-                continue;
-            }
-        }
-
-        // MMR: embedding cosine primary, tag Jaccard secondary.
-        double maxSim = 0.0;
-        const QByteArray& emb = embeddings.value(s.candidate.image.md5);
-        for (const Scored& sel : selected) {
-            double sim = 0.0;
-            const QByteArray& selEmb = embeddings.value(sel.candidate.image.md5);
-            if (!emb.isEmpty() && !selEmb.isEmpty()) {
-                sim = EmbeddingBackend::cosineSimilarity(emb, selEmb);
-            } else {
-                sim = tagOverlap(s.candidate.image, sel.candidate.image);
-            }
-            sim = qMax(sim, 0.3 * tagOverlap(s.candidate.image, sel.candidate.image));
-            maxSim = qMax(maxSim, sim);
-        }
-        const double mmrScore = kMmrLambda * s.relevance - (1.0 - kMmrLambda) * maxSim;
-        s.relevance = mmrScore;
-
-        selected.append(s);
+        picked[best] = true;
+        Scored s = scored.at(best);
+        s.relevance =
+            bestScore == -std::numeric_limits<double>::infinity() ? fallbackScore : bestScore;
         if (s.tasteId > 0)
             used[s.tasteId] += 1;
-    }
-
-    // Backfill from deferred if quotas left us short.
-    for (const Scored& s : deferred) {
-        if (selected.size() >= count)
-            break;
         selected.append(s);
     }
 
-    // debug logging
+    // Spread the tangents through the batch instead of bunching them.
+    QList<Scored> ordered = selected;
+    for (int i = 0; i < tangents.size(); ++i) {
+        const int pos =
+            qMin(ordered.size(), static_cast<int>((i + 1) * (selected.size() + tangents.size()) /
+                                                  (tangents.size() + 1.0)));
+        ordered.insert(pos, tangents.at(i));
+    }
+
+    // log every pick: the model trains on these rows when reactions arrive
     QList<FeedDatabase::RecommendationRow> rows;
-    for (const Scored& s : selected) {
+    for (const Scored& s : ordered) {
         FeedDatabase::RecommendationRow r;
         r.md5 = s.candidate.image.md5;
-        r.userSimilarity = s.userSim;
-        r.sessionSimilarity = s.sessionSim;
-        r.tagScore = s.tagScore;
-        r.freshnessScore = s.freshness;
-        r.noveltyScore = s.novelty;
-        r.explorationScore = s.exploration;
+        r.userSimilarity = s.signalValues[kSignalTaste];
+        r.sessionSimilarity = s.signalValues[kSignalSession];
+        r.tagScore = s.signalValues[kSignalTagPref];
+        r.freshnessScore = s.signalValues[kSignalFresh];
+        r.noveltyScore = s.signalValues[kSignalNovelty];
+        r.explorationScore = s.signalValues[kSignalExplore];
         r.tasteId = s.tasteId;
         r.tastePriority = s.tastePriority;
-        r.preDiversityScore = s.relevance;
+        r.preDiversityScore = s.heuristic;
         r.finalScore = s.relevance;
         r.candidateSource = s.candidate.source;
-        r.rejectedNegative = false;
-        // Stage-2 model trains on this when the reaction arrives.
-        QStringList featureToks;
-        featureToks.reserve(UserModel::kFeatureCount);
-        for (int i = 0; i < UserModel::kFeatureCount; ++i)
-            featureToks << QString::number(s.features[i], 'f', 4);
-        r.features = featureToks.join(QLatin1Char(' '));
+        r.slot = s.tangent ? QStringLiteral("tangent") : QStringLiteral("main");
+        r.modelProbability = s.probability;
+        r.uncertainty = s.uncertainty;
+        r.features = FeedDatabase::packSignals(s.heuristic, s.signalValues);
         rows.append(r);
     }
     m_db.recordRecommendations(rows);
 
     // Record exposure for the tastes that got slots.
-    for (const Scored& s : selected) {
+    for (const Scored& s : ordered) {
         if (s.tasteId > 0)
             m_db.recordTasteExposure(s.tasteId, 1.0);
     }
 
-    for (const Scored& s : selected) batch.append(s.candidate.image);
+    if (funnel) {
+        funnel->tangentSlots = tangents.size();
+        funnel->blend = blend;
+    }
+    for (const Scored& s : ordered) batch.append(s.candidate.image);
     return batch;
 }
 
@@ -924,20 +1173,30 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
     if (sourceIds.isEmpty())
         return batch;
 
-    const QList<FeedDatabase::Taste> tastes = m_db.tastes();
+    // The feed has several sites to draw from, so it never waits out a rate
+    // limit: a throttled site is skipped for this batch (browsing tabs keep
+    // the patient retry behavior).
+    HttpSource::ImpatientScope impatient;
+    m_feedSourceIdsThisBatch = sourceIds;
+    m_throttled.clear();
 
-    // Funnel: server queries -> taste filter -> thumbnail embeddings ->
-    // diversity. Cold start skips stages 2-3 so the first post appears
-    // after one quick query.
+    const QList<FeedDatabase::Taste> tastes = m_db.tastes();
+    const FeedModel model = m_db.modelSnapshot();
+    m_exploration = m_db.explorationLevel();
+    {
+        std::mt19937_64 rng(QRandomGenerator::global()->generate64());
+        m_armMultipliers = m_db.armSnapshot().drawMultipliers(armNames(), rng);
+    }
 
     QList<Candidate> candidates;
     candidates += candidatesFromTastes(tastes, sourceIds);
     candidates += candidatesBroad(tastes, sourceIds);
-    candidates += candidatesFromCombos(sourceIds);
+    candidates += candidatesFromCombos(model, sourceIds);
     candidates += candidatesFromFavorites(sourceIds);
     candidates += candidatesRecent(sourceIds);
     candidates += candidatesPopular(sourceIds);
     candidates += candidatesExploration(tastes, sourceIds);
+    candidates += candidatesTangent(model, sourceIds);
     candidates += candidatesFromSway(sourceIds);
 
     // Skip-streak rescue: fetch extra trending posts when the mix goes stale.
@@ -945,8 +1204,7 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
     if (rescueStreak >= 3) {
         const int extra = qMin(4, rescueStreak - 2);
         for (int i = 0; i < extra; ++i) {
-            const QString& src =
-                sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+            const QString& src = pickSource(sourceIds);
             const QList<SourceImage> imgs = fetchFromSource(src, QStringLiteral("order:hot"), 15);
             for (const SourceImage& img : imgs)
                 candidates.append({img, QStringLiteral("rescue"), 0});
@@ -957,7 +1215,16 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
 
     FunnelStats funnel;
     funnel.coldStart = tastes.isEmpty() ? 1 : 0;
+    funnel.exploration = m_exploration;
     funnel.stage1Candidates = candidates.size();
+    {
+        QHash<QString, int> perArm;
+        for (const Candidate& c : candidates) perArm[c.source] += 1;
+        for (auto it = perArm.constBegin(); it != perArm.constEnd(); ++it)
+            funnel.armCandidates.append({it.key(), it.value()});
+        std::sort(funnel.armCandidates.begin(), funnel.armCandidates.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+    }
     qCInfo(lcFeed).noquote() << "stage1 candidates:" << candidates.size()
                              << "tastes:" << tastes.size() << "sources:" << sourceIds.join(',')
                              << "coldStart:" << bool(funnel.coldStart);
@@ -983,11 +1250,16 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
             ++dropNoMd5;
             continue;
         }
-        if (seen.contains(img.md5)) {
+        // Same post via two arms can arrive with different md5s; the post id
+        // catches that.
+        const QString postKey = img.remoteId > 0
+                                    ? img.sourceId + QLatin1Char(':') + QString::number(img.remoteId)
+                                    : QString();
+        if (seen.contains(img.md5) || (!postKey.isEmpty() && seen.contains(postKey))) {
             ++dropDup;
             continue;
         }
-        if (m_db.wasShown(img.md5)) {
+        if (m_db.wasShown(img.md5, img.sourceId, img.remoteId)) {
             ++dropShown;
             continue;
         }
@@ -1001,26 +1273,21 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
             continue;
         }
         if (!hardNegs.isEmpty()) {
-            bool hasNeg = false;
+            QStringList hit;
             for (const SourceTag& t : img.tags) {
-                if (hardNegs.contains(t.name.trimmed().toLower())) {
-                    hasNeg = true;
-                    break;
-                }
+                const QString name = t.name.trimmed().toLower();
+                if (hardNegs.contains(name))
+                    hit << name;
             }
-            if (hasNeg) {
+            if (!hit.isEmpty()) {
                 ++dropHardNeg;
-                QStringList hit;
-                for (const SourceTag& t : img.tags) {
-                    const QString name = t.name.trimmed().toLower();
-                    if (hardNegs.contains(name))
-                        hit << name;
-                }
                 recordDrop(img, QStringLiteral("hardNeg: %1").arg(hit.join(QStringLiteral(", "))));
                 continue;
             }
         }
         seen.insert(img.md5);
+        if (!postKey.isEmpty())
+            seen.insert(postKey);
         filtered.append(c);
     }
 
@@ -1033,112 +1300,70 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
     funnel.dropHardNeg = dropHardNeg;
     funnel.dropNoMd5 = dropNoMd5;
 
-    // Stage 2 + 3: taste filter + visual relevance
-    // Skipped entirely on cold start (no tastes = nothing to compare).
-    QList<Candidate> finalists;
-    if (tastes.isEmpty()) {
-        finalists = filtered.mid(0, kFunnelVisualCount);
-    } else {
-        // Stage 2: taste-vector filter
-        QList<Candidate> shortlist;
-        if (filtered.size() > kFunnelTasteCount) {
-            QList<QPair<double, int>> ranked;
-            ranked.reserve(filtered.size());
-            for (int i = 0; i < filtered.size(); ++i) {
-                const QStringList tags = contentTags(filtered.at(i).image);
-                double best = 0.0;
-                for (const FeedDatabase::Taste& t : tastes)
-                    best = qMax(best, FeedDatabase::similarity(t.embedding, tags));
-                ranked.append({best, i});
+    // Stage 2: cheap shortlist (taste similarity + the model's tag-only
+    // opinion). Exploratory candidates are protected - a shortlist ranked
+    // by what is already known would filter out every tangent.
+    QList<QPair<double, int>> cheap;
+    cheap.reserve(filtered.size());
+    {
+        int protectedLeft = kProtectedExploratory;
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        for (int i = 0; i < filtered.size(); ++i) {
+            const QStringList tags = contentTags(filtered.at(i).image);
+            double best = 0.0;
+            for (const FeedDatabase::Taste& t : tastes)
+                best = qMax(best, FeedDatabase::similarity(t.embedding, tags));
+            const double learned = model.meanScore(buildModelFeatures(tags, {}, nullptr), nowMs);
+            double score = best + 0.5 * std::tanh(learned / 2.0);
+            if (isExploratorySource(filtered.at(i).source) && protectedLeft > 0) {
+                --protectedLeft;
+                score += 10.0;
             }
-            std::sort(ranked.begin(), ranked.end(),
-                      [](const QPair<double, int>& a, const QPair<double, int>& b) {
-                          return a.first > b.first;
-                      });
-            for (int i = 0; i < qMin(kFunnelTasteCount, ranked.size()); ++i)
-                shortlist.append(filtered.at(ranked.at(i).second));
-        } else {
-            shortlist = filtered;
+            cheap.append({score, i});
         }
-        funnel.stage2Shortlist = shortlist.size();
+        std::sort(cheap.begin(), cheap.end(),
+                  [](const QPair<double, int>& a, const QPair<double, int>& b) {
+                      return a.first > b.first;
+                  });
+    }
+    QList<Candidate> shortlist;
+    for (int i = 0; i < qMin(kFunnelTasteCount, cheap.size()); ++i)
+        shortlist.append(filtered.at(cheap.at(i).second));
+    for (int i = kFunnelTasteCount; i < cheap.size(); ++i)
+        recordDrop(filtered.at(cheap.at(i).second).image, QStringLiteral("shortlist"));
+    funnel.stage2Shortlist = shortlist.size();
 
-        // Stage-2 drops are real rejections (taste mismatch), so they show
-        // up in the dropped-images view.
-        if (filtered.size() > kFunnelTasteCount) {
-            QSet<QString> kept;
-            for (const Candidate& c : shortlist) kept.insert(c.image.md5);
-            for (const Candidate& c : filtered)
-                if (!kept.contains(c.image.md5))
-                    recordDrop(c.image, QStringLiteral("tasteFilter"));
+    // Stage 3: visual descriptors for the most promising shortlisted posts
+    // that lack one (thumbnail fetch + a few hundred microseconds each).
+    if (m_visual && !shortlist.isEmpty()) {
+        QStringList md5s;
+        for (const Candidate& c : shortlist) md5s << c.image.md5;
+        const QHash<QString, QList<float>> known = m_db.visualsFor(md5s);
+        QList<SourceImage> jobs;
+        for (const Candidate& c : shortlist) {
+            if (jobs.size() >= kMaxVisualsPerBatch)
+                break;
+            if (known.contains(c.image.md5))
+                continue;
+            if (!c.image.previewUrl.isEmpty() || !c.image.sampleUrl.isEmpty() || c.image.isLocal())
+                jobs.append(c.image);
         }
-
-        // Stage 3: visual relevance via thumbnails
-        if (m_embeddings && m_embeddings->isReady() && !shortlist.isEmpty()) {
-            QList<SourceImage> jobs;
-            for (const Candidate& c : shortlist) {
-                if (jobs.size() >= kMaxEmbeddingsPerBatch)
-                    break;
-                if (m_db.embeddingFor(c.image.md5, m_embeddings->modelName(),
-                                      m_embeddings->modelVersion())
-                        .isEmpty()) {
-                    // Remote posts need a thumbnail URL; local library posts
-                    // are embedded from the stored file (empty URL is fine).
-                    if (!c.image.previewUrl.isEmpty() || !c.image.sampleUrl.isEmpty() ||
-                        c.image.isLocal())
-                        jobs.append(c.image);
-                }
-            }
-            if (!jobs.isEmpty())
-                m_embeddings->ensureEmbeddings(jobs);
-            funnel.embeddingsComputedThisBatch = jobs.size();
-
-            QList<QPair<double, int>> visualRanked;
-            visualRanked.reserve(shortlist.size());
-            for (int i = 0; i < shortlist.size(); ++i) {
-                const QByteArray emb =
-                    m_db.embeddingFor(shortlist.at(i).image.md5, m_embeddings->modelName(),
-                                      m_embeddings->modelVersion());
-                double best = 0.0;
-                if (!emb.isEmpty()) {
-                    for (const FeedDatabase::Taste& t : tastes) {
-                        if (t.visual.isEmpty())
-                            continue;
-                        best = qMax(best, FeedDatabase::similarityVisual(t.visual, emb));
-                    }
-                }
-                visualRanked.append({best, i});
-            }
-            std::sort(visualRanked.begin(), visualRanked.end(),
-                      [](const QPair<double, int>& a, const QPair<double, int>& b) {
-                          return a.first > b.first;
-                      });
-            for (int i = 0; i < qMin(kFunnelVisualCount, visualRanked.size()); ++i)
-                finalists.append(shortlist.at(visualRanked.at(i).second));
-
-            QSet<QString> finalistMd5s;
-            for (const Candidate& c : finalists) finalistMd5s.insert(c.image.md5);
-            for (const Candidate& c : shortlist)
-                if (!finalistMd5s.contains(c.image.md5))
-                    recordDrop(c.image, QStringLiteral("visualRank"));
-        } else {
-            finalists = shortlist.mid(0, kFunnelVisualCount);
-        }
+        if (!jobs.isEmpty())
+            funnel.visualsComputedThisBatch = m_visual->ensureMany(jobs);
     }
 
-    if (finalists.isEmpty() && !filtered.isEmpty())
-        finalists = filtered.mid(0, count);
+    batch = allocateAndDiversify(shortlist, count, model, &funnel);
 
-    funnel.stage3Finalists = finalists.size();
-    batch = allocateAndDiversify(finalists, count);
-
-    qCInfo(lcFeed).noquote() << "finalists:" << finalists.size() << "-> batch:" << batch.size();
+    qCInfo(lcFeed).noquote() << "shortlist:" << shortlist.size() << "-> batch:" << batch.size()
+                             << "| tangents:" << funnel.tangentSlots << "| blend:" << funnel.blend
+                             << "| exploration:" << m_exploration;
 
     // Last resort: never hit a dead "no posts found" wall.
     if (batch.isEmpty()) {
         funnel.emergencyFallbackUsed = 1;
         qCWarning(lcFeed).noquote()
             << "funnel produced an EMPTY batch - falling back to unpersonalized random fetch";
-        const QString& src = sourceIds.at(QRandomGenerator::global()->bounded(sourceIds.size()));
+        const QString& src = pickSource(sourceIds);
         const QList<SourceImage> fresh =
             fetchFromSource(src, QStringLiteral("order:random"), count * 2);
         for (const SourceImage& img : fresh) {
@@ -1160,69 +1385,45 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
 FeedRecommender::ModelStats FeedRecommender::modelStats() const {
     ModelStats stats;
     const QList<FeedDatabase::Taste> tastes = m_db.tastes();
+    const QHash<QString, double> specificity = m_db.tagSpecificities();
     stats.tasteCount = tastes.size();
     for (const FeedDatabase::Taste& t : tastes) {
         ModelStats::TasteDetail detail;
-        QString topTags;
         detail.id = t.id;
         detail.strength = t.strength;
         detail.confidence = t.confidence;
         detail.exposure = t.exposure;
         detail.engagement = t.engagement;
-        detail.visual = !t.visual.isEmpty();
-        if (!t.embedding.isEmpty()) {
-            const QHash<QString, double> specificity = m_db.tagSpecificities();
-            QList<ModelStats::TasteDetail::Tag> ranked;
-            for (auto it = t.embedding.constBegin(); it != t.embedding.constEnd(); ++it) {
-                ModelStats::TasteDetail::Tag tag;
-                tag.name = it.key();
-                tag.weight = it.value();
-                tag.niche = queryNicheScore(it.key(), it.value(), specificity);
-                ranked.append(tag);
-            }
-            std::sort(ranked.begin(), ranked.end(),
-                      [](const ModelStats::TasteDetail::Tag& a,
-                         const ModelStats::TasteDetail::Tag& b) { return a.niche > b.niche; });
-            QStringList names;
-            for (int i = 0; i < qMin(3, ranked.size()); ++i) names << ranked.at(i).name;
-            topTags = names.join(QLatin1Char('/'));
-            detail.tags = ranked;
-        } else {
-            topTags = QStringLiteral("[visual]");
+        QList<ModelStats::TasteDetail::Tag> ranked;
+        for (auto it = t.embedding.constBegin(); it != t.embedding.constEnd(); ++it) {
+            ModelStats::TasteDetail::Tag tag;
+            tag.name = it.key();
+            tag.weight = it.value();
+            tag.niche = queryNicheScore(it.key(), it.value(), specificity);
+            ranked.append(tag);
         }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const ModelStats::TasteDetail::Tag& a, const ModelStats::TasteDetail::Tag& b) {
+                      return a.niche > b.niche;
+                  });
+        QStringList names;
+        for (int i = 0; i < qMin(3, ranked.size()); ++i) names << ranked.at(i).name;
+        detail.tags = ranked;
         stats.tasteDetails.append(detail);
-        stats.tasteSummary
-            << QStringLiteral("t%1 (%2) %3").arg(t.id).arg(t.strength, 0, 'f', 1).arg(topTags);
+        stats.tasteSummary << QStringLiteral("t%1 (%2) %3")
+                                  .arg(t.id)
+                                  .arg(t.strength, 0, 'f', 1)
+                                  .arg(names.join(QLatin1Char('/')));
     }
     stats.totalShown = m_db.totalShown();
     const QStringList hardNeg = m_db.hardNegativeTags();
     stats.hardNegatives = hardNeg.size();
     stats.hardNegativeTags = hardNeg;
     stats.skipStreak = m_db.recentSkipStreak();
+    stats.sessionBlend = sessionBlendFor(stats.skipStreak);
 
     {
         const auto rows = m_db.tagPreferenceRows();
-        QList<QPair<double, QString>> pos, neg;
-        for (auto it = rows.constBegin(); it != rows.constEnd(); ++it) {
-            const double w = shrinkTagPref(it.value().preference, it.value().confidence);
-            if (w > 0.05)
-                pos.append({w, it.key()});
-            else if (w < -0.05)
-                neg.append({w, it.key()});
-        }
-        std::sort(pos.begin(), pos.end(),
-                  [](const QPair<double, QString>& a, const QPair<double, QString>& b) {
-                      return a.first > b.first;
-                  });
-        std::sort(neg.begin(), neg.end(),
-                  [](const QPair<double, QString>& a, const QPair<double, QString>& b) {
-                      return a.first < b.first;
-                  });
-        for (int i = 0; i < qMin(10, pos.size()); ++i)
-            stats.likedTags.append({pos.at(i).second, pos.at(i).first});
-        for (int i = 0; i < qMin(10, neg.size()); ++i)
-            stats.dislikedTags.append({neg.at(i).second, neg.at(i).first});
-        // Full negative list with confidence, for debugging resurfacing tags.
         for (auto it = rows.constBegin(); it != rows.constEnd(); ++it) {
             if (it.value().preference < 0.0)
                 stats.dislikedTagsFull.append(
@@ -1233,7 +1434,6 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
                       return a.pref < b.pref;
                   });
     }
-    stats.sessionBlend = sessionBlendFor(stats.skipStreak);
     {
         LibrarySource library;
         SourceQuery favQuery;
@@ -1242,12 +1442,10 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
         const SourceResult favs = library.search(favQuery);
         stats.favPosts = favs.ok ? favs.images.size() : 0;
     }
-    stats.negativeAnchors = m_db.negativeAnchors().size();
     stats.totalImpressions = m_db.totalImpressions();
     {
-        const auto spec = m_db.tagSpecificities();
         QList<QPair<double, QString>> lowest;
-        for (auto it = spec.constBegin(); it != spec.constEnd(); ++it)
+        for (auto it = specificity.constBegin(); it != specificity.constEnd(); ++it)
             lowest.append({it.value(), it.key()});
         std::sort(lowest.begin(), lowest.end(),
                   [](const QPair<double, QString>& a, const QPair<double, QString>& b) {
@@ -1258,128 +1456,95 @@ FeedRecommender::ModelStats FeedRecommender::modelStats() const {
                                             .arg(lowest.at(i).second)
                                             .arg(lowest.at(i).first, 0, 'f', 2);
     }
-    stats.learnedSamples = m_db.userModelSamples();
-    stats.learnedBlend = m_db.userModelBlend();
-    stats.learnedWeights = m_db.userModelWeights();
     stats.swayTags = m_db.swayTags();
+
+    // learned model
+    const FeedModel model = m_db.modelSnapshot();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QList<ModelStats::LearnedTag> learned;
+    for (auto it = model.beliefs().constBegin(); it != model.beliefs().constEnd(); ++it) {
+        const FeedModel::Belief b = model.belief(it.key(), nowMs);
+        if (it.key().startsWith(QLatin1String("t:"))) {
+            if (b.positive + b.negative >= 1.0)
+                learned.append(
+                    {it.key().mid(2), b.mean, std::sqrt(b.variance), b.positive + b.negative});
+        } else if (it.key().startsWith(QLatin1String("h:"))) {
+            stats.signalWeights.append({it.key().mid(2), b.mean});
+        }
+    }
+    std::sort(learned.begin(), learned.end(),
+              [](const ModelStats::LearnedTag& a, const ModelStats::LearnedTag& b) {
+                  return a.mean > b.mean;
+              });
+    for (int i = 0; i < qMin(10, learned.size()); ++i)
+        if (learned.at(i).mean > 0.0)
+            stats.learnedLiked.append(learned.at(i));
+    for (int i = learned.size() - 1; i >= qMax(0, learned.size() - 10); --i)
+        if (learned.at(i).mean < 0.0)
+            stats.learnedDisliked.append(learned.at(i));
+    std::sort(stats.signalWeights.begin(), stats.signalWeights.end());
+    stats.exploration = m_db.explorationLevel();
+    stats.tangentCandidates = tangentTags(model, stats.exploration, 8);
+    stats.beliefCount = model.beliefs().size();
+    stats.modelSamples = model.samples();
+    stats.validationSamples = model.validationSamples();
+    stats.blend = model.blendWeight();
+    stats.modelLogLoss = model.modelLogLoss();
+    stats.heuristicLogLoss = model.heuristicLogLoss();
+
+    const ArmBandit arms = m_db.armSnapshot();
+    for (const QString& arm : armNames()) stats.armOdds.append({arm, arms.expectedReward(arm)});
+    std::sort(stats.armOdds.begin(), stats.armOdds.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    stats.tangentShown = m_db.metaValue(QStringLiteral("tangent_shown"));
+    stats.tangentHits = m_db.metaValue(QStringLiteral("tangent_hits"));
+    stats.warmStartDone = m_db.warmStartDone();
+    stats.warmStartProgress = m_db.metaValue(QStringLiteral("warmstart_progress"));
+    stats.warmStartTotal = m_db.metaValue(QStringLiteral("warmstart_total"));
     return stats;
 }
 
-FeedDatabase::RecommendationRow FeedRecommender::explainPost(const SourceImage& image) const {
-    FeedDatabase::RecommendationRow r;
-    r.md5 = image.md5;
-    const QStringList tags = contentTags(image);
-    const QList<FeedDatabase::Taste> tastes = m_db.tastes();
+QList<FeedRecommender::Explanation> FeedRecommender::explainPosts(
+    const QList<SourceImage>& images) const {
+    QList<Explanation> out;
+    if (images.isEmpty())
+        return out;
+    const ScoringContext ctx = buildContext();
+    const FeedModel model = m_db.modelSnapshot();
+    QStringList md5s;
+    for (const SourceImage& img : images) md5s << img.md5;
+    const QHash<QString, QList<float>> visuals = m_db.visualsFor(md5s);
 
-    double bestSim = 0.0;
-    for (const FeedDatabase::Taste& t : tastes) {
-        const double sim = FeedDatabase::similarity(t.embedding, tags);
-        if (sim > bestSim) {
-            bestSim = sim;
-            r.tasteId = t.id;
-        }
+    for (const SourceImage& image : images) {
+        Explanation e;
+        const FeedDatabase::RecommendationRow logged = m_db.recommendationFor(image.md5);
+        e.loggedSource = logged.candidateSource;
+        e.loggedSlot = logged.slot;
+
+        double signalValues[kSignalCount] = {};
+        qint64 tasteId = 0;
+        e.heuristicScore = computeSignals(ctx, model, image, logged.candidateSource, signalValues,
+                                          &tasteId, nullptr);
+        e.heuristic.md5 = image.md5;
+        e.heuristic.userSimilarity = signalValues[kSignalTaste];
+        e.heuristic.sessionSimilarity = signalValues[kSignalSession];
+        e.heuristic.tagScore = signalValues[kSignalTagPref];
+        e.heuristic.freshnessScore = signalValues[kSignalFresh];
+        e.heuristic.noveltyScore = signalValues[kSignalNovelty];
+        e.heuristic.explorationScore = signalValues[kSignalExplore];
+        e.heuristic.tasteId = tasteId;
+        e.heuristic.finalScore = e.heuristicScore;
+
+        const QList<double> visual = model.standardizeVisual(visuals.value(image.md5));
+        e.visualKnown = !visual.isEmpty();
+        const FeatureVector x = buildModelFeatures(contentTags(image), visual, signalValues);
+        e.modelProbability = model.predict(x);
+        e.uncertainty = model.uncertainty(x);
+        e.blend = model.blendWeight();
+        out.append(e);
     }
-    r.userSimilarity = bestSim;
-    r.sessionSimilarity = m_db.sessionSimilarity(tags);
-
-    const auto prefRows = m_db.tagPreferenceRows();
-    QHash<QString, double> prefs;
-    prefs.reserve(prefRows.size());
-    for (auto it = prefRows.constBegin(); it != prefRows.constEnd(); ++it)
-        prefs.insert(it.key(),
-                     saturateTagPref(shrinkTagPref(it.value().preference, it.value().confidence)));
-    double tagSum = 0.0;
-    double weightSum = 0.0;
-    double favMatches = 0.0;
-    const QHash<QString, int> favTagFreqs = favoriteTagFrequencies();
-    for (const SourceTag& t : image.tags) {
-        if (isGenericTag(t.name))
-            continue;
-        const QString tag = t.name.trimmed().toLower();
-        const double boost = categoryBoost(t.category);
-        auto it = prefs.constFind(tag);
-        if (it != prefs.constEnd())
-            tagSum += it.value() * boost;
-        weightSum += boost;
-
-        if (favTagFreqs.contains(tag)) {
-            favMatches += std::log1p(static_cast<double>(favTagFreqs.value(tag))) * boost;
-        }
-    }
-    r.tagScore = weightSum > 0.0 ? tagSum / weightSum : 0.0;
-    const double favOverlapScore =
-        weightSum > 0.0 ? qMin(1.0, favMatches / (weightSum * 1.5)) : 0.0;
-
-    if (image.createdAt > 0) {
-        const double ageDays = (QDateTime::currentSecsSinceEpoch() - image.createdAt) / 86400.0;
-        r.freshnessScore = std::exp(-ageDays / 30.0);
-    }
-
-    const int skipStreak = m_db.recentSkipStreak();
-    const double blend = sessionBlendFor(skipStreak);
-    const double blendedTasteSim = (1.0 - blend) * r.userSimilarity + blend * r.sessionSimilarity;
-    r.finalScore = kUserSimWeight * blendedTasteSim + kSessionSimWeight * r.sessionSimilarity +
-                   kTagPrefWeight * r.tagScore + kFavOverlapWeight * favOverlapScore +
-                   kFreshnessWeight * r.freshnessScore;
-    return r;
-}
-
-FeedRecommender::VisualVerdict FeedRecommender::explainVisual(const SourceImage& image) const {
-    VisualVerdict v;
-    if (!m_embeddings || !m_embeddings->isReady())
-        return v;
-    const QByteArray emb =
-        m_db.embeddingFor(image.md5, m_embeddings->modelName(), m_embeddings->modelVersion());
-    if (emb.isEmpty())
-        return v;
-    v.available = true;
-
-    // Best positive-taste visual similarity = "how much does this look like
-    // what you already like".
-    const QList<FeedDatabase::Taste> tastes = m_db.tastes();
-    for (const FeedDatabase::Taste& t : tastes) {
-        if (t.visual.isEmpty())
-            continue;
-        const double sim = FeedDatabase::similarityVisual(t.visual, emb);
-        if (sim > v.bestSim) {
-            v.bestSim = sim;
-            v.bestTasteId = t.id;
-        }
-    }
-    v.negAnchorSim = m_db.maxNegativeAnchorSimilarity(emb);
-
-    // Stage-2 learned model over the same features the ranker uses.
-    const QStringList tags = contentTags(image);
-    const auto prefRows = m_db.tagPreferenceRows();
-    QHash<QString, double> prefs;
-    prefs.reserve(prefRows.size());
-    for (auto it = prefRows.constBegin(); it != prefRows.constEnd(); ++it)
-        prefs.insert(it.key(),
-                     saturateTagPref(shrinkTagPref(it.value().preference, it.value().confidence)));
-    double tagSum = 0.0, weightSum = 0.0;
-    for (const SourceTag& t : image.tags) {
-        if (isGenericTag(t.name))
-            continue;
-        const QString tag = t.name.trimmed().toLower();
-        const double boost = categoryBoost(t.category);
-        auto it = prefs.constFind(tag);
-        if (it != prefs.constEnd())
-            tagSum += it.value() * boost;
-        weightSum += boost;
-    }
-    const double tagScore = weightSum > 0.0 ? tagSum / weightSum : 0.0;
-    const double sessionSim = m_db.sessionSimilarity(tags);
-
-    double features[UserModel::kFeatureCount] = {};
-    features[0] = v.bestSim;
-    features[1] = sessionSim;
-    features[2] = tagScore;
-    features[3] = 0.0;  // fav overlap omitted for the quick verdict
-    features[7] = image.score > 0 ? std::log1p(static_cast<double>(image.score)) / 10.0 : 0.0;
-    features[8] = v.negAnchorSim;
-    features[UserModel::kBiasIndex] = 1.0;
-    v.learnedProb = m_db.userModelPredict(features);
-    return v;
+    return out;
 }
 
 }  // namespace Mosaic

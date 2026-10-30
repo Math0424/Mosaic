@@ -488,11 +488,14 @@ void ViewerWindow::checkLibraryStatus() {
         return;
 
     const QString md5 = m_current.md5;
+    const SourceImage image = m_current;
     QPointer<ViewerWindow> self(this);
-    QThreadPool::globalInstance()->start([self, md5]() {
+    QThreadPool::globalInstance()->start([self, md5, image]() {
         LibrarySource library;
-        const bool inLibrary = library.hasImage(md5);
-        const bool favorite = inLibrary ? library.isFavorite(md5) : false;
+        // Matches by md5, or by source + post id when the saved copy differs.
+        const QString saved = library.savedMd5(image);
+        const bool inLibrary = !saved.isEmpty();
+        const bool favorite = inLibrary ? library.isFavorite(saved) : false;
         if (!self)
             return;
         QMetaObject::invokeMethod(

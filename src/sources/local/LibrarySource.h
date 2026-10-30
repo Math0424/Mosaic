@@ -33,6 +33,14 @@ class LibrarySource : public Source {
 
     bool hasImage(const QString& md5) const;
 
+    // True when the image is saved by md5, or when the same post (source +
+    // post id) is already saved under a different md5.
+    bool hasImage(const SourceImage& image) const;
+
+    // The md5 the image is stored under in the library (its own md5, or the
+    // md5 of the same post saved earlier), or empty when it is not saved.
+    QString savedMd5(const SourceImage& image) const;
+
     // True when this md5 is the deleted side of an already-resolved
     // duplicate pair; such images are treated as saved/removed everywhere.
     bool isDuplicateResolvedMd5(const QString& md5) const;

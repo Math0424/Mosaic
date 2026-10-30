@@ -8,7 +8,7 @@ bool SourceImage::isLocal() const {
     }
 
     LibrarySource library;
-    return library.hasImage(md5);
+    return library.hasImage(*this);
 }
 
 QString SourceImage::tooltipHtml() const {

@@ -78,12 +78,38 @@ ImportResult LibrarySource::importImage(const SourceImage& meta, const QByteArra
         }
         return result;
     }
+
+    // The same post already saved (possibly under another md5, e.g. the
+    // site re-encoded the file): don't store a second copy. Tag-refresh
+    // passes (empty data) still go through to update the existing row.
+    if (!data.isEmpty()) {
+        const QString saved = m_catalog.md5ForPost(meta.sourceId, meta.remoteId);
+        if (!saved.isEmpty()) {
+            ImportResult result;
+            result.ok = true;
+            result.alreadyExisted = true;
+            SourceImage kept;
+            if (m_catalog.lookupByMd5(saved, &kept))
+                result.filePath = LibraryCatalog::filePathFor(saved, kept.format);
+            return result;
+        }
+    }
     return m_catalog.importImage(meta, data);
 }
 
 bool LibrarySource::hasImage(const QString& md5) const {
     // A ghost md5 answers for its surviving counterpart.
     return m_catalog.hasImage(resolveDuplicateSurvivor(md5));
+}
+
+bool LibrarySource::hasImage(const SourceImage& image) const {
+    return !savedMd5(image).isEmpty();
+}
+
+QString LibrarySource::savedMd5(const SourceImage& image) const {
+    if (hasImage(image.md5))
+        return image.md5;
+    return m_catalog.md5ForPost(image.sourceId, image.remoteId);
 }
 
 /**

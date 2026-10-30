@@ -1,8 +1,9 @@
 #include "FeedPage.h"
 
 #include "FeedDatabase.h"
-#include "EmbeddingBackend.h"
 #include "FeedRecommender.h"
+#include "FeedWarmStart.h"
+#include "VisualFeatures.h"
 #include "../core/AppState.h"
 #include "../core/Paths.h"
 #include "../components/FlowLayout.h"
@@ -11,7 +12,6 @@
 #include "../components/TagSidebar.h"
 #include "../components/ViewerWindow.h"
 #include "../sources/SourceManager.h"
-#include "../sources/local/LibraryCatalog.h"
 #include "../sources/local/LibrarySource.h"
 
 #include <QAbstractItemView>
@@ -33,6 +33,8 @@
 #include <QRandomGenerator>
 #include <QScrollArea>
 #include <QSet>
+#include <QSlider>
+#include <QtConcurrentRun>
 #include <QDebug>
 #include <QLoggingCategory>
 Q_DECLARE_LOGGING_CATEGORY(lcFeed)
@@ -113,10 +115,10 @@ FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* paren
     m_media->setMaxEntries(24);
     m_db = new FeedDatabase();
     m_db->open();
-    m_embeddings = new EmbeddingBackend(*m_db, m_sources);
-    m_embeddings->initialize();
-    m_recommender = new FeedRecommender(*m_db, m_sources, state.feedSourceIds(), m_embeddings);
+    m_visual = new VisualFeatures(*m_db, m_sources);
+    m_recommender = new FeedRecommender(*m_db, m_sources, state.feedSourceIds(), m_visual);
     buildUi();
+    startWarmStart();
 
     // Kick off the first batch once the page is visible.
     QTimer::singleShot(0, this, [this]() {
@@ -127,15 +129,30 @@ FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* paren
 
 FeedPage::~FeedPage() {
     shutdown();
+    // The warm start holds raw pointers to the members deleted below.
+    m_warmStart.waitForFinished();
     delete m_recommender;
-    delete m_embeddings;
+    delete m_visual;
     delete m_db;
 }
 
 void FeedPage::shutdown() {
     // Idempotent; pool workers' writes fail fast instead of blocking exit.
+    m_cancelWarmStart = true;
     if (m_db)
         m_db->close();
+}
+
+void FeedPage::startWarmStart() {
+    if (m_warmStart.isRunning() || !m_db || !m_db->isOpen())
+        return;
+    m_cancelWarmStart = false;
+    FeedDatabase* db = m_db;
+    SourceManager* sources = &m_sources;
+    VisualFeatures* visual = m_visual;
+    std::atomic<bool>* cancel = &m_cancelWarmStart;
+    m_warmStart = QtConcurrent::run(
+        [db, sources, visual, cancel]() { FeedWarmStart(*db, *sources, *visual).run(*cancel); });
 }
 
 void FeedPage::buildUi() {
@@ -265,10 +282,33 @@ void FeedPage::buildUi() {
             Qt::QueuedConnection);
     });
 
+    // Exploration level: how much of the feed goes to tangents and how far
+    // ranking strays from what the model is sure about. Persisted in the
+    // feed DB; applied to the next batch.
+    m_explorationSlider = new QSlider(Qt::Horizontal, this);
+    m_explorationSlider->setRange(0, 100);
+    m_explorationSlider->setPageStep(10);
+    m_explorationSlider->setValue(qRound(m_db->explorationLevel() * 100.0));
+    m_explorationSlider->setFocusPolicy(Qt::NoFocus);  // arrow keys navigate the feed
+    m_explorationSlider->setToolTip(
+        QStringLiteral("How adventurous the feed is. Left: stick to what you already like. "
+                       "Right: more tangents - new tags and looks the feed is unsure about, "
+                       "so it can discover what else you enjoy."));
+    m_explorationLabel = new QLabel(this);
+    m_explorationLabel->setMinimumWidth(m_explorationLabel->fontMetrics().horizontalAdvance(
+        QStringLiteral("Explore: Adventurous")));
+    updateExplorationLabel();
+    connect(m_explorationSlider, &QSlider::valueChanged, this, [this]() {
+        updateExplorationLabel();
+        // Clicks / page steps apply at once; drags apply on release.
+        if (!m_explorationSlider->isSliderDown())
+            applyExplorationLevel();
+    });
+    connect(m_explorationSlider, &QSlider::sliderReleased, this, &FeedPage::applyExplorationLevel);
+
     // Two equal expanding spacers sandwich the button group, so it stays
-    // centered in the space left of the sway widgets. A mirror spacer on the
-    // left matches the sway group's width, keeping the buttons centered on
-    // the full row rather than just the leftover space.
+    // centered on the row. The exploration group on the left is fixed to
+    // the sway group's width for the same reason.
     auto* swayGroup = new QHBoxLayout();
     swayGroup->setContentsMargins(0, 0, 0, 0);
     swayGroup->setSpacing(6);
@@ -278,9 +318,14 @@ void FeedPage::buildUi() {
     auto* actionRow = new QHBoxLayout();
     actionRow->setContentsMargins(0, 0, 0, 0);
     actionRow->setSpacing(10);
-    auto* mirror = new QWidget(this);
-    mirror->setFixedWidth(m_swayEdit->width() + 6 + m_swayButton->sizeHint().width() + 10);
-    actionRow->addWidget(mirror);
+    auto* exploreGroup = new QWidget(this);
+    auto* exploreLayout = new QHBoxLayout(exploreGroup);
+    exploreLayout->setContentsMargins(0, 0, 0, 0);
+    exploreLayout->setSpacing(6);
+    exploreLayout->addWidget(m_explorationLabel);
+    exploreLayout->addWidget(m_explorationSlider, 1);
+    exploreGroup->setFixedWidth(m_swayEdit->width() + 6 + m_swayButton->sizeHint().width() + 10);
+    actionRow->addWidget(exploreGroup);
     actionRow->addSpacerItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Fixed));
     actionRow->addWidget(m_prevButton);
     actionRow->addWidget(m_dislikeButton);
@@ -357,19 +402,16 @@ void FeedPage::buildUi() {
         }
         const auto& t = m_tasteDetails.at(index);
         QString tip = QStringLiteral(
-                          "<b style='color:#e8a33d;'>Taste #%1</b> %2<br>"
-                          "<span style='color:#999;'>strength %3 · confidence %4 · "
-                          "exposure %5 · engagement %6</span><br>")
+                          "<b style='color:#e8a33d;'>Taste #%1</b><br>"
+                          "<span style='color:#999;'>strength %2 · confidence %3 · "
+                          "exposure %4 · engagement %5</span><br>")
                           .arg(t.id)
-                          .arg(t.visual ? QStringLiteral("[visual]") : QStringLiteral("[tags]"))
                           .arg(t.strength, 0, 'f', 2)
                           .arg(t.confidence, 0, 'f', 2)
                           .arg(t.exposure, 0, 'f', 2)
                           .arg(t.engagement, 0, 'f', 2);
         if (t.tags.isEmpty()) {
-            tip += QStringLiteral(
-                "<span style='color:#999;'>no tag vector (visual-only "
-                "taste)</span>");
+            tip += QStringLiteral("<span style='color:#999;'>no tag vector</span>");
         } else {
             tip += QStringLiteral(
                 "<b>Tags</b> <span style='color:#999;'>(niche = query "
@@ -545,7 +587,14 @@ void FeedPage::requestMore() {
                 self->m_fetching = false;
                 int droppedSeen = 0, droppedNoUrl = 0;
                 for (const SourceImage& img : batch) {
-                    if (self->m_seenMd5s.contains(img.md5)) {
+                    // Post ids share the set with md5s ("source:id" never
+                    // collides with a hex hash).
+                    const QString postKey =
+                        img.remoteId > 0
+                            ? img.sourceId + QLatin1Char(':') + QString::number(img.remoteId)
+                            : QString();
+                    if (self->m_seenMd5s.contains(img.md5) ||
+                        (!postKey.isEmpty() && self->m_seenMd5s.contains(postKey))) {
                         ++droppedSeen;
                         continue;
                     }
@@ -555,6 +604,8 @@ void FeedPage::requestMore() {
                         continue;
                     }
                     self->m_seenMd5s.insert(img.md5);
+                    if (!postKey.isEmpty())
+                        self->m_seenMd5s.insert(postKey);
                     self->m_queue.append(img);
                 }
                 qDebug().noquote()
@@ -639,7 +690,8 @@ void FeedPage::showPost(const SourceImage& image) {
         const SourceImage img = image;
         const int pos = m_position;
         QThreadPool::globalInstance()->start([db, img, tags, pos]() {
-            db->recordEvent(FeedDatabase::Event::Impression, img.sourceId, img.md5, tags, 0.0, pos);
+            db->recordEvent(FeedDatabase::Event::Impression, img.sourceId, img.md5, tags, 0.0, pos,
+                            img.remoteId);
         });
     }
 
@@ -681,11 +733,10 @@ void FeedPage::showPost(const SourceImage& image) {
     if (!image.localPath.isEmpty()) {
         markLoved();
     } else {
-        const QString md5 = image.md5;
         QPointer<FeedPage> self(this);
-        QThreadPool::globalInstance()->start([self, md5]() {
+        QThreadPool::globalInstance()->start([self, image]() {
             LibrarySource library;
-            const bool inLibrary = library.hasImage(md5);
+            const bool inLibrary = library.hasImage(image);
             if (!self)
                 return;
             QMetaObject::invokeMethod(
@@ -704,10 +755,15 @@ void FeedPage::showPost(const SourceImage& image) {
 
     // Decoding a full-res image (or a video first frame) takes tens to
     // hundreds of ms - do it off-thread, render on the GUI thread.
-    auto decodeOffThread = [](const SourceImage& post, const QByteArray& bytes,
-                              bool allowSkipOnFailure, QPointer<FeedPage> self) {
-        QThreadPool::globalInstance()->start([self, post, bytes, allowSkipOnFailure]() {
+    FeedDatabase* db = m_db;
+    auto decodeOffThread = [db](const SourceImage& post, const QByteArray& bytes,
+                                bool allowSkipOnFailure, QPointer<FeedPage> self) {
+        QThreadPool::globalInstance()->start([self, db, post, bytes, allowSkipOnFailure]() {
             const QImage frame = decodeBytes(post, bytes);
+            // The frame is decoded anyway: its style descriptor comes free,
+            // so every shown post can train the model's visual weights.
+            if (!frame.isNull() && db && !db->hasVisual(post.md5))
+                db->storeVisual(post.md5, VisualFeatures::compute(frame));
             if (!self)
                 return;
             QMetaObject::invokeMethod(
@@ -903,42 +959,6 @@ void FeedPage::advance(bool train) {
 
 // actions
 
-void FeedPage::seedFromFavorites() {
-    // Train the (fresh) model on every tag of every library favorite.
-    LibrarySource library;
-    SourceQuery favQuery;
-    favQuery.tags = QStringLiteral("usergroup:favorite");
-    favQuery.limit = 200;
-    const SourceResult favs = library.search(favQuery);
-    if (!favs.ok)
-        return;
-
-    struct SeedJob {
-        QString sourceId;
-        QString md5;
-        QStringList tags;
-    };
-    QList<SeedJob> jobs;
-    for (const SourceImage& img : favs.images) {
-        QStringList tags;
-        for (const SourceTag& t : img.tags) {
-            if (t.category == QLatin1String("usergroup") || FeedRecommender::isGenericTag(t.name))
-                continue;
-            tags << t.name;
-        }
-        if (!tags.isEmpty())
-            jobs.append({img.sourceId, img.md5, tags});
-    }
-    if (jobs.isEmpty())
-        return;
-
-    FeedDatabase* db = m_db;
-    QThreadPool::globalInstance()->start([db, jobs]() {
-        for (const SeedJob& job : jobs)
-            db->recordEvent(FeedDatabase::Event::Favorite, job.sourceId, job.md5, job.tags);
-    });
-}
-
 void FeedPage::onSoftReset() {
     const auto answer = QMessageBox::question(
         this, QStringLiteral("Soft reset"),
@@ -946,8 +966,11 @@ void FeedPage::onSoftReset() {
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes)
         return;
-    m_db->reset();
-    seedFromFavorites();
+    // A running warm start would keep writing into the wiped profile.
+    m_cancelWarmStart = true;
+    m_warmStart.waitForFinished();
+    m_db->reset(/*rerunWarmStart=*/true);
+    startWarmStart();
     m_queue.clear();
     m_seenMd5s.clear();
     m_position = -1;
@@ -965,7 +988,9 @@ void FeedPage::onHardReset() {
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes)
         return;
-    m_db->reset();
+    m_cancelWarmStart = true;
+    m_warmStart.waitForFinished();
+    m_db->reset(/*rerunWarmStart=*/false);
     m_queue.clear();
     m_seenMd5s.clear();
     m_position = -1;
@@ -1120,46 +1145,22 @@ void FeedPage::loadLikedPage() {
         const int total = offset == 0 ? db->likedInteractionCount() : -1;
         const auto rows = db->likedInteractions(kPageSize, offset, seed);
 
-        LibraryCatalog catalog;
         int resolved = 0;
         for (const auto& [md5, sourceId] : rows) {
             SourceImage img;
-            // Saved posts resolve straight from the library catalog.
-            if (!catalog.lookupByMd5(md5, &img)) {
-                // Otherwise ask the site the like came from, then the others.
-                QList<Source*> candidates;
-                if (Source* s = sources->source(sourceId))
-                    candidates.append(s);
-                for (Source* s : sources->remoteSources()) {
-                    if (!candidates.contains(s))
-                        candidates.append(s);
-                }
-                bool found = false;
-                for (Source* s : candidates) {
-                    SourceQuery q;
-                    q.tags = QStringLiteral("md5:%1").arg(md5);
-                    q.limit = 1;
-                    const SourceResult result = s->search(q);
-                    if (!result.ok || result.images.isEmpty())
-                        continue;
-                    img = result.images.first();
-                    img.md5 = md5;
-                    if (img.sourceId.isEmpty())
-                        img.sourceId = s->id();
-                    found = true;
-                    break;
-                }
-                if (!found) {
-                    // Keep it in the list so the gap is visible rather than
-                    // silently dropping a liked post. Route fetches through
-                    // a real source so the viewer can still try.
-                    img.md5 = md5;
-                    img.sourceId = sourceId;
-                    if (sources->source(img.sourceId) == nullptr) {
-                        const QList<Source*> remotes = sources->remoteSources();
-                        if (!remotes.isEmpty())
-                            img.sourceId = remotes.first()->id();
-                    }
+            // Library catalog first, then the site the like came from, then
+            // the others.
+            if (!FeedWarmStart::resolvePost(*sources, md5, sourceId, &img,
+                                            /*maxRemoteQueries=*/0)) {
+                // Keep it in the list so the gap is visible rather than
+                // silently dropping a liked post. Route fetches through
+                // a real source so the viewer can still try.
+                img.md5 = md5;
+                img.sourceId = sourceId;
+                if (sources->source(img.sourceId) == nullptr) {
+                    const QList<Source*> remotes = sources->remoteSources();
+                    if (!remotes.isEmpty())
+                        img.sourceId = remotes.first()->id();
                 }
             }
             ++resolved;
@@ -1261,6 +1262,48 @@ void FeedPage::applySwayTags() {
     updateDebugPanel();
 }
 
+void FeedPage::updateExplorationLabel() {
+    const int v = m_explorationSlider->value();
+    const char* name = v < 20   ? "Comfort"
+                       : v < 45 ? "Familiar"
+                       : v < 65 ? "Balanced"
+                       : v < 85 ? "Curious"
+                                : "Adventurous";
+    m_explorationLabel->setText(QStringLiteral("Explore: %1").arg(QLatin1String(name)));
+}
+
+void FeedPage::applyExplorationLevel() {
+    const double level = m_explorationSlider->value() / 100.0;
+    if (qAbs(level - m_db->explorationLevel()) < 0.005)
+        return;
+    // Like a sway: re-rank what has not been shown yet under the new level.
+    const int keep = qMax(m_position + 1, 0);
+    while (m_queue.size() > keep + 3) m_queue.removeLast();
+    m_statusLabel->setText(QStringLiteral("Exploration set to %1% - %2")
+                               .arg(qRound(level * 100.0))
+                               .arg(level < 0.35 ? QStringLiteral("sticking close to your tastes.")
+                                    : level < 0.65
+                                        ? QStringLiteral("a mix of favorites and tangents.")
+                                        : QStringLiteral("trying lots of new things.")));
+
+    // The DB write can wait on the training lock: off the GUI thread, and
+    // the re-rank starts only once the new level is in place.
+    FeedDatabase* db = m_db;
+    QPointer<FeedPage> self(this);
+    QThreadPool::globalInstance()->start([self, db, level]() {
+        db->setExplorationLevel(level);
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self]() {
+                if (self)
+                    self->requestMore();
+            },
+            Qt::QueuedConnection);
+    });
+}
+
 void FeedPage::onLikeClicked() {
     recordCurrent(FeedDatabase::Event::Like);
     m_likeButton->setText(QStringLiteral("Liked!"));
@@ -1334,8 +1377,8 @@ void FeedPage::updateDebugPanel() {
             QList<QString> parts;
             for (const auto& [kind, md5] : snap.recent) {
                 const char* color =
-                    (kind == QLatin1String("liked") || kind == QLatin1String("saved") ||
-                     kind == QLatin1String("watched"))
+                    (kind == QLatin1String("like") || kind == QLatin1String("favorite") ||
+                     kind == QLatin1String("view"))
                         ? kPos
                         : kNeg;
                 parts << QStringLiteral("<span style='%1'>%2</span> %3")
@@ -1346,41 +1389,60 @@ void FeedPage::updateDebugPanel() {
             html += parts.join(QStringLiteral(" · ")) + QStringLiteral("<br>");
         }
 
-        // current post (score breakdown + visual verdict)
-        if (position >= 0 && position < queue.size()) {
-            const FeedDatabase::RecommendationRow bd = rec->explainPost(current);
-            html += QStringLiteral(
-                        "<br><b style='%1'>Current post</b> %2<br>"
-                        "score: user %3 + session %4 + tags %5 = <b>%6</b> · taste #%7 · src "
-                        "%8 · hard-neg %9<br>")
-                        .arg(kTitle)
-                        .arg(current.md5.left(8))
-                        .arg(bd.userSimilarity, 0, 'f', 2)
-                        .arg(bd.sessionSimilarity, 0, 'f', 2)
-                        .arg(bd.tagScore, 0, 'f', 2)
-                        .arg(bd.finalScore, 0, 'f', 2)
-                        .arg(bd.tasteId)
-                        .arg(bd.candidateSource.isEmpty() ? QStringLiteral("?")
-                                                          : bd.candidateSource.toHtmlEscaped())
-                        .arg(bd.rejectedNegative ? QStringLiteral("yes") : QStringLiteral("no"));
+        // One explanation pass for the current post and the upcoming ones
+        // (shares the scoring context).
+        QList<SourceImage> explained;
+        for (int i = qMax(0, position); i < qMin(position + 6, queue.size()); ++i)
+            explained.append(queue.at(i));
+        const QList<FeedRecommender::Explanation> explanations = rec->explainPosts(explained);
+        const FeedModel model = db->modelSnapshot();
+        // Learned per-tag weight (posterior mean) for the tag breakdowns.
+        auto learnedWeight = [&model](const QString& tag) {
+            return model.belief(QStringLiteral("t:") + tag).mean;
+        };
+        auto slotLabel = [](const FeedRecommender::Explanation& e) {
+            if (e.loggedSlot == QLatin1String("tangent"))
+                return QStringLiteral(" · <span style='color:#e8a33d'>tangent</span>");
+            return QString();
+        };
 
-            // Per-tag learned ratings for THIS post (Bayesian-shrunk, same
-            // math the ranker uses): negatives in red, positives in green,
-            // so it is visible exactly which tags dragged the score down.
-            const auto prefRows = db->tagPreferenceRows();
+        // current post: heuristic breakdown + the learned model's verdict
+        if (position >= 0 && position < queue.size() && !explanations.isEmpty()) {
+            const FeedRecommender::Explanation& e = explanations.first();
+            const FeedDatabase::RecommendationRow& bd = e.heuristic;
+            html +=
+                QStringLiteral(
+                    "<br><b style='%1'>Current post</b> %2%3<br>"
+                    "heuristic: taste %4 + session %5 + tags %6 = <b>%7</b><br>"
+                    "model: <b>p %8</b> ±%9 · %10 learned · taste #%11 · src %12%13<br>")
+                    .arg(kTitle)
+                    .arg(current.md5.left(8))
+                    .arg(slotLabel(e))
+                    .arg(bd.userSimilarity, 0, 'f', 2)
+                    .arg(bd.sessionSimilarity, 0, 'f', 2)
+                    .arg(bd.tagScore, 0, 'f', 2)
+                    .arg(e.heuristicScore, 0, 'f', 2)
+                    .arg(e.modelProbability, 0, 'f', 2)
+                    .arg(e.uncertainty, 0, 'f', 2)
+                    .arg(QStringLiteral("%1%").arg(qRound(e.blend * 100.0)))
+                    .arg(bd.tasteId)
+                    .arg(e.loggedSource.isEmpty() ? QStringLiteral("?")
+                                                  : e.loggedSource.toHtmlEscaped())
+                    .arg(e.visualKnown
+                             ? QString()
+                             : QStringLiteral(" · <span style='%1'>no look yet</span>").arg(kDim));
+
+            // Per-tag learned weights for THIS post: negatives in red,
+            // positives in green, so it is visible exactly which tags
+            // dragged the prediction down.
             QStringList negParts, posParts;
-            for (const SourceTag& t : current.tags) {
-                const QString tag = t.name.trimmed().toLower();
-                auto it = prefRows.constFind(tag);
-                if (it == prefRows.constEnd())
-                    continue;
-                const double w =
-                    it.value().preference * (it.value().confidence / (it.value().confidence + 3.0));
-                if (w < -0.05)
+            for (const QString& tag : FeedRecommender::contentTags(current)) {
+                const double w = learnedWeight(tag);
+                if (w < -0.1)
                     negParts << QStringLiteral("<span style='%1'>%2 (%3)</span>")
                                     .arg(kNeg, tag.toHtmlEscaped())
                                     .arg(w, 0, 'f', 2);
-                else if (w > 0.05)
+                else if (w > 0.1)
                     posParts << QStringLiteral("<span style='%1'>%2 (+%3)</span>")
                                     .arg(kPos, tag.toHtmlEscaped())
                                     .arg(w, 0, 'f', 2);
@@ -1393,37 +1455,33 @@ void FeedPage::updateDebugPanel() {
                             .arg(kDim, posParts.join(QStringLiteral(", ")));
         }
 
-        // upcoming queue, with the total fed count on the header line.
-        // The visual-model verdict lives here too: it predicts whether the
-        // user will like each upcoming post, which is the actionable
-        // question (the current post is already on screen). Each line is a
-        // link; hovering shows the post's tags with learned ratings.
+        // upcoming queue, with the total fed count on the header line. The
+        // model's predicted engagement (± its uncertainty) is the
+        // actionable question here. Each line is a link; hovering shows the
+        // post's tags with learned weights.
         html += QStringLiteral("<b style='%1'>Upcoming</b> · total fed %2<br>")
                     .arg(kTitle)
                     .arg(static_cast<qint64>(db->totalImpressions()));
-        const auto prefRows = db->tagPreferenceRows();
-        auto shrunk = [](double pref, double conf) { return pref * (conf / (conf + 3.0)); };
         for (int i = position + 1; i < qMin(position + 6, queue.size()); ++i) {
             const SourceImage& img = queue.at(i);
-            const FeedDatabase::RecommendationRow bd = rec->explainPost(img);
-            const QString scoreColor = bd.finalScore >= 0 ? kPos : kNeg;
+            const int ei = i - qMax(0, position);
+            if (ei < 0 || ei >= explanations.size())
+                break;
+            const FeedRecommender::Explanation& e = explanations.at(ei);
+            const char* color =
+                e.modelProbability >= 0.55 ? kPos : (e.modelProbability >= 0.4 ? kDim : kNeg);
             html += QStringLiteral(
                         "<a href='post:%1' style='color:#cccccc; "
-                        "text-decoration:none;'>%1…</a> <span style='%2'>score %3</span>")
-                        .arg(img.md5.left(8), scoreColor)
-                        .arg(bd.finalScore, 0, 'f', 2);
-            const FeedRecommender::VisualVerdict vv = rec->explainVisual(img);
-            if (vv.available) {
-                const char* verdictColor =
-                    vv.bestSim >= 0.5 ? kPos : (vv.bestSim >= 0.3 ? kDim : kNeg);
-                const char* verdictText =
-                    vv.bestSim >= 0.5 ? "like" : (vv.bestSim >= 0.3 ? "maybe" : "drop");
-                html += QStringLiteral(" · <span style='%1'>%2 %3</span>")
-                            .arg(verdictColor)
-                            .arg(verdictText)
-                            .arg(vv.bestSim, 0, 'f', 2);
-            }
-            html += QStringLiteral("<br>");
+                        "text-decoration:none;'>%1…</a> <span style='%2'>p %3 ±%4</span> "
+                        "<span style='%5'>h %6 · %7</span>%8<br>")
+                        .arg(img.md5.left(8), QLatin1String(color))
+                        .arg(e.modelProbability, 0, 'f', 2)
+                        .arg(e.uncertainty, 0, 'f', 2)
+                        .arg(QLatin1String(kDim))
+                        .arg(e.heuristicScore, 0, 'f', 2)
+                        .arg(e.loggedSource.isEmpty() ? QStringLiteral("?")
+                                                      : e.loggedSource.toHtmlEscaped())
+                        .arg(slotLabel(e));
 
             // Cache the tag breakdown for the hover tooltip, strongest first.
             struct TagRow {
@@ -1431,21 +1489,15 @@ void FeedPage::updateDebugPanel() {
                 double w;
             };
             QList<TagRow> ranked;
-            for (const SourceTag& t : img.tags) {
-                const QString tag = t.name.trimmed().toLower();
-                auto it = prefRows.constFind(tag);
-                const double w = it != prefRows.constEnd()
-                                     ? shrunk(it.value().preference, it.value().confidence)
-                                     : 0.0;
-                ranked.append({tag, w});
-            }
+            for (const QString& tag : FeedRecommender::contentTags(img))
+                ranked.append({tag, learnedWeight(tag)});
             std::sort(ranked.begin(), ranked.end(),
                       [](const TagRow& a, const TagRow& b) { return a.w > b.w; });
             QStringList tagRows;
             for (const TagRow& r : ranked) {
-                const char* color = r.w < -0.05 ? kNeg : (r.w > 0.05 ? kPos : kDim);
-                tagRows << QStringLiteral("<span style='color:%1'>%2 %3</span>")
-                               .arg(QLatin1String(color), r.tag.toHtmlEscaped())
+                const char* tagColor = r.w < -0.1 ? kNeg : (r.w > 0.1 ? kPos : kDim);
+                tagRows << QStringLiteral("<span style='%1'>%2 %3</span>")
+                               .arg(QLatin1String(tagColor), r.tag.toHtmlEscaped())
                                .arg(r.w, 0, 'f', 2);
             }
             snap.postTagTips.insert(img.md5.left(8),
@@ -1494,22 +1546,7 @@ void FeedPage::refreshHeavyStats() {
     struct HeavyStats {
         QHash<QString, qint64> lingers;
         QHash<QString, int> interactions;
-        QStringList tasteSummary;
-        FeedRecommender::ModelStats::TasteDetails tasteDetails;
-        QList<QPair<QString, double>> likedTags;
-        QList<QPair<QString, double>> dislikedTags;
-        FeedRecommender::ModelStats::TagNegs dislikedTagsFull;
-        int tasteCount = 0;
-        int hardNegatives = 0;
-        QStringList hardNegativeTags;
-        int skipStreak = 0;
-        double sessionBlend = 0.0;
-        int negativeAnchors = 0;
-        QStringList lowSpecificityTags;
-        double learnedSamples = 0.0;
-        double learnedBlend = 0.0;
-        QList<double> learnedWeights;
-        QStringList swayTags;
+        FeedRecommender::ModelStats model;
         FeedRecommender::FunnelStats funnel;
     };
 
@@ -1520,24 +1557,7 @@ void FeedPage::refreshHeavyStats() {
         HeavyStats stats;
         stats.lingers = db->averageLingers();
         stats.interactions = db->interactionCounts();
-        {
-            const FeedRecommender::ModelStats ms = rec->modelStats();
-            stats.tasteSummary = ms.tasteSummary;
-            stats.tasteDetails = ms.tasteDetails;
-            stats.likedTags = ms.likedTags;
-            stats.dislikedTags = ms.dislikedTags;
-            stats.dislikedTagsFull = ms.dislikedTagsFull;
-            stats.tasteCount = ms.tasteCount;
-            stats.hardNegatives = ms.hardNegatives;
-            stats.hardNegativeTags = ms.hardNegativeTags;
-            stats.skipStreak = ms.skipStreak;
-            stats.sessionBlend = ms.sessionBlend;
-            stats.negativeAnchors = ms.negativeAnchors;
-            stats.lowSpecificityTags = ms.lowSpecificityTags;
-            stats.learnedSamples = ms.learnedSamples;
-            stats.learnedBlend = ms.learnedBlend;
-            stats.learnedWeights = ms.learnedWeights;
-        }
+        stats.model = rec->modelStats();
         stats.funnel = rec->lastFunnelStats();
 
         if (!self)
@@ -1549,7 +1569,19 @@ void FeedPage::refreshHeavyStats() {
                     return;
                 self->m_heavyStatsPending = false;
                 self->m_lastHeavyStatsLoad = QDateTime::currentMSecsSinceEpoch();
-                self->m_tasteDetails = stats.tasteDetails;
+                const FeedRecommender::ModelStats& ms = stats.model;
+                self->m_tasteDetails = ms.tasteDetails;
+
+                auto learnedList = [](const QList<FeedRecommender::ModelStats::LearnedTag>& tags) {
+                    QStringList items;
+                    for (const auto& t : tags)
+                        items << QStringLiteral("%1 (%2%3 ±%4)")
+                                     .arg(t.tag.toHtmlEscaped())
+                                     .arg(t.mean >= 0 ? QStringLiteral("+") : QString())
+                                     .arg(t.mean, 0, 'f', 2)
+                                     .arg(t.sd, 0, 'f', 2);
+                    return items.join(QStringLiteral(", "));
+                };
 
                 QString h;
                 // Interactions, compact: positives on one line, negatives on
@@ -1577,8 +1609,8 @@ void FeedPage::refreshHeavyStats() {
                 h += QStringLiteral(
                          "<span style='color:#999'>skip streak: %1 · session blend: %2%</span>"
                          "<br>")
-                         .arg(stats.skipStreak)
-                         .arg(stats.sessionBlend * 100.0, 0, 'f', 0);
+                         .arg(ms.skipStreak)
+                         .arg(ms.sessionBlend * 100.0, 0, 'f', 0);
 
                 // Avg watch time per kind (empty until the first dwell is
                 // recorded - show the placeholder instead of hiding it).
@@ -1595,96 +1627,117 @@ void FeedPage::refreshHeavyStats() {
                                                   : parts.join(QStringLiteral(", ")));
                 }
 
+                // learned model
+                h += QStringLiteral(
+                         "<b style='color:#e8a33d; margin-top:8px;'>Learned model</b><br>"
+                         "<b>%1% learned</b> <span style='color:#999'>· %2 samples · %3 "
+                         "live-validated · %4 beliefs</span><br>")
+                         .arg(ms.blend * 100.0, 0, 'f', 0)
+                         .arg(ms.modelSamples, 0, 'f', 0)
+                         .arg(ms.validationSamples, 0, 'f', 0)
+                         .arg(ms.beliefCount);
+                {
+                    const bool winning = ms.modelLogLoss < ms.heuristicLogLoss;
+                    h += QStringLiteral(
+                             "<span style='color:#999'>log-loss (lower wins):</span> "
+                             "<span style='color:%1'>model %2</span> vs heuristic %3<br>")
+                             .arg(QLatin1String(winning ? "#5fbf6f" : "#e05a5a"))
+                             .arg(ms.modelLogLoss, 0, 'f', 3)
+                             .arg(ms.heuristicLogLoss, 0, 'f', 3);
+                }
+                h += QStringLiteral(
+                         "<span style='color:#999'>exploration %1% · tangents shown %2 · liked "
+                         "%3%4</span><br>")
+                         .arg(ms.exploration * 100.0, 0, 'f', 0)
+                         .arg(ms.tangentShown, 0, 'f', 0)
+                         .arg(ms.tangentHits, 0, 'f', 0)
+                         .arg(ms.tangentShown > 0
+                                  ? QStringLiteral(" (%1%)").arg(
+                                        100.0 * ms.tangentHits / ms.tangentShown, 0, 'f', 0)
+                                  : QString());
+                if (ms.warmStartDone) {
+                    h += QStringLiteral("<span style='color:#999'>warm start: done</span><br>");
+                } else {
+                    h += QStringLiteral(
+                             "<span style='color:#e8a33d'>warm start: replaying history "
+                             "%1 / %2</span><br>")
+                             .arg(ms.warmStartProgress, 0, 'f', 0)
+                             .arg(ms.warmStartTotal, 0, 'f', 0);
+                }
+                if (!ms.learnedLiked.isEmpty())
+                    h += QStringLiteral(
+                             "<b style='color:#5fbf6f;'>Learned likes</b><br>"
+                             "<span style='color:#5fbf6f'>%1</span><br>")
+                             .arg(learnedList(ms.learnedLiked));
+                if (!ms.learnedDisliked.isEmpty())
+                    h += QStringLiteral(
+                             "<b style='color:#e05a5a;'>Learned dislikes</b><br>"
+                             "<span style='color:#e05a5a'>%1</span><br>")
+                             .arg(learnedList(ms.learnedDisliked));
+                if (!ms.tangentCandidates.isEmpty())
+                    h += QStringLiteral(
+                             "<b style='color:#e8a33d;'>Next tangents</b> "
+                             "<span style='color:#999'>(seen on liked posts, still "
+                             "uncertain)</span><br>%1<br>")
+                             .arg(learnedList(ms.tangentCandidates));
+                if (!ms.signalWeights.isEmpty()) {
+                    QStringList items;
+                    for (const auto& [name, w] : ms.signalWeights)
+                        items << QStringLiteral("<span style='color:%1'>%2 %3</span>")
+                                     .arg(QLatin1String(w >= 0 ? "#5fbf6f" : "#e05a5a"), name)
+                                     .arg(w, 0, 'f', 2);
+                    h += QStringLiteral("<span style='color:#999'>signal weights:</span> %1<br>")
+                             .arg(items.join(QStringLiteral(", ")));
+                }
+                {
+                    QStringList items;
+                    for (const auto& [arm, odds] : ms.armOdds)
+                        items << QStringLiteral("%1 %2%").arg(arm).arg(odds * 100.0, 0, 'f', 0);
+                    h += QStringLiteral("<span style='color:#999'>arm odds: %1</span><br>")
+                             .arg(items.join(QStringLiteral(", ")));
+                }
+
                 // Taste profiles, capped at 12 lines. Each line is a link
                 // with a hover tooltip showing the full tag-weight breakdown.
                 h += QStringLiteral(
                     "<b style='color:#e8a33d; margin-top:8px;'>Taste profiles</b><br>");
-                if (stats.tasteSummary.isEmpty()) {
+                if (ms.tasteSummary.isEmpty()) {
                     h += QStringLiteral("<span style='color:#999'>(none learned yet)</span><br>");
                 } else {
-                    const int shown = qMin(12, stats.tasteSummary.size());
+                    const int shown = qMin(12, ms.tasteSummary.size());
                     for (int i = 0; i < shown; ++i) {
                         h += QStringLiteral(
                                  "<a href='taste:%1' style='color:#cccccc; "
                                  "text-decoration:none;'>%2</a><br>")
                                  .arg(i)
-                                 .arg(stats.tasteSummary.at(i).toHtmlEscaped());
+                                 .arg(ms.tasteSummary.at(i).toHtmlEscaped());
                     }
-                    if (stats.tasteSummary.size() > shown)
+                    if (ms.tasteSummary.size() > shown)
                         h += QStringLiteral("<span style='color:#999'>… +%1 more</span><br>")
-                                 .arg(stats.tasteSummary.size() - shown);
-                }
-                if (!stats.likedTags.isEmpty()) {
-                    h += QStringLiteral("<b style='color:#5fbf6f;'>Top 10 liked tags</b><br>");
-                    QStringList items;
-                    for (const auto& pair : stats.likedTags) {
-                        items << QStringLiteral("%1 (+%2)")
-                                     .arg(pair.first)
-                                     .arg(pair.second, 0, 'f', 2);
-                    }
-                    h += QStringLiteral("<span style='color:#5fbf6f'>%1</span><br>")
-                             .arg(items.join(QStringLiteral(", ")));
-                }
-                if (!stats.dislikedTags.isEmpty()) {
-                    h +=
-                        QStringLiteral("<b style='color:#e05a5a;'>Bottom 10 disliked tags</b><br>");
-                    QStringList items;
-                    for (const auto& pair : stats.dislikedTags) {
-                        items << QStringLiteral("%1 (%2)")
-                                     .arg(pair.first)
-                                     .arg(pair.second, 0, 'f', 2);
-                    }
-                    h += QStringLiteral("<span style='color:#e05a5a'>%1</span><br>")
-                             .arg(items.join(QStringLiteral(", ")));
+                                 .arg(ms.tasteSummary.size() - shown);
                 }
                 // Name the hard negatives explicitly - a count alone hides
                 // which tags are being vetoed from queries and filtering.
-                h += QStringLiteral(
-                         "<span style='color:#999'>strong negatives: %1 · negative visual "
-                         "anchors: %2</span><br>")
-                         .arg(stats.hardNegatives)
-                         .arg(stats.negativeAnchors);
-                if (!stats.hardNegativeTags.isEmpty())
-                    h += QStringLiteral("<span style='color:#e05a5a'>hard negatives: %1</span><br>")
-                             .arg(stats.hardNegativeTags.join(QStringLiteral(", ")));
-                if (!stats.swayTags.isEmpty())
+                h += QStringLiteral("<span style='color:#999'>hard negatives: %1</span><br>")
+                         .arg(ms.hardNegatives);
+                if (!ms.hardNegativeTags.isEmpty())
+                    h += QStringLiteral("<span style='color:#e05a5a'>%1</span><br>")
+                             .arg(ms.hardNegativeTags.join(QStringLiteral(", ")));
+                if (!ms.swayTags.isEmpty())
                     h += QStringLiteral("<span style='color:#e8a33d'>sway active: %1</span><br>")
-                             .arg(stats.swayTags.join(QStringLiteral(", ")));
+                             .arg(ms.swayTags.join(QStringLiteral(", ")));
 
                 // self-learned tag specificity
                 h += QStringLiteral(
                     "<b style='color:#e8a33d; margin-top:8px;'>Tag specificity</b><br>");
-                if (stats.lowSpecificityTags.isEmpty()) {
+                if (ms.lowSpecificityTags.isEmpty()) {
                     h +=
                         QStringLiteral("<span style='color:#999'>(not enough data yet)</span><br>");
                 } else {
                     h += QStringLiteral(
                              "<span style='color:#999'>near-universal (auto-detected, no "
                              "blacklist): %1</span><br>")
-                             .arg(stats.lowSpecificityTags.join(QStringLiteral(", ")));
-                }
-
-                // stage-2 learned user model
-                h += QStringLiteral(
-                         "<b style='color:#e8a33d; margin-top:8px;'>Learned model</b><br>"
-                         "<span style='color:#999'>samples: %1 · blend: %2% learned</span><br>")
-                         .arg(stats.learnedSamples, 0, 'f', 0)
-                         .arg(stats.learnedBlend * 100.0, 0, 'f', 0);
-                if (stats.learnedWeights.size() == 10) {
-                    // Feature names in UserModel::kFeatureCount order (bias last).
-                    static const char* kFeatureNames[] = {"userSim", "session", "tags",    "favOv",
-                                                          "fresh",   "novel",   "explore", "populr",
-                                                          "negAnch", "bias"};
-                    QStringList items;
-                    for (int i = 0; i < 10; ++i) {
-                        const double w = stats.learnedWeights.at(i);
-                        const char* color = w >= 0 ? "#5fbf6f" : "#e05a5a";
-                        items << QStringLiteral("<span style='color:%3'>%1 %2</span>")
-                                     .arg(QString::fromLatin1(kFeatureNames[i]))
-                                     .arg(w, 0, 'f', 2)
-                                     .arg(QLatin1String(color));
-                    }
-                    h += items.join(QStringLiteral(", ")) + QStringLiteral("<br>");
+                             .arg(ms.lowSpecificityTags.join(QStringLiteral(", ")));
                 }
 
                 // last funnel run - one line per stage, counts in -> out,
@@ -1693,6 +1746,14 @@ void FeedPage::refreshHeavyStats() {
                 h += QStringLiteral(
                     "<b style='color:#e8a33d; margin-top:8px;'>Last funnel "
                     "run</b><br>");
+                {
+                    QStringList arms;
+                    for (const auto& [arm, n] : f.armCandidates)
+                        arms << QStringLiteral("%1 %2").arg(arm).arg(n);
+                    h += QStringLiteral("<b>arms</b> <span style='color:#999'>%1</span><br>")
+                             .arg(arms.isEmpty() ? QStringLiteral("-")
+                                                 : arms.join(QStringLiteral(" · ")));
+                }
                 const int stage1Drops = f.dropScore + f.dropHardNeg + f.dropNoMd5;
                 h += QStringLiteral(
                          "<b>stage 1</b> fetch + dedup + cheap filter: %1 kept · %2 dropped<br>")
@@ -1703,26 +1764,18 @@ void FeedPage::refreshHeavyStats() {
                          .arg(f.dropScore)
                          .arg(f.dropHardNeg)
                          .arg(f.dropNoMd5);
-                if (f.coldStart) {
-                    h += QStringLiteral(
-                        "<b>stage 2+3</b> <span style='color:#999'>skipped (cold start - "
-                        "no tastes learned yet)</span><br>");
-                } else {
-                    const int stage2Dropped = f.stage1Filtered - f.stage2Shortlist;
-                    const int stage3Dropped = f.stage2Shortlist - f.stage3Finalists;
-                    h += QStringLiteral(
-                             "<b>stage 2</b> taste-vector filter: %1 kept · %2 dropped<br>")
-                             .arg(f.stage2Shortlist)
-                             .arg(stage2Dropped);
-                    h += QStringLiteral(
-                             "<b>stage 3</b> visual ranking: %1 kept · %2 dropped · new "
-                             "embeddings: %3<br>")
-                             .arg(f.stage3Finalists)
-                             .arg(stage3Dropped)
-                             .arg(f.embeddingsComputedThisBatch);
-                }
-                h += QStringLiteral("<b>batch</b> %1 selected · cold start: %2%3<br>")
+                h += QStringLiteral(
+                         "<b>stage 2</b> shortlist: %1 kept · %2 dropped<br>"
+                         "<b>stage 3</b> visual descriptors: %3 new<br>")
+                         .arg(f.stage2Shortlist)
+                         .arg(f.stage1Filtered - f.stage2Shortlist)
+                         .arg(f.visualsComputedThisBatch);
+                h += QStringLiteral(
+                         "<b>batch</b> %1 selected · %2 tangent slots · %3% learned · cold "
+                         "start: %4%5<br>")
                          .arg(f.batchSize)
+                         .arg(f.tangentSlots)
+                         .arg(f.blend * 100.0, 0, 'f', 0)
                          .arg(f.coldStart ? QStringLiteral("yes") : QStringLiteral("no"))
                          .arg(f.emergencyFallbackUsed
                                   ? QStringLiteral(
@@ -1805,21 +1858,30 @@ void FeedPage::onSaveClicked() {
         const QString sourceId = img.sourceId.isEmpty() && remote ? remote->id() : img.sourceId;
         Source* downloadSource = self ? self->m_sources.source(sourceId) : nullptr;
 
-        QByteArray bytes;
-        QString error;
-        if (downloadSource) {
-            bytes = downloadSource->fetch(img, FileKind::Full, &error);
-        } else {
-            error = QStringLiteral("source not available");
-        }
+        LibrarySource library;
+        SourceImage post = img;
+        post.sourceId = sourceId;
 
         ImportResult result;
-        if (bytes.isEmpty()) {
-            result.error = error;
+        if (library.hasImage(post)) {
+            // Already saved (same md5, or same source + post id): skip the download.
+            result.ok = true;
+            result.alreadyExisted = true;
         } else {
-            // Import the downloaded bytes into the local library catalog.
-            LibrarySource library;
-            result = library.importImage(img, bytes);
+            QByteArray bytes;
+            QString error;
+            if (downloadSource) {
+                bytes = downloadSource->fetch(img, FileKind::Full, &error);
+            } else {
+                error = QStringLiteral("source not available");
+            }
+
+            if (bytes.isEmpty()) {
+                result.error = error;
+            } else {
+                // Import the downloaded bytes into the local library catalog.
+                result = library.importImage(post, bytes);
+            }
         }
         if (!self)
             return;
@@ -1830,8 +1892,9 @@ void FeedPage::onSaveClicked() {
                     return;
                 self->m_saveButton->setEnabled(true);
                 self->m_statusLabel->setText(
-                    result.ok ? QStringLiteral("Saved to library")
-                              : QStringLiteral("Save failed: %1").arg(result.error));
+                    !result.ok              ? QStringLiteral("Save failed: %1").arg(result.error)
+                    : result.alreadyExisted ? QStringLiteral("Already in library")
+                                            : QStringLiteral("Saved to library"));
             },
             Qt::QueuedConnection);
     });

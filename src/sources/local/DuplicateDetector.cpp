@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <mutex>
+#include <vector>
 
 namespace Mosaic {
 
@@ -35,6 +37,19 @@ bool isVideoFormat(const QString& format) {
     return format == QLatin1String("webm") || format == QLatin1String("mp4") ||
            format == QLatin1String("mov") || format == QLatin1String("mkv") ||
            format == QLatin1String("avi") || format == QLatin1String("gif");
+}
+
+/** Lazily computed high-detail SIFT blob, shared by every pair it is in. */
+struct DetailedSift {
+    std::once_flag once;
+    QByteArray blob;
+};
+
+QByteArray readFile(const QString& path) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    return f.readAll();
 }
 
 }  // namespace
@@ -97,35 +112,30 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
         return pairs;
     }
 
-    // Phase 1: fingerprint every image in parallel (decode + pHash + SIFT
-    // is the expensive part; each worker only touches its own file/data).
+    // Phase 1: pHash every image in parallel. This is the only per-image
+    // work for the whole library; SIFT (the expensive part) is deferred
+    // until the pHash pre-filter has picked the few candidate images.
 
-    std::atomic<int> fingerprinted{0};
     const int totalFiles = files.size();
-    QList<Entry> all = QtConcurrent::blockingMapped(
-        files, [&fingerprinted, totalFiles, &progress](const QPair<QString, QString>& file) {
-            Entry entry;
-            entry.md5 = file.first;
-            entry.path = file.second;
-            QFile f(file.second);
-            if (f.open(QIODevice::ReadOnly)) {
-                const QByteArray bytes = f.readAll();
-                f.close();
-                entry.phash = computePhash(bytes);
-                entry.sift = computeSiftBlob(bytes);
-            }
+    std::atomic<int> hashed{0};
+    const QList<qint64> phashes = QtConcurrent::blockingMapped(
+        files, [&hashed, totalFiles, &progress](const QPair<QString, QString>& file) {
+            const qint64 phash = computePhash(readFile(file.second));
             if (progress)
-                progress(fingerprinted.fetch_add(1) + 1, totalFiles);
-            return entry;
+                progress(hashed.fetch_add(1) + 1, totalFiles);
+            return phash;
         });
-    if (progress)
-        progress(totalFiles, totalFiles);
 
     QList<Entry> entries;
-    entries.reserve(all.size());
-    for (Entry& e : all) {
-        if (e.phash != 0 || !e.sift.isEmpty())
-            entries.append(std::move(e));
+    entries.reserve(totalFiles);
+    for (int i = 0; i < totalFiles; ++i) {
+        if (phashes.at(i) == 0)
+            continue;  // unreadable / undecodable
+        Entry entry;
+        entry.md5 = files.at(i).first;
+        entry.path = files.at(i).second;
+        entry.phash = phashes.at(i);
+        entries.append(std::move(entry));
     }
 
     // Enrich entries with metadata used to pick the favored copy per pair:
@@ -170,16 +180,43 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
         const Entry& a = entries.at(i);
         for (int j = i + 1; j < n; ++j) {
             const Entry& b = entries.at(j);
-            // Pre-filter by hamming distance when both hashes exist.
-            if (a.phash != 0 && b.phash != 0) {
-                const int hamming = static_cast<int>(
-                    std::bitset<64>(static_cast<quint64>(a.phash ^ b.phash)).count());
-                if (hamming > kHammingThreshold)
-                    continue;
-            }
-            candidates.append({i, j});
+            const int hamming = static_cast<int>(
+                std::bitset<64>(static_cast<quint64>(a.phash ^ b.phash)).count());
+            if (hamming <= kHammingThreshold)
+                candidates.append({i, j});
         }
     }
+
+    // SIFT only the images that appear in at least one candidate pair -
+    // typically a small fraction of the library.
+    QSet<int> needSift;
+    for (const QPair<int, int>& c : candidates) {
+        needSift.insert(c.first);
+        needSift.insert(c.second);
+    }
+    const QList<int> siftIndices(needSift.begin(), needSift.end());
+    const int totalSift = siftIndices.size();
+    const int totalCandidates = qMax(1, candidates.size());
+    const int totalWork = totalFiles + totalSift + totalCandidates;
+    Entry* entryData = entries.data();  // detach once; workers write distinct slots
+    std::atomic<int> sifted{0};
+    QtConcurrent::blockingMap(
+        siftIndices, [entryData, &sifted, totalFiles, totalWork, &progress](int index) {
+            entryData[index].sift = computeSiftBlob(readFile(entryData[index].path));
+            if (progress)
+                progress(totalFiles + sifted.fetch_add(1) + 1, totalWork);
+        });
+
+    // Borderline pairs re-extract a high-detail blob; an image can sit in
+    // several borderline pairs, so each blob is computed at most once.
+    std::vector<DetailedSift> detailed(static_cast<size_t>(n));
+    auto detailedBlob = [&entries, &detailed](int index) -> const QByteArray& {
+        DetailedSift& slot = detailed[static_cast<size_t>(index)];
+        std::call_once(slot.once, [&]() {
+            slot.blob = computeSiftBlob(readFile(entries.at(index).path), 16000, 0.01, 0);
+        });
+        return slot.blob;
+    };
 
     // Phase 3: verify candidates in parallel with SIFT + RANSAC.
     // Two stages: a fast pass with the standard keypoint budget; when the
@@ -190,10 +227,9 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     constexpr double kConfirmRatio = 0.55;  ///< clearly a duplicate
     constexpr double kRefineRatio = 0.25;   ///< below this: clearly not
     std::atomic<int> compared{0};
-    const int totalCandidates = qMax(1, candidates.size());
     QList<DuplicatePair> verified = QtConcurrent::blockingMapped(
-        candidates,
-        [&entries, &compared, totalCandidates, totalFiles, &progress](const QPair<int, int>& c) {
+        candidates, [&entries, &detailedBlob, &compared, totalFiles, totalSift, totalWork,
+                     &progress](const QPair<int, int>& c) {
             DuplicatePair pair;
             const Entry& a = entries.at(c.first);
             const Entry& b = entries.at(c.second);
@@ -206,17 +242,8 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
                 if (ratio >= kRefineRatio && ratio < kConfirmRatio) {
                     // Borderline: rerun with many more keypoints (lower
                     // contrast threshold, no downscale) for a finer verdict.
-                    QByteArray detA, detB;
-                    QFile fa(a.path);
-                    if (fa.open(QIODevice::ReadOnly)) {
-                        detA = computeSiftBlob(fa.readAll(), 16000, 0.01, 0);
-                        fa.close();
-                    }
-                    QFile fb(b.path);
-                    if (fb.open(QIODevice::ReadOnly)) {
-                        detB = computeSiftBlob(fb.readAll(), 16000, 0.01, 0);
-                        fb.close();
-                    }
+                    const QByteArray& detA = detailedBlob(c.first);
+                    const QByteArray& detB = detailedBlob(c.second);
                     if (!detA.isEmpty() && !detB.isEmpty()) {
                         int detailedInliers = 0;
                         const double detailed = matchSiftBlobs(detA, detB, &detailedInliers);
@@ -239,7 +266,7 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
             }
 
             if (progress)
-                progress(totalFiles + compared.fetch_add(1) + 1, totalFiles + totalCandidates);
+                progress(totalFiles + totalSift + compared.fetch_add(1) + 1, totalWork);
             return pair;
         });
 
@@ -288,7 +315,7 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
         pairs.append(normalized);
     }
     if (progress)
-        progress(totalFiles + totalCandidates, totalFiles + totalCandidates);
+        progress(totalWork, totalWork);
 
     std::sort(pairs.begin(), pairs.end(),
               [](const DuplicatePair& x, const DuplicatePair& y) { return x.score > y.score; });

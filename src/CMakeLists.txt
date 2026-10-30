@@ -69,10 +69,12 @@ add_executable(Mosaic
     feed/FeedDatabase.cpp
     feed/FeedRecommender.h
     feed/FeedRecommender.cpp
-    feed/UserModel.h
-    feed/UserModel.cpp
-    feed/EmbeddingBackend.h
-    feed/EmbeddingBackend.cpp
+    feed/FeedModel.h
+    feed/FeedModel.cpp
+    feed/FeedWarmStart.h
+    feed/FeedWarmStart.cpp
+    feed/VisualFeatures.h
+    feed/VisualFeatures.cpp
     feed/FeedPage.h
     feed/FeedPage.cpp
     sources/Source.h
@@ -124,7 +126,6 @@ target_link_libraries(Mosaic PRIVATE
     ${OpenCV_LIBS}
     ffmpeg
     duckdb
-    onnxruntime
 )
 
 # OpenCV/FFmpeg headers can warn; keep our code strict instead
@@ -155,21 +156,4 @@ add_custom_command(TARGET Mosaic POST_BUILD
         "${CMAKE_SOURCE_DIR}/third_party/libs/duckdb/duckdb.dll"
         "$<TARGET_FILE_DIR:Mosaic>/duckdb.dll"
     COMMENT "Copying duckdb.dll"
-)
-
-# Guarantee the exact onnxruntime.dll matching the linked .lib ends up next
-# to the executable (same pattern as duckdb.dll above).
-add_custom_command(TARGET Mosaic POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/third_party/libs/onnxruntime/lib/onnxruntime.dll"
-        "$<TARGET_FILE_DIR:Mosaic>/onnxruntime.dll"
-    COMMENT "Copying onnxruntime.dll"
-)
-
-# Deploy the bundled SigLIP vision encoder (feed visual embeddings).
-add_custom_command(TARGET Mosaic POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_SOURCE_DIR}/assets/onnx"
-        "$<TARGET_FILE_DIR:Mosaic>/assets/onnx"
-    COMMENT "Copying ONNX models"
 )

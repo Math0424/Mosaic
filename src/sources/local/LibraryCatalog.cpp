@@ -317,6 +317,43 @@ bool LibraryCatalog::hasImage(const QString& md5) const {
     }
 }
 
+QString LibraryCatalog::md5ForPost(const QString& sourceId, qint64 remoteId) const {
+    using namespace LibrarySql;
+
+    // Local imports carry no real post identity.
+    if (sourceId.isEmpty() || sourceId == QLatin1String("local") || remoteId <= 0)
+        return QString();
+    Database& db = Database::instance();
+    if (!db.isOpen())
+        return QString();
+    DbConnection conn = db.connection();
+    if (!conn.isOpen())
+        return QString();
+    try {
+        duckdb_result res{};
+        QString error;
+        const QString sql = QStringLiteral(
+                                "SELECT md5 FROM images "
+                                "WHERE source_id = %1 AND remote_id = %2 LIMIT 1")
+                                .arg(quoted(sourceId))
+                                .arg(remoteId);
+        if (!conn.query(sql, &res, &error))
+            return QString();
+        QString md5;
+        if (duckdb_row_count(&res) > 0) {
+            char* value = duckdb_value_varchar(&res, 0, 0);
+            if (value) {
+                md5 = QString::fromUtf8(value);
+                duckdb_free(value);
+            }
+        }
+        duckdb_destroy_result(&res);
+        return md5;
+    } catch (const std::exception&) {
+        return QString();
+    }
+}
+
 // files
 
 QList<SourceImage> LibraryCatalog::imagesWithTag(const QString& tagName,

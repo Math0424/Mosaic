@@ -23,8 +23,9 @@ simpler and built around a local, searchable library.
 
   ![Viewer](docs/images/WindowViewer.png)
 
-- **"For You" feed** — a vertical feed of recommended posts that adapts to
-  every like, save, and skip.
+- **"For You" feed** — a vertical feed of recommended posts that learns from
+  every like, save, and skip, with an **Explore** slider for how often it
+  tries new tangents.
 - **Local catalog** — tags, favorites, and metadata for your own library.
 - **Duplicate detection** — find near-identical images and resolve them in
   one click.
@@ -85,7 +86,13 @@ See the **[build guide](src/README.md)** for prerequisites and commands.
 | `Ctrl+S` | Save to library and advance |
 | `F12` | Toggle debug info |
 
-The debug sidebar also has **Dropped images** (why the funnel rejected posts)
+The **Explore** slider next to the action buttons sets how adventurous the
+feed is: further left sticks to what you already like, further right spends
+more of each batch on tangents (new tags and looks the feed is unsure about).
+
+The debug sidebar (`F12`) shows the learned model's progress (how much of the
+ranking it controls, its accuracy against the heuristic, learned likes and
+dislikes, upcoming tangents) and has **Dropped images** (why the funnel rejected posts)
 and **Liked posts**, which opens every liked/saved post in the viewer. Liked
 posts are paged in as you walk toward the end of the loaded list, so a profile
 with thousands of likes never loads all at once.

@@ -1,16 +1,18 @@
 #include "FeedDatabase.h"
 
-#include "EmbeddingBackend.h"
 #include "FeedRecommender.h"
+#include "VisualFeatures.h"
 #include "../core/Paths.h"
 
 #include <QDateTime>
 #include <QDebug>
 #include <QReadWriteLock>
+#include <QSet>
 
 #include <duckdb.h>
 
 #include <cmath>
+#include <cstring>
 
 namespace Mosaic {
 
@@ -29,89 +31,37 @@ QString quoted(const QString& s) {
     return QLatin1Char('\'') + escaped + QLatin1Char('\'');
 }
 
-// Embeddings are stored as fp16 (768 x 2 bytes) and expanded to fp32 on read.
-float halfToFloat(uint16_t h) {
-    const uint32_t sign = (h & 0x8000u) << 16;
-    const uint32_t exp = (h & 0x7C00u) >> 10;
-    const uint32_t man = h & 0x03FFu;
-    uint32_t bits;
-    if (exp == 0) {
-        bits = sign;  // zero / subnormal -> 0
-    } else if (exp == 0x1F) {
-        bits = sign | 0x7F800000u | (man << 13);  // inf / nan
-    } else {
-        const int e = static_cast<int>(exp) - 15 + 127;
-        bits = sign | (static_cast<uint32_t>(e) << 23) | (man << 13);
-    }
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-uint16_t floatToHalf(float f) {
-    uint32_t bits;
-    std::memcpy(&bits, &f, sizeof(bits));
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
-    uint32_t man = bits & 0x007FFFFFu;
-    if (exp >= 0x1F)
-        return static_cast<uint16_t>(sign | 0x7C00u);  // inf
-    if (exp <= 0)
-        return static_cast<uint16_t>(sign);  // zero
-    // Round-to-nearest-even on the dropped 13 mantissa bits.
-    uint16_t out = static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13));
-    if ((man & 0x1000u) && ((man & 0x0FFFu) || (out & 1)))
-        out = static_cast<uint16_t>(out + 1);
-    return out;
-}
-
-QByteArray packHalf(const QByteArray& fp32) {
-    const int count = fp32.size() / static_cast<int>(sizeof(float));
-    QByteArray out;
-    out.resize(count * 2);
-    const float* src = reinterpret_cast<const float*>(fp32.constData());
-    uint16_t* dst = reinterpret_cast<uint16_t*>(out.data());
-    for (int i = 0; i < count; ++i) dst[i] = floatToHalf(src[i]);
-    return out;
-}
-
-QByteArray unpackHalf(const QByteArray& fp16) {
-    const int count = fp16.size() / 2;
-    QByteArray out;
-    out.resize(count * static_cast<int>(sizeof(float)));
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(fp16.constData());
-    float* dst = reinterpret_cast<float*>(out.data());
-    for (int i = 0; i < count; ++i) dst[i] = halfToFloat(src[i]);
-    return out;
-}
+QString num(double v) { return QString::number(v, 'g', 12); }
 
 QReadWriteLock s_lock;
 
 // Nothing repeats within the last N shown posts; older history is pruned.
-constexpr qint64 kNoRepeatWindow = 50000;
+constexpr qint64 kNoRepeatWindow = 100000;
 
-constexpr qint64 kMaxImpressionEvents = 10000;
-constexpr qint64 kMaxInteractionEvents = 50000;
+constexpr qint64 kMaxImpressionEvents = 25000;
+constexpr qint64 kMaxInteractionEvents = 100000;
 
-// Interaction weights.
+// Interaction weights (taste updates).
 constexpr double kWeightFavorite = 1.00;
 constexpr double kWeightLike = 0.70;
 constexpr double kWeightLongView = 0.20;
 constexpr double kWeightNormalView = 0.05;
 constexpr double kWeightSkip = -0.03;
 constexpr double kWeightQuickSkip = -0.08;
-constexpr double kWeightDislike = -0.80;
 
 constexpr double kLongViewSeconds = 8.0;
 constexpr double kQuickSkipSeconds = 1.5;
 
 // Taste model constants.
 constexpr double kNewTasteThreshold = 0.30;
+// A liked tangent becomes its own taste unless it is clearly part of an
+// existing one: the bar for "new interest" is raised to this similarity,
+// and its evidence counts double.
+constexpr double kTangentTasteThreshold = 0.50;
+constexpr double kTangentPromotion = 2.0;
 constexpr double kTasteLearningRate = 0.27;
 constexpr int kMaxTastes = 12;
 constexpr int kMinTasteTags = 3;
-// Tag summary is just a hint/query seed; the visual vector is the main
-// representation, so prune to the strongest K tags.
 constexpr int kTasteTagLimit = 15;
 // Positive strength deltas shrink toward this ceiling.
 constexpr double kStrengthCeiling = 12.0;
@@ -129,20 +79,24 @@ constexpr double kTasteRetireStrength = 0.15;
 constexpr double kHardNegativePreference = -0.5;
 constexpr double kHardNegativeConfidence = 6.0;
 constexpr double kDislikeDelta = -0.35;
-constexpr double kSkipDelta = -0.01;
 // Near-universal tags are structurally barred from vetoing the feed.
 constexpr double kMinNegativeSpecificity = 0.35;
 constexpr double kDislikeConfidenceDelta = 1.5;
 constexpr double kFavoriteDelta = 0.10;
 constexpr double kLikeDelta = 0.06;
 constexpr double kViewDelta = 0.01;
-// Positives fade in 5 days; negatives never decay - a tag you always
-// dislike must stay vetoed, not resurface just because suppressing it
-// means it rarely gets re-sampled.
+// Positives fade; negatives never decay - a tag you always dislike must
+// stay vetoed, not resurface just because suppressing it means it rarely
+// gets re-sampled.
 constexpr double kPrefHalfLifeDays = 15.0;
 
 // Session EMA time constant (average over ~this many recent interactions).
 constexpr double kSessionTau = 12.0;
+// Impressions remembered for the boredom signal.
+constexpr int kRecentImpressions = 24;
+
+// Logged signal layout version (see packSignals).
+constexpr int kSignalLayoutVersion = 2;
 
 /// Scoped connection helper (duckdb_connect per call, disconnect on scope exit).
 class DbConnectionGuard {
@@ -183,6 +137,59 @@ class DbConnectionGuard {
    private:
     duckdb_connection m_conn;
 };
+
+// Raw-connection variants for the *Unlocked helpers that receive one.
+bool rawExecute(duckdb_connection conn, const QString& sql) {
+    if (!conn)
+        return false;
+    duckdb_result res{};
+    const QByteArray q = sql.toUtf8();
+    const bool ok = duckdb_query(conn, q.constData(), &res) == DuckDBSuccess;
+    if (!ok)
+        qWarning().noquote() << "FeedDatabase: query failed:" << duckdb_result_error(&res);
+    duckdb_destroy_result(&res);
+    return ok;
+}
+
+bool rawQuery(duckdb_connection conn, const QString& sql, duckdb_result* res) {
+    *res = {};
+    if (!conn)
+        return false;
+    const QByteArray q = sql.toUtf8();
+    if (duckdb_query(conn, q.constData(), res) != DuckDBSuccess) {
+        duckdb_destroy_result(res);
+        return false;
+    }
+    return true;
+}
+
+QString valueString(duckdb_result* res, idx_t col, idx_t row) {
+    char* v = duckdb_value_varchar(res, col, row);
+    if (!v)
+        return {};
+    const QString out = QString::fromUtf8(v);
+    duckdb_free(v);
+    return out;
+}
+
+QList<float> blobToFloats(duckdb_result* res, idx_t col, idx_t row) {
+    QList<float> out;
+    duckdb_blob blob = duckdb_value_blob(res, col, row);
+    if (blob.data && blob.size >= sizeof(float)) {
+        const int count = static_cast<int>(blob.size / sizeof(float));
+        out.resize(count);
+        std::memcpy(out.data(), blob.data, count * sizeof(float));
+    }
+    if (blob.data)
+        duckdb_free(blob.data);
+    return out;
+}
+
+QString floatsToHex(const QList<float>& values) {
+    const QByteArray bytes(reinterpret_cast<const char*>(values.constData()),
+                           static_cast<int>(values.size() * sizeof(float)));
+    return QString::fromLatin1(bytes.toHex());
+}
 
 void normalize(QHash<QString, double>& vec) {
     double norm = 0.0;
@@ -240,6 +247,74 @@ void pruneTagVector(QHash<QString, double>& vec, int limit) {
     vec = pruned;
 }
 
+QStringList contentTagsOf(const QStringList& tags) {
+    QStringList out;
+    for (const QString& raw : tags) {
+        // Tags are stored space-joined; a space inside one would split it.
+        const QString tag = raw.simplified().toLower().replace(QLatin1Char(' '), QLatin1Char('_'));
+        if (tag.isEmpty() || FeedRecommender::isGenericTag(tag))
+            continue;
+        out << tag;
+    }
+    out.removeDuplicates();
+    return out;
+}
+
+// Model label for a reaction: engaged or not, and how much evidence it is.
+bool modelLabel(FeedDatabase::Event kind, double watchSeconds, bool* engaged, double* weight) {
+    switch (kind) {
+        case FeedDatabase::Event::Favorite:
+            *engaged = true;
+            *weight = 1.0;
+            return true;
+        case FeedDatabase::Event::Like:
+            *engaged = true;
+            *weight = 0.8;
+            return true;
+        case FeedDatabase::Event::View:
+            *engaged = true;
+            *weight = watchSeconds >= kLongViewSeconds ? 0.4 : 0.12;
+            return true;
+        case FeedDatabase::Event::Skip:
+            *engaged = false;
+            *weight = watchSeconds < kQuickSkipSeconds ? 0.3 : 0.15;
+            return true;
+        case FeedDatabase::Event::Dislike:
+            *engaged = false;
+            *weight = 1.0;
+            return true;
+        case FeedDatabase::Event::Impression:
+            break;
+    }
+    return false;
+}
+
+// Candidate-arm reward for a reaction to one of its posts.
+bool armReward(FeedDatabase::Event kind, double watchSeconds, double* reward, double* weight) {
+    switch (kind) {
+        case FeedDatabase::Event::Favorite:
+        case FeedDatabase::Event::Like:
+            *reward = 1.0;
+            *weight = 1.0;
+            return true;
+        case FeedDatabase::Event::View:
+            *reward = watchSeconds >= kLongViewSeconds ? 0.7 : 0.4;
+            *weight = 0.5;
+            return true;
+        case FeedDatabase::Event::Skip:
+            *reward = 0.0;
+            *weight = watchSeconds < kQuickSkipSeconds ? 0.6 : 0.4;
+            return true;
+        case FeedDatabase::Event::Dislike:
+            *reward = 0.0;
+            *weight = 1.0;
+            return true;
+        case FeedDatabase::Event::Impression:
+            break;
+    }
+    return false;
+}
+
 }  // namespace
 
 FeedDatabase::~FeedDatabase() { close(); }
@@ -264,8 +339,9 @@ bool FeedDatabase::open(QString* error) {
 
     qDebug().noquote() << "FeedDatabase: opened" << file;
     ensureSchema();
+    migrateLegacy();
     repairSkipPoisonedConfidence();
-    loadUserModel();
+    loadModel();
     return true;
 }
 
@@ -275,12 +351,10 @@ void FeedDatabase::close() {
         // Fold the WAL back into the main file so feed.duckdb does not
         // balloon between sessions.
         {
-            duckdb_connection conn = connectRaw(m_db);
-            if (conn) {
-                duckdb_result res{};
-                if (duckdb_query(conn, "CHECKPOINT", &res) == DuckDBSuccess)
-                    duckdb_destroy_result(&res);
-                duckdb_disconnect(&conn);
+            DbConnectionGuard conn(m_db);
+            if (conn.ok()) {
+                saveModelStateUnlocked(conn.raw());
+                conn.execute(QStringLiteral("CHECKPOINT"));
             }
         }
         duckdb_close(&m_db);
@@ -289,7 +363,7 @@ void FeedDatabase::close() {
 }
 
 void FeedDatabase::ensureSchema() {
-    // Full current layout; no migrations - delete feed.duckdb to rebuild.
+    // Full current layout. Older databases are upgraded in migrateLegacy().
     static const char* kSchema = R"(
         CREATE SEQUENCE IF NOT EXISTS feed_event_seq;
         CREATE TABLE IF NOT EXISTS feed_events (
@@ -304,14 +378,13 @@ void FeedDatabase::ensureSchema() {
         CREATE TABLE IF NOT EXISTS feed_history (
             md5 VARCHAR PRIMARY KEY,
             source_id VARCHAR NOT NULL,
+            remote_id BIGINT,
             shown_at TIMESTAMP DEFAULT now()
         );
         CREATE SEQUENCE IF NOT EXISTS feed_taste_seq;
         CREATE TABLE IF NOT EXISTS feed_tastes (
             id              BIGINT PRIMARY KEY DEFAULT nextval('feed_taste_seq'),
-            visual          BLOB,               -- packed float32 vector (MAIN, CLIP space)
-            visual_dim      INTEGER,            -- vector dimension
-            embedding       VARCHAR,            -- "tag:weight;..." fallback (tag space)
+            embedding       VARCHAR,            -- "tag:weight;..." taste vector
             strength        DOUBLE NOT NULL DEFAULT 0,
             confidence      DOUBLE NOT NULL DEFAULT 0,
             exposure        DOUBLE NOT NULL DEFAULT 0,
@@ -332,14 +405,6 @@ void FeedDatabase::ensureSchema() {
         CREATE TABLE IF NOT EXISTS feed_meta (
             key             VARCHAR PRIMARY KEY,
             value           DOUBLE NOT NULL
-        );
-        CREATE SEQUENCE IF NOT EXISTS feed_neg_anchor_seq;
-        CREATE TABLE IF NOT EXISTS feed_negative_anchors (
-            id              BIGINT PRIMARY KEY DEFAULT nextval('feed_neg_anchor_seq'),
-            visual          BLOB NOT NULL,      -- packed float32 vector
-            visual_dim      INTEGER NOT NULL,
-            strength        DOUBLE NOT NULL DEFAULT 0,
-            last_used       BIGINT NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS feed_linger_stats (
             kind VARCHAR PRIMARY KEY,
@@ -363,15 +428,40 @@ void FeedDatabase::ensureSchema() {
             final_score         DOUBLE,
             candidate_source    VARCHAR,
             rejected_negative   BOOLEAN,
-            features            VARCHAR      -- packed stage-2 model features ("f0 f1 ...")
+            features            VARCHAR,     -- packed heuristic score + signals
+            slot                VARCHAR,     -- 'main' | 'tangent'
+            model_prob          DOUBLE,
+            uncertainty         DOUBLE
         );
-        CREATE TABLE IF NOT EXISTS image_embeddings (
+        CREATE TABLE IF NOT EXISTS feed_model (
+            key             VARCHAR PRIMARY KEY,   -- "t:tag" / "v:3" / "h:taste" / "b"
+            mean            DOUBLE NOT NULL,
+            variance        DOUBLE NOT NULL,
+            positive        DOUBLE NOT NULL DEFAULT 0,
+            negative        DOUBLE NOT NULL DEFAULT 0,
+            updated_at      BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS feed_model_state (
+            id              INTEGER PRIMARY KEY,
+            blob            VARCHAR
+        );
+        CREATE TABLE IF NOT EXISTS feed_arm_stats (
+            arm             VARCHAR PRIMARY KEY,
+            alpha           DOUBLE NOT NULL,
+            beta            DOUBLE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feed_post_tags (
             md5             VARCHAR PRIMARY KEY,
-            embedding       BLOB,               -- packed float32 vector
-            dim             INTEGER,
-            model           VARCHAR,
-            model_version   VARCHAR,
-            created_at      TIMESTAMP NOT NULL DEFAULT now()
+            source_id       VARCHAR,
+            tags            VARCHAR NOT NULL       -- space-separated content tags
+        );
+        CREATE TABLE IF NOT EXISTS feed_visual (
+            md5             VARCHAR PRIMARY KEY,
+            vec             BLOB NOT NULL,         -- packed float32 descriptor
+            version         INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feed_warmstart_done (
+            md5             VARCHAR PRIMARY KEY
         );
     )";
 
@@ -384,6 +474,58 @@ void FeedDatabase::ensureSchema() {
     QString err;
     if (!conn.execute(QString::fromUtf8(kSchema), &err))
         qCritical().noquote() << "FeedDatabase: schema creation failed:" << err;
+}
+
+void FeedDatabase::migrateLegacy() {
+    // Upgrades a pre-learned-model database in place: the ranking log gains
+    // the model columns, and the SigLIP-era visual state is dropped. Tag
+    // tastes, tag preferences and the full event history are kept - the
+    // warm start rebuilds the learned model from them.
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    conn.execute(
+        QStringLiteral("ALTER TABLE feed_recommendations ADD COLUMN IF NOT EXISTS slot VARCHAR"));
+    conn.execute(QStringLiteral(
+        "ALTER TABLE feed_recommendations ADD COLUMN IF NOT EXISTS model_prob DOUBLE"));
+    conn.execute(QStringLiteral(
+        "ALTER TABLE feed_recommendations ADD COLUMN IF NOT EXISTS uncertainty DOUBLE"));
+    // Post-id dedup alongside md5 (rows from before this stay md5-only).
+    conn.execute(
+        QStringLiteral("ALTER TABLE feed_history ADD COLUMN IF NOT EXISTS remote_id BIGINT"));
+
+    duckdb_result res{};
+    bool done = false;
+    if (conn.query(QStringLiteral("SELECT value FROM feed_meta WHERE key = 'schema_v2'"), &res)) {
+        done = duckdb_row_count(&res) > 0;
+        duckdb_destroy_result(&res);
+    }
+    if (done)
+        return;
+
+    // Visual-only tastes have no tag vector, so nothing can query them now.
+    // ALTER on a missing column is harmless (logged and ignored).
+    bool hasVisualColumn = false;
+    if (conn.query(QStringLiteral("SELECT 1 FROM information_schema.columns WHERE "
+                                  "table_name = 'feed_tastes' AND column_name = 'visual'"),
+                   &res)) {
+        hasVisualColumn = duckdb_row_count(&res) > 0;
+        duckdb_destroy_result(&res);
+    }
+    if (hasVisualColumn) {
+        conn.execute(
+            QStringLiteral("DELETE FROM feed_tastes WHERE embedding IS NULL OR embedding = ''"));
+        conn.execute(QStringLiteral("ALTER TABLE feed_tastes DROP COLUMN visual"));
+        conn.execute(QStringLiteral("ALTER TABLE feed_tastes DROP COLUMN visual_dim"));
+    }
+    conn.execute(QStringLiteral("DROP TABLE IF EXISTS image_embeddings"));
+    conn.execute(QStringLiteral("DROP TABLE IF EXISTS feed_negative_anchors"));
+    conn.execute(QStringLiteral("DROP SEQUENCE IF EXISTS feed_neg_anchor_seq"));
+    conn.execute(QStringLiteral("DROP TABLE IF EXISTS feed_user_model"));
+    conn.execute(
+        QStringLiteral("INSERT INTO feed_meta(key, value) VALUES ('schema_v2', 1) "
+                       "ON CONFLICT (key) DO UPDATE SET value = 1"));
+    qInfo().noquote() << "FeedDatabase: migrated to the learned-model schema";
 }
 
 void FeedDatabase::repairSkipPoisonedConfidence() {
@@ -435,20 +577,26 @@ QString FeedDatabase::eventName(Event e) {
     return QStringLiteral("unknown");
 }
 
+bool FeedDatabase::eventFromName(const QString& name, Event* out) {
+    for (Event e : {Event::Impression, Event::View, Event::Skip, Event::Like, Event::Favorite,
+                    Event::Dislike}) {
+        if (eventName(e) == name) {
+            *out = e;
+            return true;
+        }
+    }
+    return false;
+}
+
 void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QString& md5,
-                               const QStringList& tags, double watchSeconds, int position) {
+                               const QStringList& tags, double watchSeconds, int position,
+                               qint64 remoteId) {
     if (!m_db || md5.isEmpty())
         return;
 
     // Content tags only. Generic filtering is mechanical; near-universal
     // content tags are handled by self-learned specificity weighting below.
-    QStringList contentTags;
-    for (const QString& raw : tags) {
-        const QString tag = raw.trimmed().toLower();
-        if (tag.isEmpty() || FeedRecommender::isGenericTag(tag))
-            continue;
-        contentTags << tag;
-    }
+    const QStringList contentTags = contentTagsOf(tags);
 
     QWriteLocker lock(&s_lock);
     DbConnectionGuard conn(m_db);
@@ -463,11 +611,18 @@ void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QStrin
                      .arg(position)
                      .arg(watchSeconds, 0, 'f', 2));
 
-    // Shown-history for dedup.
+    // How this post was ranked: the model trains on the logged signals, the
+    // arm bandit credits the arm that found it, tangent slots get promoted.
+    const RecommendationRow logged = recommendationForUnlocked(conn.raw(), md5);
+    const bool fromTangent = logged.slot == QLatin1String("tangent") ||
+                             logged.candidateSource == QLatin1String("tangent");
+
     if (kind == Event::Impression) {
-        conn.execute(QStringLiteral("INSERT INTO feed_history(md5, source_id) VALUES (%1, %2) "
-                                    "ON CONFLICT (md5) DO NOTHING")
-                         .arg(quoted(md5), quoted(sourceId)));
+        // Shown-history for dedup.
+        conn.execute(QStringLiteral("INSERT INTO feed_history(md5, source_id, remote_id) "
+                                    "VALUES (%1, %2, %3) ON CONFLICT (md5) DO NOTHING")
+                         .arg(quoted(md5), quoted(sourceId))
+                         .arg(remoteId > 0 ? QString::number(remoteId) : QStringLiteral("NULL")));
         // Document-frequency bookkeeping from impressions only - immune to
         // dislike pollution, and lets the model learn near-universal tags
         // without a hardcoded list.
@@ -478,17 +633,17 @@ void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QStrin
                     "ON CONFLICT (tag) DO UPDATE SET doc_count = feed_tag_stats.doc_count + 1")
                     .arg(quoted(tag)));
         }
-        conn.execute(
-            QStringLiteral("INSERT INTO feed_meta(key, value) VALUES ('total_impressions', 1) "
-                           "ON CONFLICT (key) DO UPDATE SET value = feed_meta.value + 1"));
+        bumpMetaUnlocked(conn.raw(), QStringLiteral("total_impressions"), 1.0);
+        if (fromTangent)
+            bumpMetaUnlocked(conn.raw(), QStringLiteral("tangent_shown"), 1.0);
         // Prune history and raw events so the DB stays bounded.
         conn.execute(
             QStringLiteral("DELETE FROM feed_history WHERE md5 IN (SELECT md5 FROM feed_history "
                            "ORDER BY shown_at DESC OFFSET %1)")
                 .arg(kNoRepeatWindow));
-        // Prune raw events too: impressions dominate and are pure bookkeeping
-        // (no taste signal), so keep only a bounded recent window. Non-
-        // impression events are tiny but also bounded for the same reason.
+        // Impressions dominate and are pure bookkeeping (no taste signal),
+        // so keep only a bounded recent window. Non-impression events are
+        // tiny but also bounded for the same reason.
         conn.execute(
             QStringLiteral("DELETE FROM feed_events WHERE event_type = 'impression' AND id IN "
                            "(SELECT id FROM feed_events WHERE event_type = 'impression' "
@@ -499,58 +654,47 @@ void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QStrin
                            "(SELECT id FROM feed_events WHERE event_type != 'impression' "
                            "ORDER BY id DESC OFFSET %1)")
                 .arg(kMaxInteractionEvents));
+
+        m_recentImpressionTags.prepend(contentTags);
+        while (m_recentImpressionTags.size() > kRecentImpressions)
+            m_recentImpressionTags.removeLast();
+    } else {
+        // Reacted-to posts keep their tags so the model can be rebuilt
+        // from history later.
+        storePostTagsUnlocked(conn.raw(), md5, sourceId, contentTags);
     }
 
     // taste updates
-    // Only positive events update tastes; visual-space when an embedding
-    // exists, tag vector as fallback. Uses UNLOCKED helpers (write lock
-    // already held, QReadWriteLock is non-recursive).
-    const QByteArray visual = embeddingForUnlocked(md5);
+    // Only positive events grow tastes. A liked tangent is promoted: it
+    // counts double and founds its own taste unless it clearly belongs to
+    // an existing one.
     switch (kind) {
         case Event::Favorite:
-            if (!visual.isEmpty())
-                updateTastesOnPositiveVisual(visual, kWeightFavorite);
-            else
-                updateTastesOnPositive(contentTags, kWeightFavorite);
+        case Event::Like: {
+            double w = kind == Event::Favorite ? kWeightFavorite : kWeightLike;
+            double threshold = kNewTasteThreshold;
+            if (fromTangent) {
+                w *= kTangentPromotion;
+                threshold = kTangentTasteThreshold;
+                bumpMetaUnlocked(conn.raw(), QStringLiteral("tangent_hits"), 1.0);
+            }
+            updateTastesOnPositive(contentTags, w, threshold);
             break;
-        case Event::Like:
-            if (!visual.isEmpty())
-                updateTastesOnPositiveVisual(visual, kWeightLike);
-            else
-                updateTastesOnPositive(contentTags, kWeightLike);
-            break;
+        }
         case Event::View: {
             const double w = watchSeconds >= kLongViewSeconds ? kWeightLongView : kWeightNormalView;
-            if (!visual.isEmpty())
-                updateTastesOnPositiveVisual(visual, w);
-            else
-                updateTastesOnPositive(contentTags, w);
+            updateTastesOnPositive(contentTags, w, kNewTasteThreshold);
             break;
         }
         case Event::Dislike:
-            if (!visual.isEmpty()) {
-                updateTastesOnNegativeVisual(visual, 1.0);
-                // Negative visual anchors: only when the dislike does not
-                // strongly match an existing positive taste (otherwise it's
-                // a specific instance, and tag negatives cover it).
-                double bestPositiveSim = 0.0;
-                for (const Taste& t : tastesUnlocked()) {
-                    if (t.visual.isEmpty())
-                        continue;
-                    bestPositiveSim = qMax(bestPositiveSim, similarityVisual(t.visual, visual));
-                }
-                if (bestPositiveSim < 0.35)
-                    updateNegativeAnchors(visual, 1.0);
-            } else {
-                updateTastesOnNegative(contentTags, 1.0);
-            }
+            updateTastesOnNegative(contentTags, 1.0);
             break;
         case Event::Skip:
         case Event::Impression:
             break;
     }
 
-    // tag preferences
+    // tag preferences (heuristic scorer + hard-negative filter)
     // Explicit dislikes move far more than skips; positives accumulate.
     double prefDelta = 0.0;
     switch (kind) {
@@ -664,64 +808,64 @@ void FeedDatabase::recordEvent(Event kind, const QString& sourceId, const QStrin
         }
     }
 
-    // stage-2 user model
-    if (kind != Event::Impression) {
-        double label = 0.0;
-        double sampleWeight = 0.0;
-        switch (kind) {
-            case Event::Favorite:
-                label = 1.0;
-                sampleWeight = 1.0;
-                break;
-            case Event::Like:
-                label = 1.0;
-                sampleWeight = 0.7;
-                break;
-            case Event::View:
-                label = 1.0;
-                sampleWeight = watchSeconds >= kLongViewSeconds ? 0.4 : 0.15;
-                break;
-            case Event::Skip:
-                label = 0.0;
-                sampleWeight = watchSeconds < kQuickSkipSeconds ? 0.3 : 0.1;
-                break;
-            case Event::Dislike:
-                label = 0.0;
-                sampleWeight = 1.0;
-                break;
-            case Event::Impression:
-                break;  // unreachable (guarded above)
-        }
-        if (sampleWeight > 0.0) {
-            const QString featuresStr = rankedFeaturesForUnlocked(conn.raw(), md5);
-            if (!featuresStr.isEmpty()) {
-                double features[UserModel::kFeatureCount] = {};
-                bool ok = true;
-                int idx = 0;
-                for (const QString& tok : featuresStr.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
-                    if (idx >= UserModel::kFeatureCount) {
-                        ok = false;
-                        break;
-                    }
-                    bool numOk = false;
-                    const double v = tok.toDouble(&numOk);
-                    if (!numOk) {
-                        ok = false;
-                        break;
-                    }
-                    features[idx++] = v;
-                }
-                if (ok && idx == UserModel::kFeatureCount)
-                    m_userModel.train(features, label, sampleWeight);
-            }
-        }
+    if (kind == Event::Impression)
+        return;
+
+    // learned model
+    trainModelUnlocked(conn.raw(), md5, contentTags, kind, watchSeconds,
+                       logged.md5.isEmpty() ? nullptr : &logged, true);
+
+    // candidate-arm bandit: credit the arm whose query found this post
+    double reward = 0.0, rewardWeight = 0.0;
+    if (!logged.candidateSource.isEmpty() &&
+        armReward(kind, watchSeconds, &reward, &rewardWeight)) {
+        m_arms.observe(logged.candidateSource, reward, rewardWeight);
+        saveArmUnlocked(conn.raw(), logged.candidateSource);
     }
-    saveUserModelUnlocked();
 }
 
-bool FeedDatabase::wasShown(const QString& md5) const {
+void FeedDatabase::trainModelUnlocked(duckdb_connection conn, const QString& md5,
+                                      const QStringList& contentTags, Event kind,
+                                      double watchSeconds, const RecommendationRow* logged,
+                                      bool updateBias) {
+    bool engaged = false;
+    double weight = 0.0;
+    if (!modelLabel(kind, watchSeconds, &engaged, &weight))
+        return;
+
+    const QList<double> visual = m_model.standardizeVisual(visualForUnlocked(conn, md5));
+    double signalValues[kSignalCount] = {};
+    double heuristicScore = 0.0;
+    const bool hasSignals =
+        logged && unpackSignals(logged->features, &heuristicScore, signalValues);
+    const FeatureVector x =
+        buildModelFeatures(contentTags, visual, hasSignals ? signalValues : nullptr);
+
+    // Progressive validation: both scorers predict this reaction BEFORE
+    // learning from it. Only live, ranked posts count - their heuristic
+    // score is known.
+    if (hasSignals) {
+        const double modelProb = m_model.predict(x);
+        const double heuristicProb = m_model.heuristicProbability(heuristicScore);
+        m_model.recordValidation(modelProb, heuristicProb, engaged, weight);
+        m_model.trainHeuristicCalibration(heuristicScore, engaged, weight);
+    }
+
+    QStringList touched;
+    m_model.train(x, engaged, weight, &touched, updateBias);
+    saveBeliefsUnlocked(conn, touched);
+    saveModelStateUnlocked(conn);
+}
+
+bool FeedDatabase::wasShown(const QString& md5, const QString& sourceId, qint64 remoteId) const {
     if (!m_db || md5.isEmpty())
         return false;
+
+    QString match = QStringLiteral("md5 = %1").arg(quoted(md5));
+    if (remoteId > 0 && !sourceId.isEmpty())
+        match += QStringLiteral(" OR (source_id = %1 AND remote_id = %2)")
+                     .arg(quoted(sourceId))
+                     .arg(remoteId);
 
     QReadLocker lock(&s_lock);
     DbConnectionGuard conn(m_db);
@@ -730,15 +874,95 @@ bool FeedDatabase::wasShown(const QString& md5) const {
 
     duckdb_result res{};
     if (!conn.query(
-            QStringLiteral("SELECT 1 FROM (SELECT md5 FROM feed_history ORDER BY shown_at DESC "
-                           "LIMIT %1) WHERE md5 = %2")
+            QStringLiteral("SELECT 1 FROM (SELECT md5, source_id, remote_id FROM feed_history "
+                           "ORDER BY shown_at DESC LIMIT %1) WHERE %2 LIMIT 1")
                 .arg(kNoRepeatWindow)
-                .arg(quoted(md5)),
+                .arg(match),
             &res))
         return false;
     const bool shown = duckdb_row_count(&res) > 0;
     duckdb_destroy_result(&res);
     return shown;
+}
+
+// visual descriptors
+
+bool FeedDatabase::hasVisual(const QString& md5) const { return !visualFor(md5).isEmpty(); }
+
+QList<float> FeedDatabase::visualFor(const QString& md5) const {
+    if (!m_db || md5.isEmpty())
+        return {};
+    QReadLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return {};
+    return visualForUnlocked(conn.raw(), md5);
+}
+
+QList<float> FeedDatabase::visualForUnlocked(duckdb_connection conn, const QString& md5) const {
+    QList<float> out;
+    duckdb_result res{};
+    if (!rawQuery(conn,
+                  QStringLiteral("SELECT vec FROM feed_visual WHERE md5 = %1 AND version = %2")
+                      .arg(quoted(md5))
+                      .arg(VisualFeatures::kVersion),
+                  &res))
+        return out;
+    if (duckdb_row_count(&res) > 0)
+        out = blobToFloats(&res, 0, 0);
+    duckdb_destroy_result(&res);
+    return out;
+}
+
+QHash<QString, QList<float>> FeedDatabase::visualsFor(const QStringList& md5s) const {
+    QHash<QString, QList<float>> out;
+    if (!m_db || md5s.isEmpty())
+        return out;
+    QReadLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return out;
+    constexpr int kChunk = 200;
+    for (int start = 0; start < md5s.size(); start += kChunk) {
+        QStringList quotedIds;
+        for (const QString& md5 : md5s.mid(start, kChunk))
+            if (!md5.isEmpty())
+                quotedIds << quoted(md5);
+        if (quotedIds.isEmpty())
+            continue;
+        duckdb_result res{};
+        if (!conn.query(QStringLiteral("SELECT md5, vec FROM feed_visual WHERE version = %1 AND "
+                                       "md5 IN (%2)")
+                            .arg(VisualFeatures::kVersion)
+                            .arg(quotedIds.join(QLatin1Char(','))),
+                        &res))
+            continue;
+        for (idx_t row = 0; row < duckdb_row_count(&res); ++row)
+            out.insert(valueString(&res, 0, row), blobToFloats(&res, 1, row));
+        duckdb_destroy_result(&res);
+    }
+    return out;
+}
+
+void FeedDatabase::storeVisual(const QString& md5, const QList<float>& raw) {
+    if (!m_db || md5.isEmpty() || raw.isEmpty())
+        return;
+    QWriteLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    conn.execute(QStringLiteral("INSERT INTO feed_visual(md5, vec, version) VALUES (%1, "
+                                "unhex('%2'), %3) ON CONFLICT (md5) DO UPDATE SET "
+                                "vec = unhex('%2'), version = %3")
+                     .arg(quoted(md5), floatsToHex(raw))
+                     .arg(VisualFeatures::kVersion));
+    m_model.observeVisual(raw);
+    // Standardization stats change slowly; persisting every descriptor
+    // would be wasted writes.
+    if (++m_visualSinceSave >= 25) {
+        m_visualSinceSave = 0;
+        saveModelStateUnlocked(conn.raw());
+    }
 }
 
 // tastes
@@ -758,36 +982,29 @@ QList<FeedDatabase::Taste> FeedDatabase::tastesUnlocked() const {
         return out;
 
     duckdb_result res{};
-    if (!conn.query(QStringLiteral("SELECT id, visual, embedding, strength, confidence, exposure, "
+    if (!conn.query(QStringLiteral("SELECT id, embedding, strength, confidence, exposure, "
                                    "engagement, last_used, created_at FROM feed_tastes"),
                     &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
         Taste t;
         t.id = duckdb_value_int64(&res, 0, row);
-        duckdb_blob visBlob = duckdb_value_blob(&res, 1, row);
-        if (visBlob.data && visBlob.size > 0)
-            t.visual =
-                QByteArray(static_cast<const char*>(visBlob.data), static_cast<int>(visBlob.size));
-        char* emb = duckdb_value_varchar(&res, 2, row);
-        if (emb) {
-            const QString blob = QString::fromUtf8(emb);
-            duckdb_free(emb);
-            const QStringList pairs = blob.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-            for (const QString& pair : pairs) {
-                const int colon = pair.indexOf(QLatin1Char(':'));
-                if (colon <= 0)
-                    continue;
-                t.embedding[pair.left(colon)] = pair.mid(colon + 1).toDouble();
-            }
+        const QStringList pairs =
+            valueString(&res, 1, row).split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        for (const QString& pair : pairs) {
+            const int colon = pair.indexOf(QLatin1Char(':'));
+            if (colon <= 0)
+                continue;
+            t.embedding[pair.left(colon)] = pair.mid(colon + 1).toDouble();
         }
-        t.strength = duckdb_value_double(&res, 3, row);
-        t.confidence = duckdb_value_double(&res, 4, row);
-        t.exposure = duckdb_value_double(&res, 5, row);
-        t.engagement = duckdb_value_double(&res, 6, row);
-        t.lastUsedMs = duckdb_value_int64(&res, 7, row);
-        t.createdAtMs = duckdb_value_int64(&res, 8, row);
-        out.append(t);
+        t.strength = duckdb_value_double(&res, 2, row);
+        t.confidence = duckdb_value_double(&res, 3, row);
+        t.exposure = duckdb_value_double(&res, 4, row);
+        t.engagement = duckdb_value_double(&res, 5, row);
+        t.lastUsedMs = duckdb_value_int64(&res, 6, row);
+        t.createdAtMs = duckdb_value_int64(&res, 7, row);
+        if (!t.embedding.isEmpty())
+            out.append(t);
     }
     duckdb_destroy_result(&res);
 
@@ -810,109 +1027,12 @@ double FeedDatabase::similarity(const QHash<QString, double>& tasteEmbedding,
     return dot;  // both vectors are unit length
 }
 
-double FeedDatabase::similarityVisual(const QByteArray& tasteVisual,
-                                      const QByteArray& imageVisual) {
-    return EmbeddingBackend::cosineSimilarity(tasteVisual, imageVisual);
-}
-
-void FeedDatabase::updateTastesOnPositiveVisual(const QByteArray& imageVisual, double weight) {
-    if (!m_db || imageVisual.isEmpty() || weight <= 0.0)
+void FeedDatabase::updateTastesOnPositive(const QStringList& tags, double weight,
+                                          double newTasteThreshold) {
+    if (!m_db || tags.size() < kMinTasteTags || weight <= 0.0)
         return;
 
     QList<Taste> all = tastesUnlocked();
-
-    qint64 bestId = 0;
-    double bestSim = 0.0;
-    for (const Taste& t : all) {
-        if (t.visual.isEmpty())
-            continue;
-        const double sim = similarityVisual(t.visual, imageVisual);
-        if (sim > bestSim) {
-            bestSim = sim;
-            bestId = t.id;
-        }
-    }
-
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-
-    if (bestId == 0 || bestSim < kNewTasteThreshold) {
-        if (all.size() >= kMaxTastes) {
-            const Taste& weakest = all.last();
-            if (weakest.strength > weight)
-                return;
-            bestId = weakest.id;
-        } else {
-            createTasteVisual(imageVisual, weight, nowMs);
-            return;
-        }
-    }
-
-    // taste = normalize(taste + lr * weight * image)
-    QByteArray bestVisual;
-    double strength = 0.0, confidence = 0.0, engagement = 0.0;
-    for (const Taste& t : all) {
-        if (t.id == bestId) {
-            bestVisual = t.visual;
-            strength = t.strength;
-            confidence = t.confidence;
-            engagement = t.engagement;
-            break;
-        }
-    }
-    if (bestVisual.isEmpty()) {
-        createTasteVisual(imageVisual, weight, nowMs);
-        return;
-    }
-
-    const int dim = bestVisual.size() / static_cast<int>(sizeof(float));
-    const int imgDim = imageVisual.size() / static_cast<int>(sizeof(float));
-    if (dim != imgDim || dim <= 0)
-        return;  // model changed
-
-    const float* imgPtr = reinterpret_cast<const float*>(imageVisual.constData());
-    float* tastePtr = reinterpret_cast<float*>(bestVisual.data());
-    const double lr = tastePullRate(confidence);
-    double norm = 0.0;
-    for (int i = 0; i < dim; ++i) {
-        tastePtr[i] += static_cast<float>(lr * weight * imgPtr[i]);
-        norm += double(tastePtr[i]) * tastePtr[i];
-    }
-    norm = std::sqrt(norm);
-    if (norm > 1e-9) {
-        for (int i = 0; i < dim; ++i) tastePtr[i] = static_cast<float>(tastePtr[i] / norm);
-    }
-
-    // Strength grows gradually, damped by confidence ramp and ceiling.
-    const double ramp = confidence / (confidence + kConfidenceRamp);
-    strength += dampedGrowth(weight * (0.3 + 0.7 * ramp), strength);
-    confidence += weight;
-    engagement = engagement * 0.9 + weight * 0.1;
-
-    writeTasteVisual(bestId, bestVisual, strength, confidence, engagement, nowMs);
-}
-
-void FeedDatabase::updateTastesOnNegativeVisual(const QByteArray& imageVisual, double weight) {
-    if (!m_db || imageVisual.isEmpty())
-        return;
-
-    for (const Taste& t : tastesUnlocked()) {
-        if (t.visual.isEmpty())
-            continue;
-        const double sim = similarityVisual(t.visual, imageVisual);
-        if (sim > 0.2) {
-            const double newStrength = qMax(0.0, t.strength - weight * sim * 0.5);
-            writeTasteStrength(t.id, newStrength);
-        }
-    }
-}
-
-void FeedDatabase::updateTastesOnPositive(const QStringList& tags, double weight) {
-    if (!m_db || tags.isEmpty() || weight <= 0.0)
-        return;
-
-    QList<Taste> all = tastesUnlocked();
-    if (contentTagsTooFew(tags))
-        return;
 
     qint64 bestId = 0;
     double bestSim = 0.0;
@@ -926,16 +1046,20 @@ void FeedDatabase::updateTastesOnPositive(const QStringList& tags, double weight
 
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
-    if (bestId == 0 || bestSim < kNewTasteThreshold) {
+    if (bestId == 0 || bestSim < newTasteThreshold) {
         if (all.size() >= kMaxTastes) {
             const Taste& weakest = all.last();
             if (weakest.strength > weight)
                 return;  // keep existing tastes; this signal is too weak
-            bestId = weakest.id;
-        } else {
-            createTaste(tags, weight, nowMs);
-            return;
+            // Replace the weakest taste outright. Merging the new interest
+            // into an unrelated taste would let tag pruning discard it.
+            DbConnectionGuard conn(m_db);
+            if (conn.ok())
+                conn.execute(
+                    QStringLiteral("DELETE FROM feed_tastes WHERE id = %1").arg(weakest.id));
         }
+        createTaste(tags, weight, nowMs);
+        return;
     }
 
     // Pull the taste toward the image; mature tastes move slowly.
@@ -991,19 +1115,6 @@ void FeedDatabase::recordTasteExposure(qint64 tasteId, double amount) {
                      .arg(amount, 0, 'f', 4));
 }
 
-void FeedDatabase::recordTasteEngagement(qint64 tasteId, double weight) {
-    if (!m_db || tasteId <= 0)
-        return;
-    QWriteLocker lock(&s_lock);
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-    conn.execute(QStringLiteral("UPDATE feed_tastes SET engagement = engagement * 0.9 + %2 * 0.1 "
-                                "WHERE id = %1")
-                     .arg(tasteId)
-                     .arg(weight, 0, 'f', 4));
-}
-
 void FeedDatabase::decayTastes() {
     if (!m_db)
         return;
@@ -1030,7 +1141,6 @@ void FeedDatabase::decayTastes() {
     }
     duckdb_destroy_result(&res);
 
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     for (const Row& r : rows) {
         const double strengthDecay =
             r.lastUsed > 0 ? decayFactor(r.lastUsed, kTasteHalfLifeDays) : 1.0;
@@ -1049,169 +1159,12 @@ void FeedDatabase::decayTastes() {
     // new taste; otherwise a stale taste blocks kMaxTastes forever.
     conn.execute(QStringLiteral("DELETE FROM feed_tastes WHERE strength < %1")
                      .arg(kTasteRetireStrength, 0, 'f', 4));
-    Q_UNUSED(nowMs);
-}
-
-// negative visual anchors
-
-QList<FeedDatabase::NegativeAnchor> FeedDatabase::negativeAnchors() const {
-    QList<NegativeAnchor> out;
-    if (!m_db)
-        return out;
-    QReadLocker lock(&s_lock);
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return out;
-    duckdb_result res{};
-    if (!conn.query(
-            QStringLiteral("SELECT id, visual, strength, last_used FROM feed_negative_anchors"),
-            &res))
-        return out;
-    for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        NegativeAnchor a;
-        a.id = duckdb_value_int64(&res, 0, row);
-        duckdb_blob blob = duckdb_value_blob(&res, 1, row);
-        if (blob.data && blob.size > 0)
-            a.visual = QByteArray(static_cast<const char*>(blob.data), static_cast<int>(blob.size));
-        a.strength = duckdb_value_double(&res, 2, row);
-        a.lastUsedMs = duckdb_value_int64(&res, 3, row);
-        out.append(a);
-    }
-    duckdb_destroy_result(&res);
-    return out;
-}
-
-void FeedDatabase::updateNegativeAnchors(const QByteArray& imageVisual, double weight) {
-    if (!m_db || imageVisual.isEmpty())
-        return;
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-
-    duckdb_result res{};
-    qint64 bestId = 0;
-    double bestSim = 0.0;
-    if (conn.query(QStringLiteral("SELECT id, visual, strength FROM feed_negative_anchors"),
-                   &res)) {
-        for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-            duckdb_blob blob = duckdb_value_blob(&res, 1, row);
-            if (!blob.data || blob.size == 0)
-                continue;
-            const QByteArray vec(static_cast<const char*>(blob.data), static_cast<int>(blob.size));
-            const double sim = similarityVisual(vec, imageVisual);
-            if (sim > bestSim) {
-                bestSim = sim;
-                bestId = duckdb_value_int64(&res, 0, row);
-            }
-        }
-        duckdb_destroy_result(&res);
-    }
-
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    constexpr double kAnchorFitThreshold = 0.55;
-    constexpr int kMaxAnchors = 8;
-
-    if (bestId != 0 && bestSim >= kAnchorFitThreshold) {
-        conn.execute(QStringLiteral("UPDATE feed_negative_anchors SET strength = strength + %2, "
-                                    "last_used = %3 WHERE id = %1")
-                         .arg(bestId)
-                         .arg(weight, 0, 'f', 6)
-                         .arg(nowMs));
-        return;
-    }
-
-    // Once full, replace the weakest anchor when the new evidence is not
-    // a one-off.
-    duckdb_result countRes{};
-    qint64 count = 0;
-    if (conn.query(QStringLiteral("SELECT count(*) FROM feed_negative_anchors"), &countRes)) {
-        if (duckdb_row_count(&countRes) > 0)
-            count = duckdb_value_int64(&countRes, 0, 0);
-        duckdb_destroy_result(&countRes);
-    }
-    if (count >= kMaxAnchors) {
-        duckdb_result weakRes{};
-        if (conn.query(
-                QStringLiteral(
-                    "SELECT id, strength FROM feed_negative_anchors ORDER BY strength ASC LIMIT 1"),
-                &weakRes)) {
-            if (duckdb_row_count(&weakRes) > 0) {
-                const qint64 weakId = duckdb_value_int64(&weakRes, 0, 0);
-                const double weakStrength = duckdb_value_double(&weakRes, 1, 0);
-                duckdb_destroy_result(&weakRes);
-                if (weight < weakStrength)
-                    return;
-                conn.execute(
-                    QStringLiteral("DELETE FROM feed_negative_anchors WHERE id = %1").arg(weakId));
-            } else {
-                duckdb_destroy_result(&weakRes);
-            }
-        }
-    }
-
-    const QString hex = QString::fromLatin1(imageVisual.toHex());
-    conn.execute(QStringLiteral("INSERT INTO feed_negative_anchors(visual, visual_dim, strength, "
-                                "last_used) VALUES (unhex('%1'), %2, %3, %4)")
-                     .arg(hex)
-                     .arg(imageVisual.size() / static_cast<int>(sizeof(float)))
-                     .arg(weight, 0, 'f', 6)
-                     .arg(nowMs));
-}
-
-double FeedDatabase::maxNegativeAnchorSimilarity(const QByteArray& imageVisual) const {
-    if (imageVisual.isEmpty())
-        return 0.0;
-    double best = 0.0;
-    for (const NegativeAnchor& a : negativeAnchors()) {
-        if (a.visual.isEmpty())
-            continue;
-        best = qMax(best, similarityVisual(a.visual, imageVisual));
-    }
-    return best;
 }
 
 // tag specificity
 
-void FeedDatabase::recordTagDocFrequency(const QStringList& tags) {
-    // Kept for API symmetry / potential external callers; recordEvent()
-    // already does this inline for impressions to avoid a second
-    // lock+connect round trip.
-    if (!m_db || tags.isEmpty())
-        return;
-    QWriteLocker lock(&s_lock);
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-    for (const QString& raw : tags) {
-        const QString tag = raw.trimmed().toLower();
-        if (tag.isEmpty())
-            continue;
-        conn.execute(QStringLiteral(
-                         "INSERT INTO feed_tag_stats(tag, doc_count) VALUES (%1, 1) "
-                         "ON CONFLICT (tag) DO UPDATE SET doc_count = feed_tag_stats.doc_count + 1")
-                         .arg(quoted(tag)));
-    }
-    conn.execute(
-        QStringLiteral("INSERT INTO feed_meta(key, value) VALUES ('total_impressions', 1) "
-                       "ON CONFLICT (key) DO UPDATE SET value = feed_meta.value + 1"));
-}
-
 double FeedDatabase::totalImpressions() const {
-    if (!m_db)
-        return 0.0;
-    QReadLocker lock(&s_lock);
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return 0.0;
-    duckdb_result res{};
-    if (!conn.query(QStringLiteral("SELECT value FROM feed_meta WHERE key = 'total_impressions'"),
-                    &res))
-        return 0.0;
-    double v = 0.0;
-    if (duckdb_row_count(&res) > 0)
-        v = duckdb_value_double(&res, 0, 0);
-    duckdb_destroy_result(&res);
-    return v;
+    return metaValue(QStringLiteral("total_impressions"));
 }
 
 QHash<QString, double> FeedDatabase::tagSpecificities() const {
@@ -1233,12 +1186,9 @@ QHash<QString, double> FeedDatabase::tagSpecificitiesUnlocked(duckdb_connection 
     double total = 0.0;
     {
         duckdb_result res{};
-        if (duckdb_query(conn,
-                         QStringLiteral("SELECT value FROM feed_meta WHERE key = "
-                                        "'total_impressions'")
-                             .toUtf8()
-                             .constData(),
-                         &res) == DuckDBSuccess) {
+        if (rawQuery(conn,
+                     QStringLiteral("SELECT value FROM feed_meta WHERE key = 'total_impressions'"),
+                     &res)) {
             if (duckdb_row_count(&res) > 0)
                 total = duckdb_value_double(&res, 0, 0);
             duckdb_destroy_result(&res);
@@ -1253,100 +1203,396 @@ QHash<QString, double> FeedDatabase::tagSpecificitiesUnlocked(duckdb_connection 
     constexpr double kMinDocSamples = 5.0;
 
     duckdb_result res{};
-    if (duckdb_query(
-            conn, QStringLiteral("SELECT tag, doc_count FROM feed_tag_stats").toUtf8().constData(),
-            &res) != DuckDBSuccess)
+    if (!rawQuery(conn, QStringLiteral("SELECT tag, doc_count FROM feed_tag_stats"), &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* tagPtr = duckdb_value_varchar(&res, 0, row);
-        if (!tagPtr)
+        const QString tag = valueString(&res, 0, row);
+        if (tag.isEmpty())
             continue;
-        const QString tag = QString::fromUtf8(tagPtr);
-        duckdb_free(tagPtr);
         const double docCount = static_cast<double>(duckdb_value_int64(&res, 1, row));
         if (docCount < kMinDocSamples)
             continue;
         // Classic IDF, squashed to [0,1]: a tag on 100% of impressions ->
-        // 0 specificity; a tag on a tiny fraction -> close to 1. log-based
-        // so the curve is generous in the middle (most tags aren't at
-        // either extreme) instead of collapsing everything below 50%.
+        // 0 specificity; a tag on a tiny fraction -> close to 1.
         const double freq = qBound(1e-6, docCount / total, 1.0);
         const double idf = -std::log2(freq);
-        // Normalize against a reasonable ceiling (a tag seen once in 1000
-        // impressions maxes out at idf ~10) instead of letting rare tags
-        // blow past 1.0 and dominate everything.
         out.insert(tag, qBound(0.0, idf / 10.0, 1.0));
     }
     duckdb_destroy_result(&res);
     return out;
 }
 
-// learned user model
+// learned model
 
-void FeedDatabase::loadUserModel() {
-    // NOTE: called from open() which already holds the write lock.
+void FeedDatabase::loadModel() {
+    // Called from open() which already holds the write lock.
     DbConnectionGuard conn(m_db);
     if (!conn.ok())
         return;
-    // Tiny side table: feed_meta.value is DOUBLE and cannot hold the
-    // serialized model text.
-    conn.execute(
-        QStringLiteral("CREATE TABLE IF NOT EXISTS feed_user_model ("
-                       "id INTEGER PRIMARY KEY DEFAULT 0, blob VARCHAR)"));
     duckdb_result res{};
-    if (conn.query(QStringLiteral("SELECT blob FROM feed_user_model WHERE id = 0"), &res)) {
-        if (duckdb_row_count(&res) > 0) {
-            char* txt = duckdb_value_varchar(&res, 0, 0);
-            if (txt) {
-                m_userModel.deserialize(QByteArray(txt));
-                duckdb_free(txt);
-            }
+    if (conn.query(QStringLiteral("SELECT blob FROM feed_model_state WHERE id = 0"), &res)) {
+        if (duckdb_row_count(&res) > 0)
+            m_model.deserializeState(valueString(&res, 0, 0).toUtf8());
+        duckdb_destroy_result(&res);
+    }
+    if (conn.query(QStringLiteral("SELECT key, mean, variance, positive, negative, updated_at "
+                                  "FROM feed_model"),
+                   &res)) {
+        for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
+            FeedModel::Belief b;
+            b.mean = duckdb_value_double(&res, 1, row);
+            b.variance = duckdb_value_double(&res, 2, row);
+            b.positive = duckdb_value_double(&res, 3, row);
+            b.negative = duckdb_value_double(&res, 4, row);
+            b.updatedMs = duckdb_value_int64(&res, 5, row);
+            m_model.setBelief(valueString(&res, 0, row), b);
         }
         duckdb_destroy_result(&res);
     }
+    if (conn.query(QStringLiteral("SELECT arm, alpha, beta FROM feed_arm_stats"), &res)) {
+        for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
+            ArmBandit::Arm a;
+            a.alpha = duckdb_value_double(&res, 1, row);
+            a.beta = duckdb_value_double(&res, 2, row);
+            m_arms.setArm(valueString(&res, 0, row), a);
+        }
+        duckdb_destroy_result(&res);
+    }
+    if (conn.query(QStringLiteral("SELECT value FROM feed_meta WHERE key = 'exploration_level'"),
+                   &res)) {
+        if (duckdb_row_count(&res) > 0)
+            m_exploration = qBound(0.0, duckdb_value_double(&res, 0, 0), 1.0);
+        duckdb_destroy_result(&res);
+    }
+    qDebug().noquote() << "FeedDatabase: model loaded |" << m_model.beliefs().size() << "beliefs |"
+                       << m_model.samples() << "samples | blend" << m_model.blendWeight();
 }
 
-void FeedDatabase::saveUserModelUnlocked() const {
-    // NOTE: caller must hold the write lock (QReadWriteLock is
-    // non-recursive - never take it again here).
+void FeedDatabase::saveBeliefsUnlocked(duckdb_connection conn, const QStringList& keys) const {
+    if (!conn || keys.isEmpty())
+        return;
+    QStringList unique = keys;
+    unique.removeDuplicates();
+    // One multi-row upsert per chunk: a reaction touches ~70 keys, and one
+    // statement per key would hold the write lock for no reason.
+    constexpr int kChunk = 250;
+    for (int start = 0; start < unique.size(); start += kChunk) {
+        QStringList values;
+        for (const QString& key : unique.mid(start, kChunk)) {
+            const FeedModel::Belief b = m_model.beliefs().value(key);
+            values << QStringLiteral("(%1, %2, %3, %4, %5, %6)")
+                          .arg(quoted(key), num(b.mean),
+                               num(b.variance > 0.0 ? b.variance : FeedModel::priorVariance(key)),
+                               num(b.positive), num(b.negative))
+                          .arg(b.updatedMs);
+        }
+        rawExecute(conn,
+                   QStringLiteral("INSERT INTO feed_model(key, mean, variance, positive, negative, "
+                                  "updated_at) VALUES %1 ON CONFLICT (key) DO UPDATE SET "
+                                  "mean = excluded.mean, variance = excluded.variance, "
+                                  "positive = excluded.positive, negative = excluded.negative, "
+                                  "updated_at = excluded.updated_at")
+                       .arg(values.join(QLatin1Char(','))));
+    }
+}
+
+void FeedDatabase::saveModelStateUnlocked(duckdb_connection conn) const {
+    if (!conn)
+        return;
+    rawExecute(conn, QStringLiteral("INSERT INTO feed_model_state(id, blob) VALUES (0, %1) "
+                                    "ON CONFLICT (id) DO UPDATE SET blob = %1")
+                         .arg(quoted(QString::fromUtf8(m_model.serializeState()))));
+}
+
+void FeedDatabase::saveArmUnlocked(duckdb_connection conn, const QString& arm) const {
+    const ArmBandit::Arm a = m_arms.arms().value(arm);
+    rawExecute(conn, QStringLiteral("INSERT INTO feed_arm_stats(arm, alpha, beta) VALUES "
+                                    "(%1, %2, %3) ON CONFLICT (arm) DO UPDATE SET "
+                                    "alpha = %2, beta = %3")
+                         .arg(quoted(arm), num(a.alpha), num(a.beta)));
+}
+
+FeedModel FeedDatabase::modelSnapshot() const {
+    QReadLocker lock(&s_lock);
+    return m_model;
+}
+
+ArmBandit FeedDatabase::armSnapshot() const {
+    QReadLocker lock(&s_lock);
+    return m_arms;
+}
+
+double FeedDatabase::explorationLevel() const {
+    QReadLocker lock(&s_lock);
+    return m_exploration;
+}
+
+void FeedDatabase::setExplorationLevel(double level) {
+    {
+        QWriteLocker lock(&s_lock);
+        m_exploration = qBound(0.0, level, 1.0);
+    }
+    setMetaValue(QStringLiteral("exploration_level"), qBound(0.0, level, 1.0));
+}
+
+double FeedDatabase::metaValue(const QString& key, double fallback) const {
+    if (!m_db)
+        return fallback;
+    QReadLocker lock(&s_lock);
     DbConnectionGuard conn(m_db);
     if (!conn.ok())
-        return;
-    const QByteArray blob = m_userModel.serialize();
-    conn.execute(QStringLiteral("INSERT INTO feed_user_model(id, blob) VALUES (0, %1) "
-                                "ON CONFLICT (id) DO UPDATE SET blob = %1")
-                     .arg(quoted(QString::fromUtf8(blob))));
+        return fallback;
+    duckdb_result res{};
+    if (!conn.query(QStringLiteral("SELECT value FROM feed_meta WHERE key = %1").arg(quoted(key)),
+                    &res))
+        return fallback;
+    double v = fallback;
+    if (duckdb_row_count(&res) > 0)
+        v = duckdb_value_double(&res, 0, 0);
+    duckdb_destroy_result(&res);
+    return v;
 }
 
-void FeedDatabase::trainUserModel(const double* features, double label, double sampleWeight) {
+void FeedDatabase::setMetaValue(const QString& key, double value) {
     if (!m_db)
         return;
     QWriteLocker lock(&s_lock);
-    m_userModel.train(features, label, sampleWeight);
-    saveUserModelUnlocked();
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    conn.execute(QStringLiteral("INSERT INTO feed_meta(key, value) VALUES (%1, %2) "
+                                "ON CONFLICT (key) DO UPDATE SET value = %2")
+                     .arg(quoted(key), num(value)));
 }
 
-double FeedDatabase::userModelPredict(const double* features) const {
-    QReadLocker lock(&s_lock);
-    return m_userModel.predict(features);
+void FeedDatabase::bumpMetaUnlocked(duckdb_connection conn, const QString& key, double delta) {
+    rawExecute(conn, QStringLiteral("INSERT INTO feed_meta(key, value) VALUES (%1, %2) "
+                                    "ON CONFLICT (key) DO UPDATE SET value = feed_meta.value + %2")
+                         .arg(quoted(key), num(delta)));
 }
 
-double FeedDatabase::userModelBlend() const {
-    QReadLocker lock(&s_lock);
-    return m_userModel.blendWeight();
+// warm start
+
+bool FeedDatabase::warmStartDone() const {
+    return metaValue(QStringLiteral("warmstart_done")) > 0.5;
 }
 
-double FeedDatabase::userModelSamples() const {
-    QReadLocker lock(&s_lock);
-    return m_userModel.samples();
+void FeedDatabase::setWarmStartDone(bool done) {
+    setMetaValue(QStringLiteral("warmstart_done"), done ? 1.0 : 0.0);
 }
 
-QList<double> FeedDatabase::userModelWeights() const {
+void FeedDatabase::seedModelFromTagPreferences() {
+    if (!m_db)
+        return;
+    const QHash<QString, TagPreference> rows = tagPreferenceRows();
+    QWriteLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    QStringList touched;
+    for (auto it = rows.constBegin(); it != rows.constEnd(); ++it) {
+        if (FeedRecommender::isGenericTag(it.key()))
+            continue;
+        const QString key = QStringLiteral("t:") + it.key();
+        if (m_model.hasBelief(key))
+            continue;
+        // The heuristic's per-tag preference becomes the prior mean, with a
+        // slightly tightened variance: an informed guess, not a conclusion.
+        FeedModel::Belief b;
+        b.mean = qBound(-1.5, 3.0 * it.value().preference, 1.5);
+        b.variance = 0.7 * FeedModel::priorVariance(key);
+        b.updatedMs = QDateTime::currentMSecsSinceEpoch();
+        m_model.setBelief(key, b);
+        touched << key;
+    }
+    saveBeliefsUnlocked(conn.raw(), touched);
+    qInfo().noquote() << "FeedDatabase: seeded" << touched.size()
+                      << "model priors from tag preferences";
+}
+
+QList<FeedDatabase::HistoryEvent> FeedDatabase::warmStartHistory(int maxViews, int maxSkips) const {
+    QList<HistoryEvent> out;
+    if (!m_db)
+        return out;
+
+    // Only events from before the warm start began: anything newer was
+    // already trained live. The cutoff is fixed on the first call so a
+    // resumed warm start never replays a live reaction.
+    double cutoff = metaValue(QStringLiteral("warmstart_cutoff"));
+    if (cutoff <= 0.0) {
+        QReadLocker lock(&s_lock);
+        DbConnectionGuard conn(m_db);
+        duckdb_result res{};
+        if (conn.ok() && conn.query(QStringLiteral("SELECT coalesce(max(id), 0) + 1 FROM "
+                                                   "feed_events"),
+                                    &res)) {
+            if (duckdb_row_count(&res) > 0)
+                cutoff = static_cast<double>(duckdb_value_int64(&res, 0, 0));
+            duckdb_destroy_result(&res);
+        }
+        lock.unlock();
+        const_cast<FeedDatabase*>(this)->setMetaValue(QStringLiteral("warmstart_cutoff"), cutoff);
+    }
+
     QReadLocker lock(&s_lock);
-    QList<double> out;
-    out.reserve(UserModel::kFeatureCount);
-    for (int i = 0; i < UserModel::kFeatureCount; ++i) out.append(m_userModel.weight(i));
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return out;
+
+    const QString pending =
+        QStringLiteral("id < %1 AND md5 NOT IN (SELECT md5 FROM feed_warmstart_done)")
+            .arg(static_cast<qint64>(cutoff));
+
+    // Strongest explicit reaction per post (favorite > like > dislike).
+    QHash<QString, HistoryEvent> explicitByMd5;
+    auto rank = [](Event e) {
+        return e == Event::Favorite ? 3 : e == Event::Like ? 2 : e == Event::Dislike ? 1 : 0;
+    };
+    duckdb_result res{};
+    if (conn.query(QStringLiteral("SELECT md5, any_value(source_id), event_type, "
+                                  "max(watch_seconds) FROM feed_events WHERE event_type IN "
+                                  "('like', 'favorite', 'dislike') AND %1 GROUP BY md5, "
+                                  "event_type")
+                       .arg(pending),
+                   &res)) {
+        for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
+            HistoryEvent e;
+            e.md5 = valueString(&res, 0, row);
+            e.sourceId = valueString(&res, 1, row);
+            if (!eventFromName(valueString(&res, 2, row), &e.kind))
+                continue;
+            e.watchSeconds = duckdb_value_double(&res, 3, row);
+            auto it = explicitByMd5.find(e.md5);
+            if (it == explicitByMd5.end() || rank(e.kind) > rank(it->kind))
+                explicitByMd5.insert(e.md5, e);
+        }
+        duckdb_destroy_result(&res);
+    }
+    out = explicitByMd5.values();
+
+    // Implicit reactions, sampled: long views (mild positives) and skips
+    // (the bulk of the negatives - without them the model would learn
+    // that everything is liked).
+    auto sample = [&](const QString& type, const QString& extra, const QString& agg, int limit) {
+        if (limit <= 0)
+            return;
+        duckdb_result r{};
+        if (!conn.query(QStringLiteral("SELECT md5, any_value(source_id), %1(watch_seconds) "
+                                       "FROM feed_events WHERE event_type = '%2' AND %3 %4 "
+                                       "GROUP BY md5 ORDER BY random() LIMIT %5")
+                            .arg(agg, type, pending, extra)
+                            .arg(limit),
+                        &r))
+            return;
+        Event kind = Event::View;
+        eventFromName(type, &kind);
+        for (idx_t row = 0; row < duckdb_row_count(&r); ++row) {
+            HistoryEvent e;
+            e.md5 = valueString(&r, 0, row);
+            if (explicitByMd5.contains(e.md5))
+                continue;
+            e.sourceId = valueString(&r, 1, row);
+            e.kind = kind;
+            e.watchSeconds = duckdb_value_double(&r, 2, row);
+            out.append(e);
+        }
+        duckdb_destroy_result(&r);
+    };
+    sample(QStringLiteral("view"), QStringLiteral("AND watch_seconds >= %1").arg(kLongViewSeconds),
+           QStringLiteral("max"), maxViews);
+    sample(QStringLiteral("skip"), QString(), QStringLiteral("min"), maxSkips);
     return out;
+}
+
+void FeedDatabase::markWarmStartProcessed(const QString& md5) {
+    if (!m_db || md5.isEmpty())
+        return;
+    QWriteLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    conn.execute(QStringLiteral("INSERT INTO feed_warmstart_done(md5) VALUES (%1) "
+                                "ON CONFLICT (md5) DO NOTHING")
+                     .arg(quoted(md5)));
+}
+
+void FeedDatabase::trainFromHistory(const QString& md5, const QStringList& tags, Event kind,
+                                    double watchSeconds, bool updateBias) {
+    if (!m_db || md5.isEmpty())
+        return;
+    const QStringList contentTags = contentTagsOf(tags);
+    if (contentTags.isEmpty())
+        return;
+
+    QWriteLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    storePostTagsUnlocked(conn.raw(), md5, QString(), contentTags);
+    // Replays never count toward validation: the heuristic score they were
+    // ranked under is long gone.
+    trainModelUnlocked(conn.raw(), md5, contentTags, kind, watchSeconds, nullptr, updateBias);
+
+    switch (kind) {
+        case Event::Favorite:
+            updateTastesOnPositive(contentTags, kWeightFavorite, kNewTasteThreshold);
+            break;
+        case Event::Like:
+            updateTastesOnPositive(contentTags, kWeightLike, kNewTasteThreshold);
+            break;
+        case Event::View:
+            updateTastesOnPositive(contentTags, kWeightLongView, kNewTasteThreshold);
+            break;
+        case Event::Dislike:
+            updateTastesOnNegative(contentTags, 1.0);
+            break;
+        case Event::Skip:
+        case Event::Impression:
+            break;
+    }
+}
+
+// post tags
+
+QStringList FeedDatabase::postTags(const QString& md5) const {
+    if (!m_db || md5.isEmpty())
+        return {};
+    QReadLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return {};
+    duckdb_result res{};
+    QStringList out;
+    if (conn.query(
+            QStringLiteral("SELECT tags FROM feed_post_tags WHERE md5 = %1").arg(quoted(md5)),
+            &res)) {
+        if (duckdb_row_count(&res) > 0)
+            out = valueString(&res, 0, 0).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        duckdb_destroy_result(&res);
+    }
+    return out;
+}
+
+void FeedDatabase::storePostTags(const QString& md5, const QString& sourceId,
+                                 const QStringList& tags) {
+    if (!m_db || md5.isEmpty())
+        return;
+    QWriteLocker lock(&s_lock);
+    DbConnectionGuard conn(m_db);
+    if (!conn.ok())
+        return;
+    storePostTagsUnlocked(conn.raw(), md5, sourceId, contentTagsOf(tags));
+}
+
+void FeedDatabase::storePostTagsUnlocked(duckdb_connection conn, const QString& md5,
+                                         const QString& sourceId, const QStringList& tags) {
+    if (tags.isEmpty())
+        return;
+    rawExecute(conn, QStringLiteral("INSERT INTO feed_post_tags(md5, source_id, tags) VALUES "
+                                    "(%1, %2, %3) ON CONFLICT (md5) DO UPDATE SET tags = %3, "
+                                    "source_id = coalesce(nullif(%2, ''), "
+                                    "feed_post_tags.source_id)")
+                         .arg(quoted(md5), quoted(sourceId), quoted(tags.join(QLatin1Char(' ')))));
 }
 
 // negative preferences
@@ -1376,11 +1622,9 @@ QHash<QString, FeedDatabase::TagPreference> FeedDatabase::tagPreferenceRows() co
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
         TagPreference p;
-        char* tag = duckdb_value_varchar(&res, 0, row);
-        if (!tag)
+        p.tag = valueString(&res, 0, row);
+        if (p.tag.isEmpty())
             continue;
-        p.tag = QString::fromUtf8(tag);
-        duckdb_free(tag);
         p.preference = duckdb_value_double(&res, 1, row);
         p.confidence = duckdb_value_double(&res, 2, row);
         p.updatedAtMs = duckdb_value_int64(&res, 3, row);
@@ -1399,7 +1643,6 @@ QStringList FeedDatabase::hardNegativeTags() const {
     // tag that actually narrows the candidate space may arm the veto.
     const QHash<QString, double> specificity = tagSpecificities();
     for (auto it = rows.constBegin(); it != rows.constEnd(); ++it) {
-        // Generic tags must NEVER become hard negatives
         if (FeedRecommender::isGenericTag(it.key()))
             continue;
         const auto sit = specificity.constFind(it.key());
@@ -1446,7 +1689,10 @@ QStringList FeedDatabase::negativeQueryTags(int limit) const {
 
 // session model
 
-QHash<QString, double> FeedDatabase::sessionWeights() const { return m_sessionVec; }
+QHash<QString, double> FeedDatabase::sessionWeights() const {
+    QReadLocker lock(&s_lock);
+    return m_sessionVec;
+}
 
 double FeedDatabase::sessionSimilarity(const QStringList& tags) const {
     if (tags.isEmpty())
@@ -1458,6 +1704,7 @@ double FeedDatabase::sessionSimilarity(const QStringList& tags) const {
     if (imgNorm < 1e-9)
         return 0.0;
 
+    QReadLocker lock(&s_lock);
     double sim = 0.0;
     if (!m_sessionVec.isEmpty()) {
         double dot = 0.0, sesNorm = 0.0;
@@ -1492,6 +1739,11 @@ double FeedDatabase::sessionSimilarity(const QStringList& tags) const {
         }
     }
     return sim;
+}
+
+QList<QStringList> FeedDatabase::recentImpressionTags() const {
+    QReadLocker lock(&s_lock);
+    return m_recentImpressionTags;
 }
 
 void FeedDatabase::setSwayTags(const QStringList& tags) {
@@ -1545,11 +1797,9 @@ QHash<QString, qint64> FeedDatabase::averageLingers() const {
                     &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* kindValue = duckdb_value_varchar(&res, 0, row);
-        if (!kindValue)
+        const QString kind = valueString(&res, 0, row);
+        if (kind.isEmpty())
             continue;
-        const QString kind = QString::fromUtf8(kindValue);
-        duckdb_free(kindValue);
         const qint64 totalMs = duckdb_value_int64(&res, 1, row);
         const qint64 samples = duckdb_value_int64(&res, 2, row);
         out.insert(kind, totalMs / qMax<qint64>(samples, 1));
@@ -1574,11 +1824,9 @@ QHash<QString, int> FeedDatabase::interactionCounts() const {
             &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* kindValue = duckdb_value_varchar(&res, 0, row);
-        if (!kindValue)
+        const QString kind = valueString(&res, 0, row);
+        if (kind.isEmpty())
             continue;
-        const QString kind = QString::fromUtf8(kindValue);
-        duckdb_free(kindValue);
         out.insert(kind, static_cast<int>(duckdb_value_int64(&res, 1, row)));
     }
     duckdb_destroy_result(&res);
@@ -1623,9 +1871,7 @@ int FeedDatabase::recentSkipStreak() const {
         return 0;
     int streak = 0;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* typeValue = duckdb_value_varchar(&res, 0, row);
-        const QString type = typeValue ? QString::fromUtf8(typeValue) : QString();
-        duckdb_free(typeValue);
+        const QString type = valueString(&res, 0, row);
         if (type == QLatin1String("skip") || type == QLatin1String("dislike"))
             ++streak;
         else
@@ -1652,21 +1898,14 @@ QList<QPair<QString, QString>> FeedDatabase::recentInteractions(int limit) const
                         .arg(limit),
                     &res))
         return out;
-    for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* typeValue = duckdb_value_varchar(&res, 0, row);
-        char* md5Value = duckdb_value_varchar(&res, 1, row);
-        const QString type = typeValue ? QString::fromUtf8(typeValue) : QString();
-        const QString md5 = md5Value ? QString::fromUtf8(md5Value) : QString();
-        duckdb_free(typeValue);
-        duckdb_free(md5Value);
-        out.append({type, md5});
-    }
+    for (idx_t row = 0; row < duckdb_row_count(&res); ++row)
+        out.append({valueString(&res, 0, row), valueString(&res, 1, row)});
     duckdb_destroy_result(&res);
     return out;
 }
 
 QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit, int offset,
-                                                              quint32 seed) const {
+                                                               quint32 seed) const {
     QList<QPair<QString, QString>> out;
     if (!m_db)
         return out;
@@ -1695,14 +1934,9 @@ QList<QPair<QString, QString>> FeedDatabase::likedInteractions(int limit, int of
                     &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
-        char* md5Value = duckdb_value_varchar(&res, 0, row);
-        char* srcValue = duckdb_value_varchar(&res, 1, row);
-        const QString md5 = md5Value ? QString::fromUtf8(md5Value) : QString();
-        const QString src = srcValue ? QString::fromUtf8(srcValue) : QString();
-        duckdb_free(md5Value);
-        duckdb_free(srcValue);
+        const QString md5 = valueString(&res, 0, row);
         if (!md5.isEmpty())
-            out.append({md5, src});
+            out.append({md5, valueString(&res, 1, row)});
     }
     duckdb_destroy_result(&res);
     return out;
@@ -1723,18 +1957,45 @@ int FeedDatabase::likedInteractionCount() const {
                     &res))
         return 0;
     int count = 0;
-    if (duckdb_row_count(&res) > 0) {
-        char* value = duckdb_value_varchar(&res, 0, 0);
-        if (value) {
-            count = QString::fromUtf8(value).toInt();
-            duckdb_free(value);
-        }
-    }
+    if (duckdb_row_count(&res) > 0)
+        count = valueString(&res, 0, 0).toInt();
     duckdb_destroy_result(&res);
     return count;
 }
 
-// recommendation debug
+// recommendation log
+
+QString FeedDatabase::packSignals(double heuristicScore, const double* signalValues) {
+    QStringList parts;
+    parts.reserve(kSignalCount);
+    for (int i = 0; i < kSignalCount; ++i) parts << QString::number(signalValues[i], 'f', 4);
+    return QStringLiteral("%1|%2|%3")
+        .arg(kSignalLayoutVersion)
+        .arg(heuristicScore, 0, 'f', 5)
+        .arg(parts.join(QLatin1Char(' ')));
+}
+
+bool FeedDatabase::unpackSignals(const QString& packed, double* heuristicScore,
+                                 double* signalValues) {
+    const QStringList sections = packed.split(QLatin1Char('|'));
+    if (sections.size() != 3 || sections.at(0).toInt() != kSignalLayoutVersion)
+        return false;
+    bool ok = false;
+    const double score = sections.at(1).toDouble(&ok);
+    if (!ok)
+        return false;
+    const QStringList values = sections.at(2).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (values.size() != kSignalCount)
+        return false;
+    for (int i = 0; i < kSignalCount; ++i) {
+        signalValues[i] = values.at(i).toDouble(&ok);
+        if (!ok)
+            return false;
+    }
+    *heuristicScore = score;
+    return true;
+}
+
 void FeedDatabase::recordRecommendations(const QList<RecommendationRow>& rows) {
     if (!m_db || rows.isEmpty())
         return;
@@ -1749,8 +2010,9 @@ void FeedDatabase::recordRecommendations(const QList<RecommendationRow>& rows) {
             QStringLiteral("INSERT INTO feed_recommendations(md5, user_similarity, "
                            "session_similarity, tag_score, freshness_score, novelty_score, "
                            "exploration_score, taste_id, taste_priority, pre_diversity_score, "
-                           "final_score, candidate_source, rejected_negative, features) "
-                           "VALUES (%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14)")
+                           "final_score, candidate_source, rejected_negative, features, slot, "
+                           "model_prob, uncertainty) VALUES (%1, %2, %3, %4, %5, %6, %7, %8, "
+                           "%9, %10, %11, %12, %13, %14, %15, %16, %17)")
                 .arg(quoted(r.md5))
                 .arg(r.userSimilarity, 0, 'f', 4)
                 .arg(r.sessionSimilarity, 0, 'f', 4)
@@ -1764,9 +2026,12 @@ void FeedDatabase::recordRecommendations(const QList<RecommendationRow>& rows) {
                 .arg(r.finalScore, 0, 'f', 4)
                 .arg(quoted(r.candidateSource))
                 .arg(r.rejectedNegative ? QStringLiteral("TRUE") : QStringLiteral("FALSE"))
-                .arg(quoted(r.features)));
+                .arg(quoted(r.features))
+                .arg(quoted(r.slot))
+                .arg(r.modelProbability, 0, 'f', 4)
+                .arg(r.uncertainty, 0, 'f', 4));
     }
-    // Keep the debug table bounded: only the most recent rows matter.
+    // Keep the log bounded: only recent rows can still receive a reaction.
     conn.execute(QStringLiteral(
         "DELETE FROM feed_recommendations WHERE id IN "
         "(SELECT id FROM feed_recommendations ORDER BY generated_at DESC OFFSET 2000)"));
@@ -1787,18 +2052,14 @@ QList<FeedDatabase::RecommendationRow> FeedDatabase::recentRecommendations(int l
             QStringLiteral("SELECT md5, user_similarity, session_similarity, tag_score, "
                            "freshness_score, novelty_score, exploration_score, taste_id, "
                            "taste_priority, pre_diversity_score, final_score, candidate_source, "
-                           "rejected_negative FROM feed_recommendations "
-                           "ORDER BY generated_at DESC LIMIT %1")
+                           "rejected_negative, slot, model_prob, uncertainty "
+                           "FROM feed_recommendations ORDER BY generated_at DESC LIMIT %1")
                 .arg(limit),
             &res))
         return out;
     for (idx_t row = 0; row < duckdb_row_count(&res); ++row) {
         RecommendationRow r;
-        char* md5 = duckdb_value_varchar(&res, 0, row);
-        if (md5) {
-            r.md5 = QString::fromUtf8(md5);
-            duckdb_free(md5);
-        }
+        r.md5 = valueString(&res, 0, row);
         r.userSimilarity = duckdb_value_double(&res, 1, row);
         r.sessionSimilarity = duckdb_value_double(&res, 2, row);
         r.tagScore = duckdb_value_double(&res, 3, row);
@@ -1809,125 +2070,55 @@ QList<FeedDatabase::RecommendationRow> FeedDatabase::recentRecommendations(int l
         r.tastePriority = duckdb_value_double(&res, 8, row);
         r.preDiversityScore = duckdb_value_double(&res, 9, row);
         r.finalScore = duckdb_value_double(&res, 10, row);
-        char* src = duckdb_value_varchar(&res, 11, row);
-        if (src) {
-            r.candidateSource = QString::fromUtf8(src);
-            duckdb_free(src);
-        }
+        r.candidateSource = valueString(&res, 11, row);
         r.rejectedNegative = duckdb_value_boolean(&res, 12, row);
+        r.slot = valueString(&res, 13, row);
+        r.modelProbability = duckdb_value_double(&res, 14, row);
+        r.uncertainty = duckdb_value_double(&res, 15, row);
         out.append(r);
     }
     duckdb_destroy_result(&res);
     return out;
 }
 
-QString FeedDatabase::rankedFeaturesFor(const QString& md5) const {
+FeedDatabase::RecommendationRow FeedDatabase::recommendationFor(const QString& md5) const {
     if (!m_db || md5.isEmpty())
         return {};
     QReadLocker lock(&s_lock);
     DbConnectionGuard conn(m_db);
     if (!conn.ok())
         return {};
-    return rankedFeaturesForUnlocked(conn.raw(), md5);
+    return recommendationForUnlocked(conn.raw(), md5);
 }
 
-QString FeedDatabase::rankedFeaturesForUnlocked(duckdb_connection conn, const QString& md5) const {
-    if (!conn || md5.isEmpty())
-        return {};
+FeedDatabase::RecommendationRow FeedDatabase::recommendationForUnlocked(duckdb_connection conn,
+                                                                        const QString& md5) const {
+    RecommendationRow r;
     duckdb_result res{};
-    QString out;
-    if (duckdb_query(conn,
-                     QStringLiteral("SELECT features FROM feed_recommendations WHERE md5 = %1 "
-                                    "ORDER BY generated_at DESC LIMIT 1")
-                         .arg(quoted(md5))
-                         .toUtf8()
-                         .constData(),
-                     &res) == DuckDBSuccess) {
-        if (duckdb_row_count(&res) > 0) {
-            char* txt = duckdb_value_varchar(&res, 0, 0);
-            if (txt) {
-                out = QString::fromUtf8(txt);
-                duckdb_free(txt);
-            }
-        }
-        duckdb_destroy_result(&res);
-    }
-    return out;
-}
-
-// image embeddings
-
-QByteArray FeedDatabase::embeddingFor(const QString& md5, const QString& model,
-                                      const QString& modelVersion) const {
-    QReadLocker lock(&s_lock);
-    return embeddingForUnlocked(md5, model, modelVersion);
-}
-
-QByteArray FeedDatabase::embeddingForUnlocked(const QString& md5, const QString& model,
-                                              const QString& modelVersion) const {
-    if (!m_db || md5.isEmpty())
-        return {};
-
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return {};
-
-    // When a model/version filter is given, an embedding produced by a
-    // different model is treated as missing - the caller will
-    // regenerate it rather than mixing incompatible vector spaces.
-    QString sql =
-        QStringLiteral("SELECT embedding FROM image_embeddings WHERE md5 = %1").arg(quoted(md5));
-    if (!model.isEmpty())
-        sql += QStringLiteral(" AND model = %1").arg(quoted(model));
-    if (!modelVersion.isEmpty())
-        sql += QStringLiteral(" AND model_version = %1").arg(quoted(modelVersion));
-
-    duckdb_result res{};
-    if (!conn.query(sql, &res))
-        return {};
-    QByteArray out;
+    if (!rawQuery(conn,
+                  QStringLiteral("SELECT candidate_source, slot, features, model_prob, "
+                                 "uncertainty, final_score, taste_id FROM feed_recommendations "
+                                 "WHERE md5 = %1 ORDER BY generated_at DESC LIMIT 1")
+                      .arg(quoted(md5)),
+                  &res))
+        return r;
     if (duckdb_row_count(&res) > 0) {
-        duckdb_blob blob = duckdb_value_blob(&res, 0, 0);
-        if (blob.data && blob.size > 0) {
-            // Stored as fp16 (half the disk); expand to the packed fp32
-            // representation every consumer expects.
-            out = unpackHalf(
-                QByteArray(static_cast<const char*>(blob.data), static_cast<int>(blob.size)));
-        }
+        r.md5 = md5;
+        r.candidateSource = valueString(&res, 0, 0);
+        r.slot = valueString(&res, 1, 0);
+        r.features = valueString(&res, 2, 0);
+        r.modelProbability = duckdb_value_double(&res, 3, 0);
+        r.uncertainty = duckdb_value_double(&res, 4, 0);
+        r.finalScore = duckdb_value_double(&res, 5, 0);
+        r.tasteId = duckdb_value_int64(&res, 6, 0);
     }
     duckdb_destroy_result(&res);
-    return out;
-}
-
-void FeedDatabase::storeImageEmbedding(const QString& md5, const QByteArray& packed,
-                                       const QString& model, const QString& modelVersion) {
-    if (!m_db || md5.isEmpty() || packed.isEmpty())
-        return;
-
-    QWriteLocker lock(&s_lock);
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-
-    // Stored as fp16: 768 dims = 1536 bytes/image instead of 3072.
-    // Expanded back to fp32 on read.
-    const QByteArray half = packHalf(packed);
-    const QString hex = QString::fromLatin1(half.toHex());
-    conn.execute(
-        QStringLiteral("INSERT INTO image_embeddings(md5, embedding, dim, model, model_version) "
-                       "VALUES (%1, unhex('%2'), %3, %4, %5) "
-                       "ON CONFLICT (md5) DO UPDATE SET embedding = unhex('%2'), dim = %3, "
-                       "model = %4, model_version = %5, created_at = now()")
-            .arg(quoted(md5))
-            .arg(hex)
-            .arg(packed.size() / static_cast<int>(sizeof(float)))
-            .arg(quoted(model))
-            .arg(quoted(modelVersion)));
+    return r;
 }
 
 // tuning
 
-void FeedDatabase::reset(QString* error) {
+void FeedDatabase::reset(bool rerunWarmStart, QString* error) {
     QWriteLocker lock(&s_lock);
     DbConnectionGuard conn(m_db);
     if (!conn.ok()) {
@@ -1935,28 +2126,28 @@ void FeedDatabase::reset(QString* error) {
             *error = QStringLiteral("Feed database is not open");
         return;
     }
-    QString dbError;
-    conn.execute(QStringLiteral("DELETE FROM feed_events"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_history"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_tastes"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_tag_preferences"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_linger_stats"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_recommendations"), &dbError);
-    conn.execute(QStringLiteral("DELETE FROM feed_negative_anchors"), &dbError);
-    // Tag doc-frequency (feed_tag_stats/feed_meta) is catalog knowledge,
-    // not user preference - a profile reset does NOT wipe it; specificity
-    // stays learned across resets.
+    for (const char* table : {"feed_events", "feed_history", "feed_tastes", "feed_tag_preferences",
+                              "feed_linger_stats", "feed_recommendations", "feed_model",
+                              "feed_arm_stats", "feed_post_tags", "feed_warmstart_done"})
+        conn.execute(QStringLiteral("DELETE FROM %1").arg(QLatin1String(table)));
+    conn.execute(QStringLiteral(
+        "DELETE FROM feed_meta WHERE key IN ('warmstart_cutoff', 'warmstart_progress', "
+        "'warmstart_total', 'warmstart_priors', 'warmstart_favorites', 'tangent_shown', "
+        "'tangent_hits')"));
+    conn.execute(QStringLiteral("INSERT INTO feed_meta(key, value) VALUES ('warmstart_done', %1) "
+                                "ON CONFLICT (key) DO UPDATE SET value = %1")
+                     .arg(rerunWarmStart ? 0 : 1));
+    // Tag doc-frequency, visual descriptors and the exploration level are
+    // catalog knowledge / settings, not preference - a reset keeps them.
     m_sessionVec.clear();
     m_sessionMass = 0.0;
-    m_userModel.reset();
-    saveUserModelUnlocked();
+    m_recentImpressionTags.clear();
+    m_model.reset();
+    m_arms.reset();
+    saveModelStateUnlocked(conn.raw());
 }
 
 // taste helpers
-
-bool FeedDatabase::contentTagsTooFew(const QStringList& tags) const {
-    return tags.size() < kMinTasteTags;
-}
 
 void FeedDatabase::createTaste(const QStringList& tags, double weight, qint64 nowMs) {
     DbConnectionGuard conn(m_db);
@@ -2007,41 +2198,6 @@ void FeedDatabase::writeTasteStrength(qint64 id, double strength) {
     conn.execute(QStringLiteral("UPDATE feed_tastes SET strength = %2 WHERE id = %1")
                      .arg(id)
                      .arg(strength, 0, 'f', 6));
-}
-
-void FeedDatabase::createTasteVisual(const QByteArray& imageVisual, double weight, qint64 nowMs) {
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-    // Embeddings are a few KB - a hex literal is simple and safe here.
-    const QString hex = QString::fromLatin1(imageVisual.toHex());
-    conn.execute(QStringLiteral("INSERT INTO feed_tastes(visual, visual_dim, embedding, strength, "
-                                "confidence, exposure, engagement, last_used, created_at) "
-                                "VALUES (unhex('%1'), %2, '', %3, %4, 0, %5, %6, %6)")
-                     .arg(hex)
-                     .arg(imageVisual.size() / static_cast<int>(sizeof(float)))
-                     .arg(weight, 0, 'f', 6)
-                     .arg(weight, 0, 'f', 6)
-                     .arg(weight * 0.1, 0, 'f', 6)
-                     .arg(nowMs));
-}
-
-void FeedDatabase::writeTasteVisual(qint64 id, const QByteArray& visual, double strength,
-                                    double confidence, double engagement, qint64 nowMs) {
-    DbConnectionGuard conn(m_db);
-    if (!conn.ok())
-        return;
-    const QString hex = QString::fromLatin1(visual.toHex());
-    conn.execute(QStringLiteral("UPDATE feed_tastes SET visual = unhex('%2'), visual_dim = %3, "
-                                "strength = %4, confidence = %5, engagement = %6, last_used = %7 "
-                                "WHERE id = %1")
-                     .arg(id)
-                     .arg(hex)
-                     .arg(visual.size() / static_cast<int>(sizeof(float)))
-                     .arg(strength, 0, 'f', 6)
-                     .arg(confidence, 0, 'f', 6)
-                     .arg(engagement, 0, 'f', 6)
-                     .arg(nowMs));
 }
 
 }  // namespace Mosaic

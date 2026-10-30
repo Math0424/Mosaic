@@ -18,7 +18,6 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-assets/onnx/v1/vision_model_fp16.onnx
 *.i
 *.obj
 *.pdb
@@ -27,8 +26,8 @@ assets/onnx/v1/vision_model_fp16.onnx
 third_party/libs/duckdb/**
 third_party/libs/opencv/**
 third_party/libs/ffmpeg/**
+# Leftover ONNX Runtime binaries from before the feed dropped it.
 third_party/libs/onnxruntime/**
 !third_party/libs/ffmpeg/README.md
-!third_party/libs/onnxruntime/README.md
 
 TODO.md

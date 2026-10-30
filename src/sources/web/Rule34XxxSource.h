@@ -1,5 +1,8 @@
 #pragma once
 
+#include <QHash>
+#include <QMutex>
+
 #include "HttpSource.h"
 
 namespace Mosaic {
@@ -25,9 +28,14 @@ class Rule34XxxSource : public HttpSource {
    protected:
     QByteArray userAgent() const override;
     void addHeaders(QNetworkRequest& request) const override;
+    int requestIntervalMs(const QString& host) const override;
 
    private:
     QString resolveFullUrl(const SourceImage& image) const;
+
+    // Post id -> original file URL, so a post page is fetched at most once.
+    mutable QMutex m_fullUrlMutex;
+    mutable QHash<qint64, QString> m_fullUrls;
 };
 
 }  // namespace Mosaic

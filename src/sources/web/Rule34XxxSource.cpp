@@ -10,6 +10,10 @@ namespace {
 
 // Site settings (kept in code, one place per source).
 constexpr const char* kBaseUrl = "https://rule34.xxx";
+// The site answers bursts with 429s. HTML pages (search, post) are the
+// expensive ones; the image hosts tolerate more.
+constexpr int kPageIntervalMs = 1000;
+constexpr int kMediaIntervalMs = 100;
 
 /** Decodes the HTML entities the site uses inside tag attributes. */
 QString decodeEntities(QString text) {
@@ -87,6 +91,14 @@ void Rule34XxxSource::addHeaders(QNetworkRequest& request) const {
     request.setRawHeader("sec-ch-ua", "\"Chromium\";v=\"141\", \"Not?A_Brand\";v=\"24\"");
     request.setRawHeader("sec-ch-ua-mobile", "?0");
     request.setRawHeader("sec-ch-ua-platform", "\"Windows\"");
+}
+
+int Rule34XxxSource::requestIntervalMs(const QString& host) const {
+    if (host == QLatin1String("rule34.xxx") || host == QLatin1String("www.rule34.xxx"))
+        return kPageIntervalMs;
+    if (host.endsWith(QLatin1String(".rule34.xxx")))
+        return kMediaIntervalMs;
+    return 0;
 }
 
 SourceResult Rule34XxxSource::search(const SourceQuery& query) {
@@ -206,6 +218,12 @@ SourceResult Rule34XxxSource::search(const SourceQuery& query) {
 QString Rule34XxxSource::resolveFullUrl(const SourceImage& image) const {
     if (image.remoteId <= 0)
         return {};
+    {
+        QMutexLocker lock(&m_fullUrlMutex);
+        const auto cached = m_fullUrls.constFind(image.remoteId);
+        if (cached != m_fullUrls.constEnd())
+            return *cached;
+    }
     const QByteArray details = httpGet(postUrl(image.remoteId));
     if (details.isEmpty())
         return {};
@@ -214,7 +232,10 @@ QString Rule34XxxSource::resolveFullUrl(const SourceImage& image) const {
     const QRegularExpressionMatch m = originalRe.match(QString::fromUtf8(details));
     if (!m.hasMatch())
         return {};
-    return directFileUrl(m.captured(QStringLiteral("url")));
+    const QString url = directFileUrl(m.captured(QStringLiteral("url")));
+    QMutexLocker lock(&m_fullUrlMutex);
+    m_fullUrls.insert(image.remoteId, url);
+    return url;
 }
 
 QByteArray Rule34XxxSource::fetch(const SourceImage& image, FileKind kind, QString* error) {

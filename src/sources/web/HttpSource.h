@@ -15,6 +15,26 @@ namespace Mosaic {
 // parentOf() and childrenOf().
 class HttpSource : public Source {
    public:
+    // While alive, requests made on this thread fail fast instead of
+    // waiting out a rate limit: no 429 retries, and a request whose host
+    // slot is more than `maxWaitMs` away is skipped without being sent.
+    // For latency-sensitive callers (the feed) that can use another site;
+    // browsing stays patient. Scopes nest.
+    class ImpatientScope {
+       public:
+        explicit ImpatientScope(int maxWaitMs = 1500);
+        ~ImpatientScope();
+        ImpatientScope(const ImpatientScope&) = delete;
+        ImpatientScope& operator=(const ImpatientScope&) = delete;
+
+       private:
+        int m_previous;
+    };
+
+    // True when this thread's most recent request failed because of a
+    // rate limit (429, or skipped by an ImpatientScope).
+    static bool lastRequestRateLimited();
+
     bool downloadToFile(const SourceImage& image, FileKind kind, const QString& path,
                         const std::function<void(qint64, qint64)>& progress = nullptr,
                         QString* error = nullptr) override;
@@ -25,6 +45,10 @@ class HttpSource : public Source {
 
     // Extra request headers (e.g. client hints for Cloudflare-fronted sites).
     virtual void addHeaders(QNetworkRequest& request) const;
+
+    // Minimum spacing between requests to one host, shared by every thread
+    // using the source. 0 (the default) only honours 429 back-off.
+    virtual int requestIntervalMs(const QString& host) const;
 
     QByteArray httpGet(const QString& url, QString* error = nullptr) const;
 

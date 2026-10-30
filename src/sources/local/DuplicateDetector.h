@@ -15,7 +15,8 @@ struct DuplicatePair {
 };
 
 // Duplicate detection: pHash pre-filter, then SIFT + RANSAC verification.
-// Fingerprints are computed on the fly.
+// Fingerprints are computed on the fly (nothing is stored); SIFT only for
+// images that survive the pHash pre-filter.
 class DuplicateDetector {
    public:
     // Synchronous; call from a worker thread.
