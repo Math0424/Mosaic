@@ -144,7 +144,7 @@ QByteArray R34Source::fetch(const SourceImage& image, FileKind kind, QString* er
     if (kind == FileKind::Full) {
         const QString resolved = resolveFullUrl(image);
         if (!resolved.isEmpty()) {
-            const QByteArray data = httpGet(resolved, error);
+            const QByteArray data = mediaGet(resolved, error);
             if (!data.isEmpty())
                 return data;
         }

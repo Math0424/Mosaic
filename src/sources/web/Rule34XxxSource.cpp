@@ -268,7 +268,7 @@ QByteArray Rule34XxxSource::fetch(const SourceImage& image, FileKind kind, QStri
         if (url.isEmpty())
             continue;
         QString attemptError;
-        const QByteArray data = httpGet(url, &attemptError);
+        const QByteArray data = mediaGet(url, &attemptError);
         if (!data.isEmpty())
             return data;
         if (lastError.isEmpty())

@@ -6,6 +6,7 @@
 #include <QEventLoop>
 #include <QDebug>
 #include <QFile>
+#include <QCache>
 #include <QHash>
 #include <QMutex>
 #include <QNetworkAccessManager>
@@ -16,6 +17,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QWaitCondition>
 
 #include <memory>
 
@@ -36,6 +38,9 @@ constexpr int kShutdownPollMs = 100;
 // httpGet buffers the body in memory; anything larger should go through
 // httpDownload (streamed to disk) instead.
 constexpr qint64 kMaxBodyBytes = 512LL * 1024 * 1024;
+// Recently fetched media kept for mediaGet() (see MediaFetches).
+constexpr int kRecentMediaKiB = 64 * 1024;
+constexpr qint64 kMaxRecentMediaBytes = 16LL * 1024 * 1024;
 
 /**
  * Masks credential query values (api_key=..., user_id=...) in text that may
@@ -134,15 +139,27 @@ int backOff(const QString& host, int delayMs) {
 }
 
 /**
- * One manager per worker thread (a QNetworkAccessManager must stay on the
- * thread that made it), so keep-alive connections and TLS sessions are
- * reused instead of handshaking on every request. Destroyed at thread exit.
+ * In-flight and recently completed media downloads, shared by all sources
+ * and threads. Feed scoring (visual features), the media preload and the
+ * thumbnail strips ask for the same preview independently; without this
+ * each one downloaded it again, often at the same moment.
  */
-QNetworkAccessManager& threadManager() {
-    thread_local std::unique_ptr<QNetworkAccessManager> manager;
-    if (!manager)
-        manager = std::make_unique<QNetworkAccessManager>();
-    return *manager;
+struct SharedFetch {
+    bool done = false;
+    QByteArray bytes;
+    QString error;
+};
+
+struct MediaFetches {
+    QMutex mutex;
+    QWaitCondition finished;
+    QHash<QString, std::shared_ptr<SharedFetch>> inFlight;
+    QCache<QString, QByteArray> recent{kRecentMediaKiB};  // cost = KiB
+};
+
+MediaFetches& mediaFetches() {
+    static MediaFetches fetches;
+    return fetches;
 }
 
 void clearStrikes(const QString& host) {
@@ -200,7 +217,12 @@ QByteArray HttpSource::httpGet(const QString& url, QString* error) const {
             return {};
         }
 
-        QNetworkReply* reply = threadManager().get(makeRequest(url));
+        // A manager per request: worker threads run no event loop between
+        // requests, so a manager kept across them ends up reusing keep-alive
+        // sockets the server already closed ("device not open"), and those
+        // requests hang until the timeout.
+        QNetworkAccessManager manager;
+        QNetworkReply* reply = manager.get(makeRequest(url));
 
         QEventLoop loop;
         QTimer timeout;
@@ -299,7 +321,12 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
         file.resize(0);
         file.seek(0);
 
-        QNetworkReply* reply = threadManager().get(makeRequest(url));
+        // A manager per request: worker threads run no event loop between
+        // requests, so a manager kept across them ends up reusing keep-alive
+        // sockets the server already closed ("device not open"), and those
+        // requests hang until the timeout.
+        QNetworkAccessManager manager;
+        QNetworkReply* reply = manager.get(makeRequest(url));
 
         // Stream every chunk to disk as it arrives; never buffer the body.
         QEventLoop loop;
@@ -362,6 +389,45 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
     }
 }
 
+QByteArray HttpSource::mediaGet(const QString& url, QString* error) const {
+    MediaFetches& shared = mediaFetches();
+    std::shared_ptr<SharedFetch> mine;
+    {
+        QMutexLocker lock(&shared.mutex);
+        if (const QByteArray* hit = shared.recent.object(url))
+            return *hit;
+        const auto running = shared.inFlight.constFind(url);
+        if (running != shared.inFlight.constEnd()) {
+            // Someone is already downloading it: share that result,
+            // failures included (retrying would just queue another timeout).
+            const std::shared_ptr<SharedFetch> pending = running.value();
+            while (!pending->done) shared.finished.wait(&shared.mutex);
+            if (error && pending->bytes.isEmpty())
+                *error = pending->error;
+            return pending->bytes;
+        }
+        mine = std::make_shared<SharedFetch>();
+        shared.inFlight.insert(url, mine);
+    }
+
+    QString fetchError;
+    const QByteArray bytes = httpGet(url, &fetchError);
+    {
+        QMutexLocker lock(&shared.mutex);
+        mine->bytes = bytes;
+        mine->error = fetchError;
+        mine->done = true;
+        shared.inFlight.remove(url);
+        if (!bytes.isEmpty() && bytes.size() <= kMaxRecentMediaBytes)
+            shared.recent.insert(url, new QByteArray(bytes),
+                                 static_cast<qsizetype>((bytes.size() + 1023) / 1024));
+    }
+    shared.finished.wakeAll();
+    if (error && bytes.isEmpty())
+        *error = fetchError;
+    return bytes;
+}
+
 QByteArray HttpSource::fetch(const SourceImage& image, FileKind kind, QString* error) {
     const QString url = image.urlFor(kind);
     if (url.isEmpty()) {
@@ -369,7 +435,7 @@ QByteArray HttpSource::fetch(const SourceImage& image, FileKind kind, QString* e
             *error = QStringLiteral("Image has no URL to download");
         return {};
     }
-    return httpGet(url, error);
+    return mediaGet(url, error);
 }
 
 bool HttpSource::downloadToFile(const SourceImage& image, FileKind kind, const QString& path,

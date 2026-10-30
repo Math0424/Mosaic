@@ -224,6 +224,17 @@ CheckResult Verification::checkDuckDB() {
             return r;
         }
 
+        // The tag must exist before it can be linked.
+        if (!con.execute(QStringLiteral("INSERT INTO tags(category, name) "
+                                        "VALUES ('character', 'test')"),
+                         &error)) {
+            r.ok = false;
+            r.detail = QStringLiteral("INSERT tags failed: %1").arg(error);
+
+            duckdb_close(&database);
+            return r;
+        }
+
         // Link image/tag
         if (!con.execute(QStringLiteral("INSERT INTO image_tags(image_id, tag_id) "
                                         "SELECT i.id, t.id "

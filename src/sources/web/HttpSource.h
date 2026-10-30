@@ -52,6 +52,11 @@ class HttpSource : public Source {
 
     QByteArray httpGet(const QString& url, QString* error = nullptr) const;
 
+    // httpGet for media files (content-addressed URLs): concurrent requests
+    // for one URL share a single download, and recent results are reused.
+    // Not for API/search pages, whose content changes.
+    QByteArray mediaGet(const QString& url, QString* error = nullptr) const;
+
     bool httpDownload(const QString& url, const QString& path,
                       const std::function<void(qint64, qint64)>& progress = nullptr,
                       QString* error = nullptr) const;
