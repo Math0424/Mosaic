@@ -120,12 +120,25 @@ bool sanitizeTags(DbConnection& conn, QString* error) {
         }
         statements << QStringLiteral("DELETE FROM image_tags WHERE tag_id = %1").arg(repair.id)
                    << QStringLiteral("DELETE FROM tags WHERE id = %1").arg(repair.id);
+        // One transaction per tag: a failed repair rolls back cleanly and
+        // the old tag stays intact for the next startup to retry.
+        DbTransaction tx(conn, &dbError);
+        if (!tx.isActive()) {
+            if (error)
+                *error = dbError;
+            return false;
+        }
         for (const QString& sql : statements) {
             if (!conn.execute(sql, &dbError)) {
                 if (error)
                     *error = dbError;
                 return false;
             }
+        }
+        if (!tx.commit(&dbError)) {
+            if (error)
+                *error = dbError;
+            return false;
         }
     }
 
@@ -205,6 +218,18 @@ QStringList ddlStatements() {
             QStringLiteral("CREATE INDEX IF NOT EXISTS idx_image_tags_tag "
                            "ON image_tags(tag_id)"),
 
+            // Parent links whose parent post is not in the library yet:
+            // images.parent_id holds the parent's internal id, so it can
+            // only be set once the parent is imported (LibraryCatalog
+            // adopts these rows then).
+            QStringLiteral(R"(
+            CREATE TABLE IF NOT EXISTS pending_parents (
+                image_id         INTEGER PRIMARY KEY,
+                source_id        VARCHAR NOT NULL,
+                remote_parent_id BIGINT NOT NULL
+            )
+        )"),
+
             // Duplicate pairs the user has dismissed on the Conflicts page.
             // Pairs where one side was deleted are not recorded: the next
             // scan can't find both sides anyway. Stored once per pair with
@@ -217,6 +242,39 @@ QStringList ddlStatements() {
                 PRIMARY KEY (md5_a, md5_b)
             )
         )")};
+}
+
+/** Stored meta.schema_version; 0 for a new or pre-versioning database. */
+int storedVersion(DbConnection& conn) {
+    duckdb_result res{};
+    QString error;
+    // Fails on a new database (no meta table yet): version 0.
+    if (!conn.query(QStringLiteral("SELECT value FROM meta WHERE key = 'schema_version'"), &res,
+                    &error))
+        return 0;
+    int version = 0;
+    if (duckdb_row_count(&res) > 0) {
+        char* value = duckdb_value_varchar(&res, 0, 0);
+        if (value) {
+            version = QString::fromUtf8(value).toInt();
+            duckdb_free(value);
+        }
+    }
+    duckdb_destroy_result(&res);
+    return version;
+}
+
+/**
+ * Data migrations from version N-1 to N, run after the DDL (so new tables
+ * exist) inside one transaction. Additive schema changes belong in
+ * ddlStatements(); this is for rewriting existing rows. Empty for now:
+ * v2 -> v3 only added pending_parents.
+ */
+QStringList migrationTo(int version) {
+    // Add a case per version that needs row rewrites, e.g.
+    //   if (version == 4) return {QStringLiteral("UPDATE ...")};
+    Q_UNUSED(version);
+    return {};
 }
 
 }  // namespace
@@ -232,6 +290,19 @@ bool ensureSchema(DbConnection& conn, QString* error) {
         return false;
     }
 
+    // A database written by a newer build may use a layout this build does
+    // not understand; writing to it could corrupt it.
+    const int fromVersion = storedVersion(conn);
+    if (fromVersion > kVersion) {
+        if (error)
+            *error = QStringLiteral(
+                         "The library database was created by a newer version of Mosaic "
+                         "(schema %1, this build supports %2). Please update Mosaic.")
+                         .arg(fromVersion)
+                         .arg(kVersion);
+        return false;
+    }
+
     for (const QString& statement : ddlStatements()) {
         QString queryError;
 
@@ -242,6 +313,26 @@ bool ensureSchema(DbConnection& conn, QString* error) {
 
             return false;
         }
+    }
+
+    if (fromVersion > 0 && fromVersion < kVersion) {
+        DbTransaction tx(conn, error);
+        if (!tx.isActive())
+            return false;
+        for (int version = fromVersion + 1; version <= kVersion; ++version) {
+            for (const QString& sql : migrationTo(version)) {
+                QString queryError;
+                if (!conn.execute(sql, &queryError)) {
+                    if (error)
+                        *error = QStringLiteral("Migration to schema %1 failed: %2")
+                                     .arg(version)
+                                     .arg(queryError);
+                    return false;
+                }
+            }
+        }
+        if (!tx.commit(error))
+            return false;
     }
 
     const QString versionSql = QStringLiteral(

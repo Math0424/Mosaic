@@ -183,7 +183,7 @@ ViewerWindow::ViewerWindow(Source* source, const QList<SourceImage>& images, int
     AppState state;
     if (state.load()) {
         const QRect geo = state.viewerGeometry();
-        if (geo.width() > 0 && geo.height() > 0)
+        if (AppState::isGeometryOnScreen(geo))
             setGeometry(geo);
         m_loupeZoom = state.viewerLoupeZoom();
         m_loupeDiameter = state.viewerLoupeDiameter();
@@ -643,7 +643,7 @@ void ViewerWindow::loadMedia(const SourceImage& image) {
     }
 
     // 1) Thumbnail first so there's never a blank pane.
-    if (!image.isLocal() && !image.md5.isEmpty()) {
+    if (!image.isInLibrary() && !image.md5.isEmpty()) {
         const QByteArray thumb = m_cache.value(cacheKey(image.md5, FileKind::Preview));
         QImage placeholder;
         if (!thumb.isEmpty() && placeholder.loadFromData(thumb)) {
@@ -714,7 +714,7 @@ void ViewerWindow::loadMedia(const SourceImage& image) {
 }
 
 void ViewerWindow::loadVideoProgressively(const SourceImage& image) {
-    if (image.isLocal() && QFile::exists(image.localPath)) {
+    if (image.isInLibrary() && QFile::exists(image.localPath)) {
         m_loading = false;
         m_statusLabel->clear();
         showVideoPath(image.localPath);
@@ -1130,7 +1130,7 @@ void ViewerWindow::preloadAround(int index) {
         if (i < 0 || i >= m_images.size())
             continue;
         const SourceImage& img = m_images.at(i);
-        if (!img.isLocal())  // local preview == full file
+        if (!img.isInLibrary())  // local preview == full file
             fetchIntoCache(img, FileKind::Preview);
         if (mediaKindOf(img) == MediaKind::Image)
             fetchIntoCache(img, FileKind::Full);
@@ -1257,7 +1257,7 @@ void ViewerWindow::updateSidebars() {
 void ViewerWindow::updateFavoriteButton() { m_favoriteButton->setChecked(m_current.favorite); }
 
 bool ViewerWindow::currentIsLocal() const {
-    return !m_current.md5.isEmpty() && (m_source->isLocal() || m_current.isLocal());
+    return !m_current.md5.isEmpty() && (m_source->isLocal() || m_current.isInLibrary());
 }
 
 // library actions
@@ -1398,7 +1398,7 @@ void ViewerWindow::copyCurrentMedia() {
 QString ViewerWindow::currentMediaFile() const {
     if (!m_currentMediaFile.isEmpty() && QFile::exists(m_currentMediaFile))
         return m_currentMediaFile;
-    if (m_current.isLocal() && !m_current.localPath.isEmpty() && QFile::exists(m_current.localPath))
+    if (m_current.isInLibrary() && !m_current.localPath.isEmpty() && QFile::exists(m_current.localPath))
         return m_current.localPath;
     return QString();
 }

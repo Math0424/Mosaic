@@ -4,6 +4,7 @@
 #include "LibrarySql.h"
 #include "../../core/Database.h"
 #include "../../core/Paths.h"
+#include "../../core/Shutdown.h"
 #include "../../media/ImageFingerprint.h"
 
 #include <QDir>
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <bitset>
 #include <mutex>
+#include <numeric>
 #include <vector>
 
 namespace Mosaic {
@@ -45,12 +47,38 @@ struct DetailedSift {
     QByteArray blob;
 };
 
-QByteArray readFile(const QString& path) {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly))
-        return {};
-    return f.readAll();
-}
+/**
+ * Memory-maps a file for the fingerprint functions: these run on every core
+ * at once, and mapping keeps the encoded bytes out of the heap (the OS pages
+ * them in and drops them under pressure).
+ */
+class MappedFile {
+   public:
+    explicit MappedFile(const QString& path) : m_file(path) {
+        if (!m_file.open(QIODevice::ReadOnly) || m_file.size() <= 0)
+            return;
+        m_data = m_file.map(0, m_file.size());
+        if (m_data)
+            m_bytes = QByteArray::fromRawData(reinterpret_cast<const char*>(m_data),
+                                              static_cast<qsizetype>(m_file.size()));
+        else
+            m_bytes = m_file.readAll();  // mapping unsupported: fall back
+    }
+    ~MappedFile() {
+        m_bytes.clear();  // drop the raw-data view before unmapping
+        if (m_data)
+            m_file.unmap(m_data);
+    }
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    const QByteArray& bytes() const { return m_bytes; }
+
+   private:
+    QFile m_file;
+    uchar* m_data = nullptr;
+    QByteArray m_bytes;
+};
 
 }  // namespace
 
@@ -58,59 +86,44 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     const std::function<void(int, int)>& progress, QString* error) {
     QList<DuplicatePair> pairs;
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return pairs;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return pairs;
-    }
 
     // Collect the fingerprintable files first (cheap catalog query).
     QList<QPair<QString, QString>> files;  // md5, on-disk path
-    try {
-        duckdb_result res{};
-        QString dbError;
-        const QString sql = QStringLiteral("SELECT md5, format FROM images ORDER BY md5");
-        if (!conn.query(sql, &res, &dbError)) {
-            if (error)
-                *error = dbError;
-            return pairs;
-        }
-        const idx_t rowCount = duckdb_row_count(&res);
-        for (idx_t row = 0; row < rowCount; ++row) {
-            char* md5Value = duckdb_value_varchar(&res, 0, row);
-            char* formatValue = duckdb_value_varchar(&res, 1, row);
-            if (!md5Value || !formatValue) {
-                if (md5Value)
-                    duckdb_free(md5Value);
-                if (formatValue)
-                    duckdb_free(formatValue);
-                continue;
-            }
-            const QString md5 = QString::fromUtf8(md5Value);
-            const QString format = QString::fromUtf8(formatValue);
-            duckdb_free(md5Value);
-            duckdb_free(formatValue);
-            // Videos can't be fingerprinted with SIFT/pHash.
-            if (isVideoFormat(format))
-                continue;
-            const QString path = LibraryCatalog::filePathFor(md5, format);
-            if (path.isEmpty())
-                continue;
-            files.append({md5, path});
-        }
-        duckdb_destroy_result(&res);
-    } catch (const std::exception& e) {
+    duckdb_result res{};
+    QString dbError;
+    const QString sql = QStringLiteral("SELECT md5, format FROM images ORDER BY md5");
+    if (!conn.query(sql, &res, &dbError)) {
         if (error)
-            *error = QString::fromUtf8(e.what());
+            *error = dbError;
         return pairs;
     }
+    const idx_t rowCount = duckdb_row_count(&res);
+    for (idx_t row = 0; row < rowCount; ++row) {
+        char* md5Value = duckdb_value_varchar(&res, 0, row);
+        char* formatValue = duckdb_value_varchar(&res, 1, row);
+        if (!md5Value || !formatValue) {
+            if (md5Value)
+                duckdb_free(md5Value);
+            if (formatValue)
+                duckdb_free(formatValue);
+            continue;
+        }
+        const QString md5 = QString::fromUtf8(md5Value);
+        const QString format = QString::fromUtf8(formatValue);
+        duckdb_free(md5Value);
+        duckdb_free(formatValue);
+        // Videos can't be fingerprinted with SIFT/pHash.
+        if (isVideoFormat(format))
+            continue;
+        const QString path = LibraryCatalog::filePathFor(md5, format);
+        if (path.isEmpty())
+            continue;
+        files.append({md5, path});
+    }
+    duckdb_destroy_result(&res);
 
     // Phase 1: pHash every image in parallel. This is the only per-image
     // work for the whole library; SIFT (the expensive part) is deferred
@@ -120,11 +133,15 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     std::atomic<int> hashed{0};
     const QList<qint64> phashes = QtConcurrent::blockingMapped(
         files, [&hashed, totalFiles, &progress](const QPair<QString, QString>& file) {
-            const qint64 phash = computePhash(readFile(file.second));
+            if (Shutdown::requested())
+                return qint64(0);
+            const qint64 phash = computePhash(MappedFile(file.second).bytes());
             if (progress)
                 progress(hashed.fetch_add(1) + 1, totalFiles);
             return phash;
         });
+    if (Shutdown::requested())
+        return pairs;
 
     QList<Entry> entries;
     entries.reserve(totalFiles);
@@ -142,50 +159,59 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     // more tags wins, and an older post wins when tag counts tie.
     QHash<QString, Entry*> entryIndex;
     for (Entry& e : entries) entryIndex.insert(e.md5, &e);
-    try {
-        duckdb_result meta{};
-        const QString metaSql = QStringLiteral(
-            "SELECT i.md5, epoch(i.created_at), "
-            "       (SELECT COUNT(*) FROM image_tags it WHERE it.image_id = i.id) "
-            "FROM images i "
-            "ORDER BY i.md5");
-        QString dbError;
-        if (conn.query(metaSql, &meta, &dbError)) {
-            const idx_t mRows = duckdb_row_count(&meta);
-            for (idx_t row = 0; row < mRows; ++row) {
-                char* md5Value = duckdb_value_varchar(&meta, 0, row);
-                if (!md5Value)
-                    continue;
-                const QString md5 = QString::fromUtf8(md5Value);
-                duckdb_free(md5Value);
-                Entry* e = entryIndex.value(md5, nullptr);
-                if (!e)
-                    continue;
-                e->createdAt = duckdb_value_int64(&meta, 1, row);
-                e->tagCount = duckdb_value_int64(&meta, 2, row);
-            }
-            duckdb_destroy_result(&meta);
+    // Best-effort: if this query fails the favoring heuristic just falls
+    // back to the md5 order.
+    duckdb_result meta{};
+    const QString metaSql = QStringLiteral(
+        "SELECT i.md5, epoch(i.created_at), "
+        "       (SELECT COUNT(*) FROM image_tags it WHERE it.image_id = i.id) "
+        "FROM images i "
+        "ORDER BY i.md5");
+    if (conn.query(metaSql, &meta, &dbError)) {
+        const idx_t mRows = duckdb_row_count(&meta);
+        for (idx_t row = 0; row < mRows; ++row) {
+            char* md5Value = duckdb_value_varchar(&meta, 0, row);
+            if (!md5Value)
+                continue;
+            const QString md5 = QString::fromUtf8(md5Value);
+            duckdb_free(md5Value);
+            Entry* e = entryIndex.value(md5, nullptr);
+            if (!e)
+                continue;
+            e->createdAt = duckdb_value_int64(&meta, 1, row);
+            e->tagCount = duckdb_value_int64(&meta, 2, row);
         }
-    } catch (const std::exception&) {
-        // Metadata enrichment is best-effort; missing it just degrades the
-        // favoring heuristic (falls back to the older post).
+        duckdb_destroy_result(&meta);
     }
 
     // Phase 2: cheap candidate selection (hamming distance on pHash).
 
+    // Still all-pairs, but one row per task across every core; rows are
+    // flattened in order so the candidate list stays deterministic.
     constexpr int kHammingThreshold = 12;
-    QList<QPair<int, int>> candidates;
     const int n = entries.size();
-    for (int i = 0; i < n; ++i) {
-        const Entry& a = entries.at(i);
-        for (int j = i + 1; j < n; ++j) {
-            const Entry& b = entries.at(j);
-            const int hamming = static_cast<int>(
-                std::bitset<64>(static_cast<quint64>(a.phash ^ b.phash)).count());
-            if (hamming <= kHammingThreshold)
-                candidates.append({i, j});
-        }
-    }
+    std::vector<quint64> hashes(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) hashes[static_cast<size_t>(i)] = static_cast<quint64>(entries.at(i).phash);
+    QList<int> rows(n);
+    std::iota(rows.begin(), rows.end(), 0);
+    const QList<QList<QPair<int, int>>> rowCandidates =
+        QtConcurrent::blockingMapped(rows, [&hashes, n](int i) {
+            QList<QPair<int, int>> found;
+            if (Shutdown::requested())
+                return found;
+            const quint64 a = hashes[static_cast<size_t>(i)];
+            for (int j = i + 1; j < n; ++j) {
+                const int hamming =
+                    static_cast<int>(std::bitset<64>(a ^ hashes[static_cast<size_t>(j)]).count());
+                if (hamming <= kHammingThreshold)
+                    found.append({i, j});
+            }
+            return found;
+        });
+    if (Shutdown::requested())
+        return pairs;
+    QList<QPair<int, int>> candidates;
+    for (const auto& row : rowCandidates) candidates += row;
 
     // SIFT only the images that appear in at least one candidate pair -
     // typically a small fraction of the library.
@@ -202,7 +228,9 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     std::atomic<int> sifted{0};
     QtConcurrent::blockingMap(
         siftIndices, [entryData, &sifted, totalFiles, totalWork, &progress](int index) {
-            entryData[index].sift = computeSiftBlob(readFile(entryData[index].path));
+            if (Shutdown::requested())
+                return;
+            entryData[index].sift = computeSiftBlob(MappedFile(entryData[index].path).bytes());
             if (progress)
                 progress(totalFiles + sifted.fetch_add(1) + 1, totalWork);
         });
@@ -213,7 +241,7 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
     auto detailedBlob = [&entries, &detailed](int index) -> const QByteArray& {
         DetailedSift& slot = detailed[static_cast<size_t>(index)];
         std::call_once(slot.once, [&]() {
-            slot.blob = computeSiftBlob(readFile(entries.at(index).path), 16000, 0.01, 0);
+            slot.blob = computeSiftBlob(MappedFile(entries.at(index).path).bytes(), 16000, 0.01, 0);
         });
         return slot.blob;
     };
@@ -231,6 +259,8 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
         candidates, [&entries, &detailedBlob, &compared, totalFiles, totalSift, totalWork,
                      &progress](const QPair<int, int>& c) {
             DuplicatePair pair;
+            if (Shutdown::requested())
+                return pair;
             const Entry& a = entries.at(c.first);
             const Entry& b = entries.at(c.second);
 
@@ -269,6 +299,9 @@ QList<DuplicatePair> DuplicateDetector::findDuplicates(
                 progress(totalFiles + totalSift + compared.fetch_add(1) + 1, totalWork);
             return pair;
         });
+
+    if (Shutdown::requested())
+        return pairs;
 
     // Result cleanup (read-only, the catalog is not modified):
     //  - pairs already organized in one parent/child chain are not conflicts
@@ -333,18 +366,9 @@ bool DuplicateDetector::markResolved(const QString& md5, const QString& md5B, QS
     if (a > b)
         std::swap(a, b);
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return false;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return false;
-    }
 
     const QString sql = QStringLiteral(
                             "INSERT INTO resolved_duplicates (md5_a, md5_b) "
@@ -364,50 +388,36 @@ QPair<QString, QString> DuplicateDetector::retrieveDuplicate(const QString& md5,
                                                              QString* error) const {
     QString a = md5.trimmed();
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return {};
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return {};
-    }
 
-    try {
-        duckdb_result meta{};
-        const QString sql = QStringLiteral(
-                                "SELECT md5_a, md5_b FROM resolved_duplicates "
-                                "WHERE md5_a = %1 OR md5_b = %1")
-                                .arg(quoted(a));
-        QString dbError;
-        if (conn.query(sql, &meta, &dbError)) {
-            const idx_t mRows = duckdb_row_count(&meta);
-            if (mRows > 0) {
-                QString qva;
-                QString qvb;
-                char* va = duckdb_value_varchar(&meta, 0, 0);
-                if (va) {
-                    qva = QString::fromUtf8(va);
-                    duckdb_free(va);
-                }
-                char* vb = duckdb_value_varchar(&meta, 1, 0);
-                if (vb) {
-                    qvb = QString::fromUtf8(vb);
-                    duckdb_free(vb);
-                }
-                if (!qva.isEmpty() && !qvb.isEmpty()) {
-                    return {qva, qvb};
-                }
+    duckdb_result meta{};
+    const QString sql = QStringLiteral(
+                            "SELECT md5_a, md5_b FROM resolved_duplicates "
+                            "WHERE md5_a = %1 OR md5_b = %1")
+                            .arg(quoted(a));
+    QString dbError;
+    if (conn.query(sql, &meta, &dbError)) {
+        const idx_t mRows = duckdb_row_count(&meta);
+        if (mRows > 0) {
+            QString qva;
+            QString qvb;
+            char* va = duckdb_value_varchar(&meta, 0, 0);
+            if (va) {
+                qva = QString::fromUtf8(va);
+                duckdb_free(va);
             }
-            duckdb_destroy_result(&meta);
+            char* vb = duckdb_value_varchar(&meta, 1, 0);
+            if (vb) {
+                qvb = QString::fromUtf8(vb);
+                duckdb_free(vb);
+            }
+            if (!qva.isEmpty() && !qvb.isEmpty()) {
+                return {qva, qvb};
+            }
         }
-    } catch (const std::exception& e) {
-        if (error)
-            *error = QString::fromUtf8(e.what());
+        duckdb_destroy_result(&meta);
     }
     return {};
 }
@@ -415,14 +425,9 @@ QPair<QString, QString> DuplicateDetector::retrieveDuplicate(const QString& md5,
 bool DuplicateDetector::removeFromResolved(const QString& md5) const {
     QString a = md5.trimmed();
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
+    DbConnection conn = Database::instance().connect();
+    if (!conn.isOpen())
         return false;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        return false;
-    }
 
     const QString sql = QStringLiteral(
                             "DELETE FROM resolved_duplicates "
@@ -441,10 +446,7 @@ bool DuplicateDetector::isResolved(const QString& md5, const QString& md5B) cons
     if (a.isEmpty() || b.isEmpty())
         return false;
 
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
 
@@ -470,10 +472,7 @@ bool DuplicateDetector::isMd5Resolved(const QString& md5) const {
     if (a.isEmpty())
         return false;
 
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
 

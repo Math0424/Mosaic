@@ -106,13 +106,27 @@ void splitTagGroups(const QString& tags, QList<TagGroup>& groups, QStringList& e
             continue;
         }
 
+        if (c == QLatin1Char('(') && tags.indexOf(QLatin1Char(')'), i + 1) < 0) {
+            // Unclosed '(': ignore it rather than swallowing the rest of
+            // the query (exclusions, order:) into one OR-group.
+            ++i;
+            continue;
+        }
+
         if (c == QLatin1Char('(')) {
             // Parenthesized OR-group: collect until the matching ')'.
             ++i;
             TagGroup group;
             QString token;
-            while (i < n && tags.at(i) != QLatin1Char(')')) {
+            // Parens inside a tag ("fate_(series)") nest; only a ')' at
+            // depth 0 closes the group.
+            int depth = 0;
+            while (i < n && !(tags.at(i) == QLatin1Char(')') && depth == 0)) {
                 const QChar ch = tags.at(i);
+                if (ch == QLatin1Char('('))
+                    ++depth;
+                else if (ch == QLatin1Char(')'))
+                    --depth;
                 if (ch.isSpace()) {
                     const QString alt = normalizeAlternative(token);
                     if (!alt.isEmpty())

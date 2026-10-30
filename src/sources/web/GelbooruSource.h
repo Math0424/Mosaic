@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QMutex>
 
 #include "HttpSource.h"
 
@@ -24,12 +25,10 @@ class GelbooruSource : public HttpSource {
     QList<SourceImage> childrenOf(const SourceImage& image, QString* error = nullptr) override;
 
     // Optional dapi credentials (gelbooru.com and safebooru.org require them).
-    void setCredentials(const QString& userId, const QString& apiKey) {
-        m_userId = userId;
-        m_apiKey = apiKey;
-    }
+    // Set from the GUI thread while worker threads read them in addAuth().
+    void setCredentials(const QString& userId, const QString& apiKey);
 
-    bool hasCredentials() const { return !m_userId.isEmpty() && !m_apiKey.isEmpty(); }
+    bool hasCredentials() const;
 
     // Only usable with configured credentials; hidden otherwise.
     bool isEnabled() const override { return hasCredentials(); }
@@ -46,6 +45,7 @@ class GelbooruSource : public HttpSource {
     QString m_displayName;
     QString m_apiBase;
     QString m_siteBase;
+    mutable QMutex m_credentialsMutex;  // guards m_userId / m_apiKey
     QString m_userId;
     QString m_apiKey;
 };

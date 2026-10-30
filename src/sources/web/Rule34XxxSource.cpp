@@ -146,9 +146,11 @@ SourceResult Rule34XxxSource::search(const SourceQuery& query) {
     static const QRegularExpression scoreRe(QStringLiteral("\\bscore:(-?\\d+)"));
     static const QRegularExpression ratingRe(QStringLiteral("\\brating:(\\w+)"));
 
+    int thumbBlocks = 0;
     auto it = thumbRe.globalMatch(html);
     while (it.hasNext()) {
         const QRegularExpressionMatch m = it.next();
+        ++thumbBlocks;
         const QString block = m.captured(QStringLiteral("block"));
 
         const QString previewUrl =
@@ -205,9 +207,19 @@ SourceResult Rule34XxxSource::search(const SourceQuery& query) {
     }
 
     result.pageLimit = kPageSize;
-    if (result.images.isEmpty())
-        qInfo().noquote() << "rule34.xxx: 0 posts parsed (page" << query.page << ", tags:" << search
-                          << ") - layout may have changed";
+    // A genuinely empty search says so; anything else that yields no posts
+    // means the HTML scraping no longer matches the site's markup.
+    const bool saysEmpty = html.contains(QLatin1String("Nobody here but us chickens"));
+    if (result.images.isEmpty() && (thumbBlocks > 0 || !saysEmpty)) {
+        result.warning = QStringLiteral(
+            "%1 returned a page Mosaic could not read - the site layout may have changed")
+                             .arg(displayName());
+        qWarning().noquote() << "rule34.xxx: 0 posts parsed from" << thumbBlocks
+                             << "thumb block(s) (page" << query.page << ", tags:" << search
+                             << ") - layout may have changed";
+    } else if (result.images.isEmpty())
+        qDebug().noquote() << "rule34.xxx: no results (page" << query.page << ", tags:" << search
+                           << ")";
     else
         qDebug().noquote() << "rule34.xxx search:" << result.images.size() << "images, page"
                            << query.page << "tags:" << search;

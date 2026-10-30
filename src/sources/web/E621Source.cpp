@@ -52,12 +52,12 @@ bool parsePost(const QJsonObject& post, SourceImage& out) {
         return false;
 
     out.sourceId = id();
-    out.remoteId = post.value(QStringLiteral("id")).toInt();
+    out.remoteId = post.value(QStringLiteral("id")).toInteger();
     out.previewUrl = preview.value(QStringLiteral("url")).toString();
     out.sampleUrl = sample.value(QStringLiteral("url")).toString();
     out.width = file.value(QStringLiteral("width")).toInt();
     out.height = file.value(QStringLiteral("height")).toInt();
-    out.fileSize = file.value(QStringLiteral("size")).toInt();
+    out.fileSize = file.value(QStringLiteral("size")).toInteger();
     out.format = file.value(QStringLiteral("ext")).toString();
     out.rating = post.value(QStringLiteral("rating")).toString();
     out.score =
@@ -83,7 +83,7 @@ bool parsePost(const QJsonObject& post, SourceImage& out) {
 
     // Parent chain: relationships.parent_id (null when there is no parent).
     const QJsonObject relationships = post.value(QStringLiteral("relationships")).toObject();
-    out.parentId = relationships.value(QStringLiteral("parent_id")).toInt(0);
+    out.parentId = relationships.value(QStringLiteral("parent_id")).toInteger(0);
     out.hasChildren = relationships.value(QStringLiteral("has_children")).toBool();
 
     // Tags: { general: [...], artist: [...], character: [...], ... }

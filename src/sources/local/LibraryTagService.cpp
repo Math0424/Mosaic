@@ -10,10 +10,7 @@ using namespace LibrarySql;
 
 QStringList LibraryTagService::allTagNames() const {
     QStringList names;
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return names;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return names;
     duckdb_result res{};
@@ -37,10 +34,7 @@ QStringList LibraryTagService::allTagNames() const {
 
 QHash<QString, QString> LibraryTagService::allTagCategories() const {
     QHash<QString, QString> categories;
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return categories;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return categories;
     duckdb_result res{};
@@ -97,73 +91,65 @@ QString LibraryTagService::addTag(const QString& md5, const QString& tagName,
             *error = QStringLiteral("Empty tag name");
         return {};
     }
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return {};
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return {};
-    }
 
-    try {
-        QString category =
-            requestedCategory.isEmpty() ? QStringLiteral("usergroup") : requestedCategory;
-        QString dbError;
+    QString category =
+        requestedCategory.isEmpty() ? QStringLiteral("usergroup") : requestedCategory;
+    QString dbError;
 
-        // Reuse the existing tag row's category when the tag is known.
-        const QString categorySql =
-            QStringLiteral("SELECT category FROM tags WHERE lower(name) = %1 LIMIT 1")
-                .arg(quoted(name));
-        duckdb_result categoryResult{};
-        if (conn.query(categorySql, &categoryResult, &dbError)) {
-            if (duckdb_row_count(&categoryResult) > 0) {
-                char* value = duckdb_value_varchar(&categoryResult, 0, 0);
-                if (value) {
-                    category = QString::fromUtf8(value);
-                    duckdb_free(value);
-                }
+    // Reuse the existing tag row's category when the tag is known.
+    const QString categorySql =
+        QStringLiteral(
+            "SELECT t.category FROM tags t "
+            "WHERE lower(t.name) = %1 "
+            // Same name in several categories: the most-used one wins,
+            // then alphabetical, so the choice is stable.
+            "ORDER BY (SELECT COUNT(*) FROM image_tags it WHERE it.tag_id = t.id) DESC, "
+            "         t.category "
+            "LIMIT 1")
+            .arg(quoted(name));
+    duckdb_result categoryResult{};
+    if (conn.query(categorySql, &categoryResult, &dbError)) {
+        if (duckdb_row_count(&categoryResult) > 0) {
+            char* value = duckdb_value_varchar(&categoryResult, 0, 0);
+            if (value) {
+                category = QString::fromUtf8(value);
+                duckdb_free(value);
             }
-            duckdb_destroy_result(&categoryResult);
         }
+        duckdb_destroy_result(&categoryResult);
+    }
 
-        const QString insertTag = QStringLiteral(
-                                      "INSERT INTO tags(category, name) "
-                                      "VALUES (%1, %2) "
-                                      "ON CONFLICT (category, name) DO NOTHING")
-                                      .arg(quoted(category), quoted(name));
-        if (!conn.execute(insertTag, &dbError)) {
-            if (error)
-                *error = dbError;
-            return {};
-        }
-
-        const QString linkTag = QStringLiteral(
-                                    "INSERT INTO image_tags(image_id, tag_id) "
-                                    "SELECT i.id, t.id "
-                                    "FROM images i "
-                                    "JOIN tags t "
-                                    "  ON t.category = %2 "
-                                    " AND t.name = %3 "
-                                    "WHERE i.md5 = %1 "
-                                    "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                    .arg(quoted(md5), quoted(category), quoted(name));
-        if (!conn.execute(linkTag, &dbError)) {
-            if (error)
-                *error = dbError;
-            return {};
-        }
-
-        return category;
-    } catch (const std::exception& e) {
+    const QString insertTag = QStringLiteral(
+                                  "INSERT INTO tags(category, name) "
+                                  "VALUES (%1, %2) "
+                                  "ON CONFLICT (category, name) DO NOTHING")
+                                  .arg(quoted(category), quoted(name));
+    if (!conn.execute(insertTag, &dbError)) {
         if (error)
-            *error = QString::fromUtf8(e.what());
+            *error = dbError;
         return {};
     }
+
+    const QString linkTag = QStringLiteral(
+                                "INSERT INTO image_tags(image_id, tag_id) "
+                                "SELECT i.id, t.id "
+                                "FROM images i "
+                                "JOIN tags t "
+                                "  ON t.category = %2 "
+                                " AND t.name = %3 "
+                                "WHERE i.md5 = %1 "
+                                "ON CONFLICT (image_id, tag_id) DO NOTHING")
+                                .arg(quoted(md5), quoted(category), quoted(name));
+    if (!conn.execute(linkTag, &dbError)) {
+        if (error)
+            *error = dbError;
+        return {};
+    }
+
+    return category;
 }
 
 bool LibraryTagService::removeTag(const QString& md5, const QString& tagName,
@@ -174,40 +160,25 @@ bool LibraryTagService::removeTag(const QString& md5, const QString& tagName,
             *error = QStringLiteral("Empty tag name");
         return false;
     }
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
+        return false;
+    QString dbError;
+    const QString sql = QStringLiteral(
+                            "DELETE FROM image_tags "
+                            "WHERE image_id = ("
+                            "    SELECT id FROM images WHERE md5 = %1"
+                            ") "
+                            "AND tag_id IN ("
+                            "    SELECT id FROM tags WHERE lower(name) = %2"
+                            ")")
+                            .arg(quoted(md5), quoted(name));
+    if (!conn.execute(sql, &dbError)) {
         if (error)
-            *error = QStringLiteral("Database is not open");
+            *error = dbError;
         return false;
     }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return false;
-    }
-    try {
-        QString dbError;
-        const QString sql = QStringLiteral(
-                                "DELETE FROM image_tags "
-                                "WHERE image_id = ("
-                                "    SELECT id FROM images WHERE md5 = %1"
-                                ") "
-                                "AND tag_id IN ("
-                                "    SELECT id FROM tags WHERE lower(name) = %2"
-                                ")")
-                                .arg(quoted(md5), quoted(name));
-        if (!conn.execute(sql, &dbError)) {
-            if (error)
-                *error = dbError;
-            return false;
-        }
-        return true;
-    } catch (const std::exception& e) {
-        if (error)
-            *error = QString::fromUtf8(e.what());
-        return false;
-    }
+    return true;
 }
 
 int LibraryTagService::mergeTags(const QString& primary, const QStringList& secondaries,
@@ -232,115 +203,120 @@ int LibraryTagService::mergeTags(const QString& primary, const QStringList& seco
         return -1;
     }
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return -1;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
+
+    QString dbError;
+
+    // All-or-nothing: a failure mid-loop must not leave tags half-merged.
+    DbTransaction tx(conn, &dbError);
+    if (!tx.isActive()) {
         if (error)
-            *error = QStringLiteral("Could not open database connection");
+            *error = dbError;
         return -1;
     }
 
-    try {
-        QString dbError;
-
-        // Reuse the primary tag's existing category when it is already known,
-        // otherwise file it under "general".
-        QString category = QStringLiteral("general");
-        {
-            const QString sql =
-                QStringLiteral("SELECT category FROM tags WHERE lower(name) = %1 LIMIT 1")
-                    .arg(quoted(primaryName));
-            duckdb_result res{};
-            if (conn.query(sql, &res, &dbError)) {
-                if (duckdb_row_count(&res) > 0) {
-                    char* value = duckdb_value_varchar(&res, 0, 0);
-                    if (value) {
-                        category = QString::fromUtf8(value);
-                        duckdb_free(value);
-                    }
+    // Reuse the primary tag's existing category when it is already known,
+    // otherwise file it under "general".
+    QString category = QStringLiteral("general");
+    {
+        const QString sql =
+            QStringLiteral(
+            "SELECT t.category FROM tags t "
+            "WHERE lower(t.name) = %1 "
+            // Same name in several categories: the most-used one wins,
+            // then alphabetical, so the choice is stable.
+            "ORDER BY (SELECT COUNT(*) FROM image_tags it WHERE it.tag_id = t.id) DESC, "
+            "         t.category "
+            "LIMIT 1")
+                .arg(quoted(primaryName));
+        duckdb_result res{};
+        if (conn.query(sql, &res, &dbError)) {
+            if (duckdb_row_count(&res) > 0) {
+                char* value = duckdb_value_varchar(&res, 0, 0);
+                if (value) {
+                    category = QString::fromUtf8(value);
+                    duckdb_free(value);
                 }
-                duckdb_destroy_result(&res);
             }
+            duckdb_destroy_result(&res);
+        }
+    }
+
+    const QString insertTag = QStringLiteral(
+                                  "INSERT INTO tags(category, name) "
+                                  "VALUES (%1, %2) "
+                                  "ON CONFLICT (category, name) DO NOTHING")
+                                  .arg(quoted(category), quoted(primaryName));
+    if (!conn.execute(insertTag, &dbError)) {
+        if (error)
+            *error = dbError;
+        return -1;
+    }
+
+    int movedImages = 0;
+    for (const QString& name : secondaryNames) {
+        // How many images carry this secondary tag (for the status line).
+        const QString countSql = QStringLiteral(
+                                     "SELECT COUNT(DISTINCT it.image_id) "
+                                     "FROM image_tags it "
+                                     "JOIN tags t ON t.id = it.tag_id "
+                                     "WHERE lower(t.name) = %1")
+                                     .arg(quoted(name));
+        duckdb_result res{};
+        if (conn.query(countSql, &res, &dbError)) {
+            if (duckdb_row_count(&res) > 0)
+                movedImages += static_cast<int>(duckdb_value_int64(&res, 0, 0));
+            duckdb_destroy_result(&res);
         }
 
-        const QString insertTag = QStringLiteral(
-                                      "INSERT INTO tags(category, name) "
-                                      "VALUES (%1, %2) "
-                                      "ON CONFLICT (category, name) DO NOTHING")
-                                      .arg(quoted(category), quoted(primaryName));
-        if (!conn.execute(insertTag, &dbError)) {
+        // Re-link every image tagged with the secondary to the primary.
+        const QString linkSql = QStringLiteral(
+                                    "INSERT INTO image_tags(image_id, tag_id) "
+                                    "SELECT it.image_id, p.id "
+                                    "FROM image_tags it "
+                                    "JOIN tags s "
+                                    "  ON s.id = it.tag_id "
+                                    " AND lower(s.name) = %2 "
+                                    "JOIN tags p "
+                                    "  ON p.category = %3 AND p.name = %1 "
+                                    "ON CONFLICT (image_id, tag_id) DO NOTHING")
+                                    .arg(quoted(primaryName), quoted(name), quoted(category));
+        if (!conn.execute(linkSql, &dbError)) {
             if (error)
                 *error = dbError;
             return -1;
         }
 
-        int movedImages = 0;
-        for (const QString& name : secondaryNames) {
-            // How many images carry this secondary tag (for the status line).
-            const QString countSql = QStringLiteral(
-                                         "SELECT COUNT(DISTINCT it.image_id) "
-                                         "FROM image_tags it "
-                                         "JOIN tags t ON t.id = it.tag_id "
-                                         "WHERE lower(t.name) = %1")
-                                         .arg(quoted(name));
-            duckdb_result res{};
-            if (conn.query(countSql, &res, &dbError)) {
-                if (duckdb_row_count(&res) > 0)
-                    movedImages += static_cast<int>(duckdb_value_int64(&res, 0, 0));
-                duckdb_destroy_result(&res);
-            }
-
-            // Re-link every image tagged with the secondary to the primary.
-            const QString linkSql = QStringLiteral(
-                                        "INSERT INTO image_tags(image_id, tag_id) "
-                                        "SELECT it.image_id, p.id "
-                                        "FROM image_tags it "
-                                        "JOIN tags s "
-                                        "  ON s.id = it.tag_id "
-                                        " AND lower(s.name) = %2 "
-                                        "JOIN tags p "
-                                        "  ON lower(p.name) = %1 "
-                                        "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                        .arg(quoted(primaryName), quoted(name));
-            if (!conn.execute(linkSql, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return -1;
-            }
-
-            // Unlink and delete the secondary tag itself.
-            const QString unlinkSql = QStringLiteral(
-                                          "DELETE FROM image_tags "
-                                          "WHERE tag_id IN ("
-                                          "    SELECT id FROM tags WHERE lower(name) = %1"
-                                          ")")
-                                          .arg(quoted(name));
-            if (!conn.execute(unlinkSql, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return -1;
-            }
-
-            const QString deleteTagSql =
-                QStringLiteral("DELETE FROM tags WHERE lower(name) = %1").arg(quoted(name));
-            if (!conn.execute(deleteTagSql, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return -1;
-            }
+        // Unlink and delete the secondary tag itself.
+        const QString unlinkSql = QStringLiteral(
+                                      "DELETE FROM image_tags "
+                                      "WHERE tag_id IN ("
+                                      "    SELECT id FROM tags WHERE lower(name) = %1"
+                                      ")")
+                                      .arg(quoted(name));
+        if (!conn.execute(unlinkSql, &dbError)) {
+            if (error)
+                *error = dbError;
+            return -1;
         }
 
-        return movedImages;
-    } catch (const std::exception& e) {
+        const QString deleteTagSql =
+            QStringLiteral("DELETE FROM tags WHERE lower(name) = %1").arg(quoted(name));
+        if (!conn.execute(deleteTagSql, &dbError)) {
+            if (error)
+                *error = dbError;
+            return -1;
+        }
+    }
+
+    if (!tx.commit(&dbError)) {
         if (error)
-            *error = QString::fromUtf8(e.what());
+            *error = dbError;
         return -1;
     }
+    return movedImages;
 }
 
 }  // namespace Mosaic

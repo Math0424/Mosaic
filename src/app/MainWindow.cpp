@@ -13,11 +13,14 @@
 #include "../feed/FeedPage.h"
 #include "../core/Database.h"
 #include "../core/Paths.h"
+#include "../core/Shutdown.h"
+#include "../core/ThreadPools.h"
 #include "../sources/SourceManager.h"
 #include "../sources/local/LibrarySource.h"
 
 #include <QCloseEvent>
 #include <QDateTime>
+#include <QDebug>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -401,7 +404,7 @@ void MainWindow::restoreState() {
         return;
     }
 
-    if (!m_state.windowGeometry().isNull()) {
+    if (AppState::isGeometryOnScreen(m_state.windowGeometry())) {
         setGeometry(m_state.windowGeometry());
     }
     if (m_state.windowMaximized()) {
@@ -552,18 +555,27 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         if (auto* browser = qobject_cast<SourceBrowser*>(m_tabs->widget(i)))
             browser->closeViewerWindow();
     }
+    // Reload first on purpose: viewer windows save their geometry through
+    // their own AppState, and saveState() would otherwise overwrite it.
     m_state.load();
 
     saveState();
     event->accept();
+
+    // Ask long-running workers (scan, tag refresh, imports, duplicate
+    // search, HTTP waits) to stop at their next safe point.
+    Shutdown::request();
 
     // Close the feed DB before waiting on the pool: its workers hold the
     // DB lock and duckdb_close must not race them. Also CHECKPOINTs the WAL.
     if (m_feedPage)
         m_feedPage->shutdown();
 
-    // Short grace period (1s) - pending feed writes are disposable.
-    if (!QThreadPool::globalInstance()->waitForDone(1000)) {
+    // Cancelled workers finish their current item (one file import or one
+    // HTTP request, which aborts within ~100ms) and drain. The hard exit is
+    // a last resort for a task stuck in a call that cannot be interrupted.
+    if (!ThreadPools::waitForDone(10000)) {
+        qWarning().noquote() << "Shutdown: worker threads still busy after 10s, forcing exit";
         std::thread([]() { Database::instance().close(); }).detach();
         QThread::msleep(250);
         std::_Exit(0);
@@ -761,8 +773,9 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
     switch (event->key()) {
         case Qt::Key_Q:
             if (ctrl) {
+                // closeEvent saves state, stops workers and closes the DB;
+                // the event loop then ends normally (no exit() mid-teardown).
                 close();
-                exit(0);
             }
             break;
         case Qt::Key_T:

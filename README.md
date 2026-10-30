@@ -48,6 +48,9 @@ See the **[build guide](src/README.md)** for prerequisites and commands.
 | **Media** | Images and video |
 | **Built with** | C++20 - Qt 6 - CMake |
 
+Windows is the only supported target: the build files assume MSVC, and the
+single-instance guard (`InstanceGuard`) is a no-op on other platforms.
+
 
 ## Keybinds
 

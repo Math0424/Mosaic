@@ -6,6 +6,7 @@
 #include "VisualFeatures.h"
 #include "../core/AppState.h"
 #include "../core/Paths.h"
+#include "../core/ThreadPools.h"
 #include "../components/FlowLayout.h"
 #include "../components/Icons.h"
 #include "../components/SourceBrowser.h"
@@ -113,10 +114,13 @@ FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* paren
     m_likedSeed = QRandomGenerator::global()->generate() | 1u;
     m_media = new MediaCache(this);
     m_media->setMaxEntries(24);
-    m_db = new FeedDatabase();
-    m_db->open();
-    m_visual = new VisualFeatures(*m_db, m_sources);
-    m_recommender = new FeedRecommender(*m_db, m_sources, state.feedSourceIds(), m_visual);
+    m_db = std::make_unique<FeedDatabase>();
+    QString dbError;
+    if (!m_db->open(&dbError))
+        qWarning().noquote() << "FeedPage: feed database failed to open, feed disabled:" << dbError;
+    m_visual = std::make_unique<VisualFeatures>(*m_db, m_sources);
+    m_recommender =
+        std::make_unique<FeedRecommender>(*m_db, m_sources, state.feedSourceIds(), m_visual.get());
     buildUi();
     startWarmStart();
 
@@ -131,9 +135,8 @@ FeedPage::~FeedPage() {
     shutdown();
     // The warm start holds raw pointers to the members deleted below.
     m_warmStart.waitForFinished();
-    delete m_recommender;
-    delete m_visual;
-    delete m_db;
+    // Members are released in reverse declaration order (recommender,
+    // visual, db), matching their dependencies.
 }
 
 void FeedPage::shutdown() {
@@ -147,9 +150,9 @@ void FeedPage::startWarmStart() {
     if (m_warmStart.isRunning() || !m_db || !m_db->isOpen())
         return;
     m_cancelWarmStart = false;
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     SourceManager* sources = &m_sources;
-    VisualFeatures* visual = m_visual;
+    VisualFeatures* visual = m_visual.get();
     std::atomic<bool>* cancel = &m_cancelWarmStart;
     m_warmStart = QtConcurrent::run(
         [db, sources, visual, cancel]() { FeedWarmStart(*db, *sources, *visual).run(*cancel); });
@@ -293,7 +296,8 @@ void FeedPage::buildUi() {
     m_explorationSlider->setToolTip(
         QStringLiteral("How adventurous the feed is. Left: stick to what you already like. "
                        "Right: more tangents - new tags and looks the feed is unsure about, "
-                       "so it can discover what else you enjoy."));
+                       "so it can discover what else you enjoy. The far right also mixes in "
+                       "random posts unrelated to anything you like."));
     m_explorationLabel = new QLabel(this);
     m_explorationLabel->setMinimumWidth(m_explorationLabel->fontMetrics().horizontalAdvance(
         QStringLiteral("Explore: Adventurous")));
@@ -567,6 +571,12 @@ void FeedPage::keyPressEvent(QKeyEvent* event) {
 void FeedPage::requestMore() {
     if (m_fetching)
         return;
+    if (!m_db->isOpen()) {
+        // Without the feed DB there is no profile to recommend from.
+        m_statusLabel->setText(QStringLiteral(
+            "Feed unavailable: the feed database could not be opened (see Mosaic.log)."));
+        return;
+    }
     m_fetching = true;
     m_statusLabel->setText(QStringLiteral("Finding posts you might like…"));
 
@@ -598,7 +608,7 @@ void FeedPage::requestMore() {
                         ++droppedSeen;
                         continue;
                     }
-                    if (!img.isLocal() && img.fileUrl.isEmpty() && img.sampleUrl.isEmpty() &&
+                    if (!img.isInLibrary() && img.fileUrl.isEmpty() && img.sampleUrl.isEmpty() &&
                         img.previewUrl.isEmpty()) {
                         ++droppedNoUrl;
                         continue;
@@ -662,7 +672,7 @@ void FeedPage::preloadNext() {
         const SourceImage nextImg = m_queue.at(next);
         if (nextImg.md5.isEmpty())
             continue;
-        if (!nextImg.isLocal() && nextImg.fileUrl.isEmpty() && nextImg.sampleUrl.isEmpty() &&
+        if (!nextImg.isInLibrary() && nextImg.fileUrl.isEmpty() && nextImg.sampleUrl.isEmpty() &&
             nextImg.previewUrl.isEmpty())
             continue;
 
@@ -686,7 +696,7 @@ void FeedPage::showPost(const SourceImage& image) {
     if (!image.md5.isEmpty() && !m_interactedMd5s.contains(image.md5)) {
         QStringList tags;
         for (const SourceTag& t : image.tags) tags << t.name;
-        FeedDatabase* db = m_db;
+        FeedDatabase* db = m_db.get();
         const SourceImage img = image;
         const int pos = m_position;
         QThreadPool::globalInstance()->start([db, img, tags, pos]() {
@@ -707,7 +717,7 @@ void FeedPage::showPost(const SourceImage& image) {
     m_mediaLabel->setPixmap(QPixmap());
 
     // Posts with no usable URL can never load - fail fast.
-    if (!image.isLocal() && image.fileUrl.isEmpty() && image.sampleUrl.isEmpty() &&
+    if (!image.isInLibrary() && image.fileUrl.isEmpty() && image.sampleUrl.isEmpty() &&
         image.previewUrl.isEmpty()) {
         skipFailedPost(QStringLiteral("no media URL"));
         return;
@@ -755,7 +765,7 @@ void FeedPage::showPost(const SourceImage& image) {
 
     // Decoding a full-res image (or a video first frame) takes tens to
     // hundreds of ms - do it off-thread, render on the GUI thread.
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     auto decodeOffThread = [db](const SourceImage& post, const QByteArray& bytes,
                                 bool allowSkipOnFailure, QPointer<FeedPage> self) {
         QThreadPool::globalInstance()->start([self, db, post, bytes, allowSkipOnFailure]() {
@@ -771,15 +781,18 @@ void FeedPage::showPost(const SourceImage& image) {
                 [self, post, frame, allowSkipOnFailure]() {
                     if (!self)
                         return;
+                    // Position check first: a late result (even a failure)
+                    // for a post the user already left must not touch, or
+                    // skip, the post now on screen.
+                    if (self->m_position < 0 || self->m_position >= self->m_queue.size())
+                        return;
+                    if (self->m_queue.at(self->m_position).md5 != post.md5)
+                        return;  // user moved on
                     if (frame.isNull()) {
                         if (!self->m_mediaLoaded && allowSkipOnFailure)
                             self->skipFailedPost(QStringLiteral("decode failed"));
                         return;
                     }
-                    if (self->m_position < 0 || self->m_position >= self->m_queue.size())
-                        return;
-                    if (self->m_queue.at(self->m_position).md5 != post.md5)
-                        return;  // user moved on
                     if (allowSkipOnFailure == false && self->m_mediaLoaded)
                         return;  // full quality already shown
                     self->applyDecodedMedia(post, frame);
@@ -908,7 +921,7 @@ void FeedPage::recordCurrent(FeedDatabase::Event event) {
     const qint64 dwell = m_shownAt > 0 ? QDateTime::currentMSecsSinceEpoch() - m_shownAt : 0;
 
     // Training writes run off the GUI thread (DB write lock).
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     QThreadPool::globalInstance()->start([db, event, img, tags, dwellSecs, dwell]() {
         db->recordEvent(event, img.sourceId, img.md5, tags, dwellSecs, -1);
         if (dwell > 0 && dwell < kAbandonMs)
@@ -930,7 +943,7 @@ void FeedPage::advance(bool train) {
 
         // Training writes happen off the GUI thread: recordEvent runs
         // several SQL updates plus a history prune.
-        FeedDatabase* db = m_db;
+        FeedDatabase* db = m_db.get();
         QThreadPool::globalInstance()->start([db, img, tags, dwell]() {
             // Adaptive thresholds from this user's linger history.
             const QHash<QString, qint64> lingers = db->averageLingers();
@@ -1054,7 +1067,7 @@ void FeedPage::toggleDropped() {
             img.sourceId.isEmpty() ? m_sources.remoteSources().value(0)->id() : img.sourceId);
         if (!source)
             continue;
-        QThreadPool::globalInstance()->start([btn, source, img, cacheDir]() {
+        ThreadPools::network()->start([btn, source, img, cacheDir]() {
             QImage decoded;
             const QString cachePath = cacheDir + QLatin1Char('/') + img.md5 + QLatin1String(".jpg");
             if (!decoded.load(cachePath)) {
@@ -1137,7 +1150,7 @@ void FeedPage::loadLikedPage() {
     const int offset = m_likedOffset;
     const int generation = m_likedGeneration;
     const quint32 seed = m_likedSeed;
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     SourceManager* sources = &m_sources;
     QPointer<FeedPage> self(this);
 
@@ -1268,7 +1281,8 @@ void FeedPage::updateExplorationLabel() {
                        : v < 45 ? "Familiar"
                        : v < 65 ? "Balanced"
                        : v < 85 ? "Curious"
-                                : "Adventurous";
+                       : v < 95 ? "Adventurous"
+                                : "Wild";
     m_explorationLabel->setText(QStringLiteral("Explore: %1").arg(QLatin1String(name)));
 }
 
@@ -1288,7 +1302,7 @@ void FeedPage::applyExplorationLevel() {
 
     // The DB write can wait on the training lock: off the GUI thread, and
     // the re-rank starts only once the new level is in place.
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([self, db, level]() {
         db->setExplorationLevel(level);
@@ -1341,8 +1355,8 @@ void FeedPage::updateDebugPanel() {
     const SourceImage current =
         (position >= 0 && position < queue.size()) ? queue.at(position) : SourceImage{};
 
-    FeedDatabase* db = m_db;
-    FeedRecommender* rec = m_recommender;
+    FeedDatabase* db = m_db.get();
+    FeedRecommender* rec = m_recommender.get();
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([self, db, rec, position, sessionStart, queue, current]() {
         DebugSnapshot snap;
@@ -1550,8 +1564,8 @@ void FeedPage::refreshHeavyStats() {
         FeedRecommender::FunnelStats funnel;
     };
 
-    FeedDatabase* db = m_db;
-    FeedRecommender* rec = m_recommender;
+    FeedDatabase* db = m_db.get();
+    FeedRecommender* rec = m_recommender.get();
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([db, rec, self]() {
         HeavyStats stats;
@@ -1821,7 +1835,7 @@ void FeedPage::onDislikeClicked() {
     // Explicit thumbs down: strong negative signal for every tag of the
     // post. OFF the GUI thread - same lock-contention reason as
     // recordCurrent() above.
-    FeedDatabase* db = m_db;
+    FeedDatabase* db = m_db.get();
     const SourceImage imgCopy = img;
     QThreadPool::globalInstance()->start([db, imgCopy, tags, dwell]() {
         db->recordEvent(FeedDatabase::Event::Dislike, imgCopy.sourceId, imgCopy.md5, tags);

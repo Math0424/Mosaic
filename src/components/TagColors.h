@@ -22,4 +22,9 @@ inline QColor categoryColor(const QString& category) {
     return QColor(170, 170, 180);  // general / unknown
 }
 
+// "#rrggbb" form of categoryColor(), for rich-text tooltips.
+inline QString categoryColorHtml(const QString& category) {
+    return categoryColor(category).name(QColor::HexRgb);
+}
+
 }  // namespace Mosaic

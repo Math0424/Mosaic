@@ -42,7 +42,19 @@ QString GelbooruSource::id() const { return m_id; }
 
 QString GelbooruSource::displayName() const { return m_displayName; }
 
+void GelbooruSource::setCredentials(const QString& userId, const QString& apiKey) {
+    QMutexLocker lock(&m_credentialsMutex);
+    m_userId = userId;
+    m_apiKey = apiKey;
+}
+
+bool GelbooruSource::hasCredentials() const {
+    QMutexLocker lock(&m_credentialsMutex);
+    return !m_userId.isEmpty() && !m_apiKey.isEmpty();
+}
+
 void GelbooruSource::addAuth(QUrlQuery& params) const {
+    QMutexLocker lock(&m_credentialsMutex);
     if (!m_userId.isEmpty() && !m_apiKey.isEmpty()) {
         params.addQueryItem(QStringLiteral("user_id"), m_userId);
         params.addQueryItem(QStringLiteral("api_key"), m_apiKey);

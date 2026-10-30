@@ -96,6 +96,34 @@ bool DbConnection::query(const QString& sql, duckdb_result* result, QString* err
     return true;
 }
 
+DbTransaction::DbTransaction(DbConnection& conn, QString* error) : m_conn(conn) {
+    m_active = m_conn.execute(QStringLiteral("BEGIN TRANSACTION"), error);
+}
+
+DbTransaction::~DbTransaction() {
+    if (!m_active)
+        return;
+    QString error;
+    if (!m_conn.execute(QStringLiteral("ROLLBACK"), &error))
+        qWarning().noquote() << "Database: ROLLBACK failed:" << error;
+}
+
+bool DbTransaction::isActive() const { return m_active; }
+
+bool DbTransaction::commit(QString* error) {
+    if (!m_active) {
+        if (error)
+            *error = QStringLiteral("No active transaction");
+        return false;
+    }
+    m_active = false;
+    if (m_conn.execute(QStringLiteral("COMMIT"), error))
+        return true;
+    // A failed COMMIT leaves DuckDB's transaction aborted; end it.
+    m_conn.execute(QStringLiteral("ROLLBACK"));
+    return false;
+}
+
 Database::Database() = default;
 
 Database::~Database() { close(); }
@@ -173,6 +201,18 @@ DbConnection Database::connection() {
         return {};
 
     return DbConnection(m_db);
+}
+
+DbConnection Database::connect(QString* error) {
+    if (!m_db) {
+        if (error)
+            *error = QStringLiteral("Library database is not open");
+        return {};
+    }
+    DbConnection conn(m_db);
+    if (!conn.isOpen() && error)
+        *error = QStringLiteral("Could not open a database connection");
+    return conn;
 }
 
 duckdb_database Database::handle() const { return m_db; }

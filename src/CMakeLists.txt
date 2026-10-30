@@ -65,6 +65,10 @@ add_executable(Mosaic
     core/Paths.cpp
     core/Schema.h
     core/Schema.cpp
+    core/Shutdown.h
+    core/Shutdown.cpp
+    core/ThreadPools.h
+    core/ThreadPools.cpp
     feed/FeedDatabase.h
     feed/FeedDatabase.cpp
     feed/FeedRecommender.h
@@ -115,6 +119,9 @@ option(PUBLISH_NO_CONSOLE "Remove console window for publish builds" OFF)
 add_dependencies(Mosaic Mosaic_build_number)
 target_include_directories(Mosaic PRIVATE "${CMAKE_BINARY_DIR}/generated")
 
+# Single source of truth for the version: project(VERSION ...) at the top level.
+target_compile_definitions(Mosaic PRIVATE MOSAIC_VERSION="${PROJECT_VERSION}")
+
 target_link_libraries(Mosaic PRIVATE
     Qt6::Core
     Qt6::Gui
@@ -128,9 +135,20 @@ target_link_libraries(Mosaic PRIVATE
     duckdb
 )
 
+# Opt-in strictness (the build is warning-free at /W4):
+#   cmake --preset dev -DMOSAIC_WARNINGS_AS_ERRORS=ON -DMOSAIC_STATIC_ANALYSIS=ON
+option(MOSAIC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors (/WX)" OFF)
+option(MOSAIC_STATIC_ANALYSIS "Run the MSVC code analyzer (/analyze) - slow" OFF)
+
 # OpenCV/FFmpeg headers can warn; keep our code strict instead
 if(MSVC)
     target_compile_options(Mosaic PRIVATE /W4 /permissive- /external:W0)
+    if(MOSAIC_WARNINGS_AS_ERRORS)
+        target_compile_options(Mosaic PRIVATE /WX)
+    endif()
+    if(MOSAIC_STATIC_ANALYSIS)
+        target_compile_options(Mosaic PRIVATE /analyze /analyze:external-)
+    endif()
     target_compile_options(Mosaic PRIVATE $<$<CONFIG:Release>:/O2> $<$<CONFIG:Release>:/GL>)
     
     # Modern CMake equivalent for link flags:

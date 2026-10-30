@@ -1,7 +1,9 @@
 #include "MediaCache.h"
 
+#include "../core/ThreadPools.h"
 #include "../sources/local/LibrarySource.h"
 
+#include <QDateTime>
 #include <QDebug>
 #include <QImage>
 #include <QMetaObject>
@@ -14,6 +16,8 @@ namespace Mosaic {
 namespace {
 
 constexpr int kPreviewMaxBytes = 24 * 1024 * 1024;  // sanity cap for decode attempts
+constexpr qint64 kMaxEntryBytes = 128LL * 1024 * 1024;  // larger blobs are not cached
+constexpr qint64 kFailureTtlMs = 30000;  // short: failures are often rate limits
 
 }  // namespace
 
@@ -39,6 +43,19 @@ QImage MediaCache::cachedPreviewImage(const QString& md5) const {
     return {};
 }
 
+bool MediaCache::recentlyFailed(const QString& key) const {
+    const auto it = m_failedAt.constFind(key);
+    return it != m_failedAt.constEnd() &&
+           QDateTime::currentMSecsSinceEpoch() - it.value() < kFailureTtlMs;
+}
+
+void MediaCache::markFetched(const QString& key, bool ok) {
+    if (ok)
+        m_failedAt.remove(key);
+    else
+        m_failedAt.insert(key, QDateTime::currentMSecsSinceEpoch());
+}
+
 bool MediaCache::inFlight(const QString& md5, FileKind kind) const {
     return m_inFlight.contains(cacheKey(md5, kind));
 }
@@ -61,11 +78,16 @@ void MediaCache::fetchIntoCache(Source* source, const SourceImage& image, FileKi
     const QString key = cacheKey(image.md5, kind);
     if (m_cache.contains(key) || m_inFlight.contains(key))
         return;  // cached or already on its way
+    if (recentlyFailed(key)) {
+        if (onReady)
+            onReady();  // nothing cached; callers check cached() and see empty
+        return;
+    }
     m_inFlight.insert(key);
 
     QPointer<MediaCache> self(this);
     const QString md5 = image.md5;
-    QThreadPool::globalInstance()->start([self, source, image, kind, key, md5, onReady]() {
+    ThreadPools::network()->start([self, source, image, kind, key, md5, onReady]() {
         // Library posts are read from disk - never re-downloaded.
         QByteArray bytes;
         LibrarySource library;
@@ -83,11 +105,9 @@ void MediaCache::fetchIntoCache(Source* source, const SourceImage& image, FileKi
                 if (!self)
                     return;
                 self->m_inFlight.remove(key);
+                self->markFetched(key, !bytes.isEmpty());
                 if (!bytes.isEmpty()) {
-                    if (!self->m_cache.contains(key))
-                        self->m_cacheOrder.append(key);
-                    self->m_cache.insert(key, bytes);
-                    self->evict();
+                    self->store(key, bytes);
                 } else {
                     qDebug().noquote() << "MediaCache: fetch returned no data for" << md5;
                 }
@@ -136,9 +156,14 @@ bool MediaCache::request(Source* source, const SourceImage& image,
         return false;
     }
 
+    // Recently failed: start nothing. Callers see neither variant in flight
+    // and treat the post as unavailable (FeedPage skips it).
+    if (recentlyFailed(cacheKey(md5, FileKind::Full)))
+        return false;
+
     QPointer<MediaCache> self(this);
     m_inFlight.insert(cacheKey(md5, FileKind::Full));
-    QThreadPool::globalInstance()->start([self, source, image, md5, onFull]() {
+    ThreadPools::network()->start([self, source, image, md5, onFull]() {
         // Library first, then remote.
         QString error;
         QByteArray bytes;
@@ -158,16 +183,18 @@ bool MediaCache::request(Source* source, const SourceImage& image,
                     return;
                 const QString key = cacheKey(md5, FileKind::Full);
                 self->m_inFlight.remove(key);
+                self->markFetched(key, !bytes.isEmpty());
                 if (bytes.isEmpty()) {
-                    self->m_cache.remove(key);
+                    self->drop(key);
                     const auto subs = self->m_subscribers.take(key);
                     for (const auto& sub : subs) sub(bytes);
+                    // The initiator hears about the failure too, or its UI
+                    // stays on "loading" forever.
+                    if (onFull)
+                        onFull(bytes);
                     return;
                 }
-                if (!self->m_cache.contains(key))
-                    self->m_cacheOrder.append(key);
-                self->m_cache.insert(key, bytes);
-                self->evict();
+                self->store(key, bytes);
                 const auto subs = self->m_subscribers.take(key);
                 for (const auto& sub : subs) sub(bytes);
                 if (onFull)
@@ -181,15 +208,37 @@ bool MediaCache::request(Source* source, const SourceImage& image,
 void MediaCache::invalidate(const QString& md5) {
     for (int i = 0; i < static_cast<int>(FileKind::Full) + 1; ++i) {
         const QString key = cacheKey(md5, static_cast<FileKind>(i));
-        m_cache.remove(key);
+        drop(key);
         m_inFlight.remove(key);
-        m_cacheOrder.removeAll(key);
+        m_failedAt.remove(key);
     }
 }
 
+void MediaCache::store(const QString& key, const QByteArray& bytes) {
+    drop(key);
+    if (bytes.size() > kMaxEntryBytes)
+        return;
+    m_cache.insert(key, bytes);
+    m_cacheOrder.append(key);
+    m_totalBytes += bytes.size();
+    evict();
+}
+
+void MediaCache::drop(const QString& key) {
+    const auto it = m_cache.constFind(key);
+    if (it == m_cache.constEnd())
+        return;
+    m_totalBytes -= it->size();
+    m_cache.erase(it);
+    m_cacheOrder.removeAll(key);
+}
+
 void MediaCache::evict() {
-    while (m_cacheOrder.size() > m_maxEntries) {
+    // Oldest first; the newest entry always stays.
+    while (m_cacheOrder.size() > 1 &&
+           (m_cacheOrder.size() > m_maxEntries || m_totalBytes > m_maxBytes)) {
         const QString key = m_cacheOrder.takeFirst();
+        m_totalBytes -= m_cache.value(key).size();
         m_cache.remove(key);
     }
 }

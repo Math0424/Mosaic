@@ -2,6 +2,9 @@
 build/
 out/
 
+# Local build counter, bumped on every build (cmake/build_number.cmake)
+build_number.txt
+
 # Installer output (Inno Setup)
 build/installer/
 
@@ -26,7 +29,8 @@ Desktop.ini
 third_party/libs/duckdb/**
 third_party/libs/opencv/**
 third_party/libs/ffmpeg/**
-# Leftover ONNX Runtime binaries from before the feed dropped it.
+# Leftover ONNX Runtime binaries from before the feed dropped it. Safe to
+# drop this rule once the folder is deleted locally.
 third_party/libs/onnxruntime/**
 !third_party/libs/ffmpeg/README.md
 

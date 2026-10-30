@@ -1,5 +1,7 @@
 #include "HttpSource.h"
 
+#include "../../core/Shutdown.h"
+
 #include <QDateTime>
 #include <QEventLoop>
 #include <QDebug>
@@ -9,10 +11,13 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QRegularExpression>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+
+#include <memory>
 
 namespace Mosaic {
 
@@ -26,11 +31,28 @@ constexpr int kTimeoutMs = 30000;
 // Retries after "429 Too Many Requests" before giving up.
 constexpr int kMaxRateLimitRetries = 3;
 constexpr int kMaxRetryAfterMs = 60000;
+// How often blocking waits check for app shutdown.
+constexpr int kShutdownPollMs = 100;
+// httpGet buffers the body in memory; anything larger should go through
+// httpDownload (streamed to disk) instead.
+constexpr qint64 kMaxBodyBytes = 512LL * 1024 * 1024;
+
+/**
+ * Masks credential query values (api_key=..., user_id=...) in text that may
+ * reach the log or the UI. Qt's errorString() embeds the URL too.
+ */
+QString redacted(const QString& text) {
+    static const QRegularExpression secrets(
+        QStringLiteral("([?&](?:api_key|user_id|login|password)=)[^&#\\s]*"),
+        QRegularExpression::CaseInsensitiveOption);
+    QString out = text;
+    return out.replace(secrets, QStringLiteral("\\1***"));
+}
 
 QString httpError(QNetworkReply* reply) {
     return QStringLiteral("HTTP %1: %2")
         .arg(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt())
-        .arg(reply->errorString());
+        .arg(redacted(reply->errorString()));
 }
 
 bool isRateLimited(QNetworkReply* reply) {
@@ -86,9 +108,13 @@ bool waitForSlot(const QString& host, int intervalMs, int maxWaitMs) {
         next = slot + qMax(0, intervalMs);
         waitMs = slot - now;
     }
-    if (waitMs > 0)
-        QThread::msleep(static_cast<unsigned long>(waitMs));
-    return true;
+    // Sleep in slices so a cooldown never holds up app shutdown.
+    while (waitMs > 0 && !Shutdown::requested()) {
+        const qint64 slice = qMin<qint64>(waitMs, kShutdownPollMs);
+        QThread::msleep(static_cast<unsigned long>(slice));
+        waitMs -= slice;
+    }
+    return !Shutdown::requested();
 }
 
 /**
@@ -105,6 +131,18 @@ int backOff(const QString& host, int delayMs) {
     qint64& next = pacing.nextSlotMs[host];
     next = qMax(next, QDateTime::currentMSecsSinceEpoch() + cooldown);
     return cooldown;
+}
+
+/**
+ * One manager per worker thread (a QNetworkAccessManager must stay on the
+ * thread that made it), so keep-alive connections and TLS sessions are
+ * reused instead of handshaking on every request. Destroyed at thread exit.
+ */
+QNetworkAccessManager& threadManager() {
+    thread_local std::unique_ptr<QNetworkAccessManager> manager;
+    if (!manager)
+        manager = std::make_unique<QNetworkAccessManager>();
+    return *manager;
 }
 
 void clearStrikes(const QString& host) {
@@ -150,29 +188,47 @@ QByteArray HttpSource::httpGet(const QString& url, QString* error) const {
     t_lastRateLimited = false;
     for (int attempt = 0;; ++attempt) {
         if (!waitForSlot(host, requestIntervalMs(host), t_maxWaitMs)) {
+            if (Shutdown::requested()) {
+                if (error)
+                    *error = QStringLiteral("Shutting down");
+                return {};
+            }
             t_lastRateLimited = true;
             if (error)
                 *error = QStringLiteral("%1 is rate limiting - skipped").arg(host);
-            qDebug().noquote() << "HTTP GET skipped, host cooling down --" << url;
+            qDebug().noquote() << "HTTP GET skipped, host cooling down --" << redacted(url);
             return {};
         }
 
-        QNetworkAccessManager manager;
-        QNetworkReply* reply = manager.get(makeRequest(url));
+        QNetworkReply* reply = threadManager().get(makeRequest(url));
 
         QEventLoop loop;
         QTimer timeout;
         timeout.setSingleShot(true);
         QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
         QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        QTimer shutdownPoll;
+        QObject::connect(&shutdownPoll, &QTimer::timeout, reply, [reply]() {
+            if (Shutdown::requested())
+                reply->abort();
+        });
+        shutdownPoll.start(kShutdownPollMs);
+        bool tooLarge = false;
+        QObject::connect(reply, &QNetworkReply::downloadProgress, reply,
+                         [reply, &tooLarge](qint64 received, qint64 total) {
+                             if (received > kMaxBodyBytes || total > kMaxBodyBytes) {
+                                 tooLarge = true;
+                                 reply->abort();
+                             }
+                         });
         timeout.start(kTimeoutMs);
         loop.exec();
 
         if (timeout.isActive() && isRateLimited(reply)) {
             const int cooldownMs = backOff(host, retryDelayMs(reply, attempt));
-            if (!impatient && attempt < kMaxRateLimitRetries) {
-                qWarning().noquote() << "HTTP 429, retrying in" << cooldownMs << "ms --" << url;
-                reply->deleteLater();
+            if (!impatient && attempt < kMaxRateLimitRetries && !Shutdown::requested()) {
+                qWarning().noquote() << "HTTP 429, retrying in" << cooldownMs << "ms --" << redacted(url);
+                delete reply;  // loop has exited: no signal of reply is on the stack
                 continue;
             }
             // Impatient callers give up at once; the cooldown still
@@ -180,25 +236,31 @@ QByteArray HttpSource::httpGet(const QString& url, QString* error) const {
             t_lastRateLimited = true;
             if (impatient)
                 qWarning().noquote() << "HTTP 429, not retrying (cooling" << host << "for"
-                                     << cooldownMs << "ms) --" << url;
+                                     << cooldownMs << "ms) --" << redacted(url);
         } else if (timeout.isActive() && reply->error() == QNetworkReply::NoError) {
             clearStrikes(host);
         }
 
         QByteArray data;
-        if (!timeout.isActive()) {
+        if (tooLarge) {
             if (error)
-                *error = QStringLiteral("Request timed out: %1").arg(url);
-            qWarning().noquote() << "HTTP GET timed out:" << url;
+                *error = QStringLiteral("Response larger than %1 MB").arg(kMaxBodyBytes >> 20);
+            qWarning().noquote() << "HTTP GET aborted, body too large --" << redacted(url);
+        } else if (!timeout.isActive()) {
+            // The manager outlives this call: stop the transfer explicitly.
+            reply->abort();
+            if (error)
+                *error = QStringLiteral("Request timed out: %1").arg(redacted(url));
+            qWarning().noquote() << "HTTP GET timed out:" << redacted(url);
         } else if (reply->error() != QNetworkReply::NoError) {
             if (error)
                 *error = httpError(reply);
-            qWarning().noquote() << "HTTP GET failed:" << httpError(reply) << "--" << url;
+            qWarning().noquote() << "HTTP GET failed:" << httpError(reply) << "--" << redacted(url);
         } else {
             data = reply->readAll();
-            qDebug().noquote() << "HTTP GET ok:" << data.size() << "bytes --" << url;
+            qDebug().noquote() << "HTTP GET ok:" << data.size() << "bytes --" << redacted(url);
         }
-        reply->deleteLater();
+        delete reply;
         return data;
     }
 }
@@ -220,20 +282,24 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
     t_lastRateLimited = false;
     for (int attempt = 0;; ++attempt) {
         if (!waitForSlot(host, requestIntervalMs(host), t_maxWaitMs)) {
-            t_lastRateLimited = true;
             file.close();
             QFile::remove(path);
+            if (Shutdown::requested()) {
+                if (error)
+                    *error = QStringLiteral("Shutting down");
+                return false;
+            }
+            t_lastRateLimited = true;
             if (error)
                 *error = QStringLiteral("%1 is rate limiting - skipped").arg(host);
-            qDebug().noquote() << "HTTP download skipped, host cooling down --" << url;
+            qDebug().noquote() << "HTTP download skipped, host cooling down --" << redacted(url);
             return false;
         }
         // A retried attempt starts over; drop the rate-limit page's body.
         file.resize(0);
         file.seek(0);
 
-        QNetworkAccessManager manager;
-        QNetworkReply* reply = manager.get(makeRequest(url));
+        QNetworkReply* reply = threadManager().get(makeRequest(url));
 
         // Stream every chunk to disk as it arrives; never buffer the body.
         QEventLoop loop;
@@ -241,6 +307,12 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
         timeout.setSingleShot(true);
         QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
         QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        QTimer shutdownPoll;
+        QObject::connect(&shutdownPoll, &QTimer::timeout, reply, [reply]() {
+            if (Shutdown::requested())
+                reply->abort();
+        });
+        shutdownPoll.start(kShutdownPollMs);
         QObject::connect(reply, &QNetworkReply::readyRead, [&]() {
             file.write(reply->readAll());
             if (progress)
@@ -252,10 +324,10 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
 
         if (timeout.isActive() && isRateLimited(reply)) {
             const int cooldownMs = backOff(host, retryDelayMs(reply, attempt));
-            if (!impatient && attempt < kMaxRateLimitRetries) {
+            if (!impatient && attempt < kMaxRateLimitRetries && !Shutdown::requested()) {
                 qWarning().noquote()
-                    << "HTTP 429, retrying download in" << cooldownMs << "ms --" << url;
-                reply->deleteLater();
+                    << "HTTP 429, retrying download in" << cooldownMs << "ms --" << redacted(url);
+                delete reply;
                 continue;
             }
             t_lastRateLimited = true;
@@ -269,13 +341,14 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
 
         bool ok = false;
         if (!timeout.isActive()) {
+            reply->abort();
             if (error)
-                *error = QStringLiteral("Request timed out: %1").arg(url);
-            qWarning().noquote() << "HTTP download timed out:" << url;
+                *error = QStringLiteral("Request timed out: %1").arg(redacted(url));
+            qWarning().noquote() << "HTTP download timed out:" << redacted(url);
         } else if (reply->error() != QNetworkReply::NoError) {
             if (error)
                 *error = httpError(reply);
-            qWarning().noquote() << "HTTP download failed:" << httpError(reply) << "--" << url;
+            qWarning().noquote() << "HTTP download failed:" << httpError(reply) << "--" << redacted(url);
         } else {
             ok = true;
             if (progress)
@@ -284,7 +357,7 @@ bool HttpSource::httpDownload(const QString& url, const QString& path,
         }
         if (!ok)
             QFile::remove(path);
-        reply->deleteLater();
+        delete reply;
         return ok;
     }
 }

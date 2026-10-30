@@ -3,11 +3,10 @@
 #include <QDebug>
 #include <QFile>
 #include <QIcon>
-#include <QLoggingCategory>
 #include <QMessageBox>
 #include <QTextStream>
-#include <crtdbg.h>
 
+#include "BuildNumber.h"
 #include "app/InstanceGuard.h"
 #include "app/MainWindow.h"
 #include "app/Theme.h"
@@ -17,13 +16,44 @@
 #include "core/FileLogger.h"
 #include "core/Paths.h"
 
-namespace {}  // namespace
+namespace {
+
+// Startup self-tests (GL context, codecs, DuckDB) cost a noticeable delay,
+// so a normal launch runs them only until a build has passed once. The
+// marker holds the last passing build; a failure removes it so the next
+// launch checks again. --selftest always runs them.
+QString selfTestMarkerPath() {
+    return Mosaic::Paths::appDataDir() + QStringLiteral("/selftest.ok");
+}
+
+QByteArray currentBuildId() {
+    return QCoreApplication::applicationVersion().toUtf8() + '+' +
+           QByteArray::number(Mosaic_BUILD_NUMBER);
+}
+
+bool selfTestPassedForThisBuild() {
+    QFile marker(selfTestMarkerPath());
+    return marker.open(QIODevice::ReadOnly) && marker.readAll().trimmed() == currentBuildId();
+}
+
+void recordSelfTestResult(bool passed) {
+    if (!passed) {
+        QFile::remove(selfTestMarkerPath());
+        return;
+    }
+    Mosaic::Paths::ensureCreated();
+    QFile marker(selfTestMarkerPath());
+    if (marker.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        marker.write(currentBuildId());
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("Math"));
     QCoreApplication::setApplicationName(QStringLiteral("Mosaic"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(MOSAIC_VERSION));
     app.setWindowIcon(QIcon(QStringLiteral(":/icon.svg")));
 
     Mosaic::FileLogger::install();
@@ -33,8 +63,8 @@ int main(int argc, char* argv[]) {
     QCommandLineParser parser;
     parser.setApplicationDescription(
         QStringLiteral("Mosaic - bulk image viewing and downloading platform"));
-    const QCommandLineOption helpOpt = parser.addHelpOption();
-    const QCommandLineOption versionOpt = parser.addVersionOption();
+    parser.addHelpOption();
+    parser.addVersionOption();
     const QCommandLineOption selfTestOpt(
         QStringList{QStringLiteral("s"), QStringLiteral("selftest")},
         QStringLiteral("Run stack verification headless and exit (code 0 = all pass)."));
@@ -50,8 +80,11 @@ int main(int argc, char* argv[]) {
         return Mosaic::Verification::allPassed(results) ? 0 : 1;
     }
 
-    const auto results = Mosaic::Verification::runAll();
-    if (!Mosaic::Verification::allPassed(results)) {
+    if (selfTestPassedForThisBuild()) {
+        qDebug().noquote() << "Self-tests skipped (passed before for this build)";
+    } else if (const auto results = Mosaic::Verification::runAll();
+               !Mosaic::Verification::allPassed(results)) {
+        recordSelfTestResult(false);
         QTextStream err(stderr);
         for (const auto& r : results) {
             if (!r.ok) {
@@ -61,6 +94,7 @@ int main(int argc, char* argv[]) {
         }
         err.flush();
     } else {
+        recordSelfTestResult(true);
         qDebug().noquote() << "Self-tests passed";
     }
 

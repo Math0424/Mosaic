@@ -12,6 +12,7 @@
 #include <QWidget>
 
 #include <atomic>
+#include <memory>
 
 class QLabel;
 class QCompleter;
@@ -92,9 +93,9 @@ class FeedPage : public QWidget {
     void loadLikedPage();
 
     SourceManager& m_sources;
-    FeedDatabase* m_db = nullptr;
-    VisualFeatures* m_visual = nullptr;  // visual style descriptors
-    FeedRecommender* m_recommender = nullptr;
+    std::unique_ptr<FeedDatabase> m_db;
+    std::unique_ptr<VisualFeatures> m_visual;  // visual style descriptors
+    std::unique_ptr<FeedRecommender> m_recommender;
     QFuture<void> m_warmStart;
     std::atomic<bool> m_cancelWarmStart{false};
 

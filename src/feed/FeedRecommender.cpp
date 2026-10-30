@@ -53,14 +53,35 @@ double sessionBlendFor(int skipStreak) {
 constexpr double kMmrLambda = 0.75;
 
 // Exploration slider mapping (level in [0, 1]):
+// Extra push for the upper half of the slider: exactly 0 up to 50%, then
+// rising quadratically to 1 at 100%. The bottom half behaves as the plain
+// linear mappings below; only the adventurous end goes further.
+double topBoost(double level) {
+    const double t = qMax(0.0, (level - 0.5) / 0.5);
+    return t * t;
+}
 // Thompson temperature - how far ranking strays from the posterior mean.
-double thompsonTemperature(double level) { return 0.3 + 1.7 * level; }
-// Share of each batch reserved for tangent slots.
-double tangentShare(double level) { return 0.05 + 0.30 * level; }
+double thompsonTemperature(double level) { return 0.3 + 1.7 * level + 1.0 * topBoost(level); }
+// Share of each batch reserved for tangent slots (capped at half a batch).
+double tangentShare(double level) { return 0.05 + 0.30 * level + 0.15 * topBoost(level); }
 // Optimism bonus per unit of uncertainty when picking tangents.
-double tangentOptimism(double level) { return 0.5 + 1.5 * level; }
+double tangentOptimism(double level) { return 0.5 + 1.5 * level + 1.0 * topBoost(level); }
 // Minimum predicted engagement for a tangent: plausible, not random.
-double tangentFloor(double level) { return 0.30 - 0.20 * level; }
+double tangentFloor(double level) { return 0.30 - 0.20 * level - 0.05 * topBoost(level); }
+// Budget multiplier for the exploratory candidate arms.
+double exploratoryArmScale(double level) { return 0.4 + 1.2 * level + 0.8 * topBoost(level); }
+// Optimism (mean + k * sd) when ranking tangent tags to query.
+double tangentTagOptimism(double level) { return 0.3 + 0.9 * level + 0.6 * topBoost(level); }
+// Weight on the heuristic's novelty / exploration terms.
+double curiosityFor(double level) { return 0.5 + level + 0.5 * topBoost(level); }
+// "Throw it at the wall": random posts with no link to any taste, added to
+// the exploration arm only in the upper half of the slider (0 below 50%).
+// Independent of the bandit's arm budget so the slider always delivers it.
+constexpr int kWildcardPostsAtMax = 16;
+int wildcardPosts(double level) {
+    const int n = static_cast<int>(std::lround(kWildcardPostsAtMax * topBoost(level)));
+    return n >= 4 ? n : 0;  // below a handful a query is not worth the request
+}
 
 // Quality floor: minimum site score.
 constexpr int kMinPostScore = 0;
@@ -355,7 +376,7 @@ int FeedRecommender::armLimit(const QString& arm, int base) const {
     double m = m_armMultipliers.value(arm, 1.0);
     // The slider scales the exploratory arms on top of the bandit's view.
     if (isExploratorySource(arm))
-        m *= 0.4 + 1.2 * m_exploration;
+        m *= exploratoryArmScale(m_exploration);
     const int limit = static_cast<int>(std::lround(base * m));
     // Below a handful of results a query is not worth the request.
     return limit >= 4 ? limit : 0;
@@ -607,11 +628,21 @@ QList<FeedRecommender::Candidate> FeedRecommender::candidatesPopular(
 QList<FeedRecommender::Candidate> FeedRecommender::candidatesExploration(
     const QList<FeedDatabase::Taste>& tastes, const QStringList& sourceIds) const {
     QList<Candidate> out;
-    const int limit = armLimit(QStringLiteral("exploration"), 15);
-    if (sourceIds.isEmpty() || limit == 0)
+    if (sourceIds.isEmpty())
         return out;
 
-    // Exploration must not be random garbage: wildcard-expand a
+    const int wild = wildcardPosts(m_exploration);
+    if (wild > 0) {
+        const QString& src = pickSource(sourceIds);
+        for (const SourceImage& img : fetchFromSource(src, QStringLiteral("order:random"), wild))
+            out.append({img, QStringLiteral("exploration"), 0});
+    }
+
+    const int limit = armLimit(QStringLiteral("exploration"), 15);
+    if (limit == 0)
+        return out;
+
+    // The regular arm must not be random garbage: wildcard-expand a
     // tag from a known taste prefix to find nearby-but-unfamiliar content.
     // The seed tag is the most NICHE one (preference x specificity), since
     // a specific prefix expands into a far tighter neighborhood.
@@ -671,7 +702,7 @@ QList<FeedRecommender::ModelStats::LearnedTag> FeedRecommender::tangentTags(cons
         for (int i = 0; i < qMin(5, top.size()); ++i) anchored.insert(top.at(i).second);
     }
     const QStringList sway = m_db.swayTags();
-    const double k = 0.3 + 0.9 * exploration;
+    const double k = tangentTagOptimism(exploration);
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     QList<QPair<double, ModelStats::LearnedTag>> ranked;
     for (auto it = model.beliefs().constBegin(); it != model.beliefs().constEnd(); ++it) {
@@ -680,7 +711,11 @@ QList<FeedRecommender::ModelStats::LearnedTag> FeedRecommender::tangentTags(cons
         const FeedModel::Belief b = model.belief(it.key(), nowMs);
         const double evidence = b.positive + b.negative;
         // Well-established tags (lots of evidence) are not tangents either.
-        if (b.positive <= 0.0 || b.mean <= 0.0 || evidence >= 25.0)
+        // Normally a tangent must have ridden along on liked posts; at the
+        // adventurous end, tags the model is unsure or mildly negative
+        // about qualify too (optimism then ranks the uncertain ones up).
+        const double boost = topBoost(exploration);
+        if (evidence >= 25.0 || b.mean <= -0.15 * boost || (boost <= 0.0 && b.positive <= 0.0))
             continue;
         const QString tag = it.key().mid(2);
         if (isGenericTag(tag) || hardNegs.contains(tag) || sway.contains(tag) ||
@@ -890,7 +925,7 @@ double FeedRecommender::computeSignals(const ScoringContext& ctx, const FeedMode
     signalValues[kSignalExplore] = isExploratorySource(source) ? 1.0 : 0.0;
 
     // The heuristic score itself. The slider leans its curiosity terms.
-    const double curiosity = 0.5 + ctx.exploration;
+    const double curiosity = curiosityFor(ctx.exploration);
     const double blendedTaste = (1.0 - ctx.sessionBlend) * signalValues[kSignalTaste] +
                                 ctx.sessionBlend * signalValues[kSignalSession];
     return kUserSimWeight * blendedTaste + kSessionSimWeight * signalValues[kSignalSession] +
@@ -999,7 +1034,10 @@ QList<SourceImage> FeedRecommender::allocateAndDiversify(QList<Candidate>& candi
             const Scored& s = scored.at(i);
             if (s.probability < floor)
                 continue;
-            const double bonus = isExploratorySource(s.candidate.source) ? 0.5 : 0.0;
+            // Posts the exploratory arms found deliberately get extra
+            // credit, much more at the adventurous end of the slider.
+            const double bonus =
+                isExploratorySource(s.candidate.source) ? 0.5 + 1.5 * topBoost(level) : 0.0;
             ranked.append({s.meanLogit + optimism * (1.0 + bonus) * s.uncertainty, i});
         }
         std::sort(ranked.begin(), ranked.end(),
@@ -1345,7 +1383,7 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
                 break;
             if (known.contains(c.image.md5))
                 continue;
-            if (!c.image.previewUrl.isEmpty() || !c.image.sampleUrl.isEmpty() || c.image.isLocal())
+            if (!c.image.previewUrl.isEmpty() || !c.image.sampleUrl.isEmpty() || c.image.isInLibrary())
                 jobs.append(c.image);
         }
         if (!jobs.isEmpty())

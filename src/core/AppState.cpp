@@ -5,42 +5,84 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QScreen>
 #include <QDebug>
 
 namespace Mosaic {
 
+bool AppState::isGeometryOnScreen(const QRect& geometry) {
+    if (geometry.width() <= 0 || geometry.height() <= 0)
+        return false;
+    const QRect titleBar(geometry.x(), geometry.y(), geometry.width(), 40);
+    for (const QScreen* screen : QGuiApplication::screens()) {
+        const QRect visible = screen->availableGeometry().intersected(titleBar);
+        if (visible.width() >= 100 && visible.height() >= 20)
+            return true;
+    }
+    return false;
+}
+
 namespace {
 constexpr int kStateVersion = 1;
+
+/**
+ * The state file's root object, shared by load() and the static readers.
+ * Returns false (with a reason) when missing, unreadable or corrupt.
+ */
+bool readStateRoot(QJsonObject* root, QString* error) {
+    QFile file(Paths::stateFile());
+    if (!file.exists()) {
+        if (error)
+            *error = QStringLiteral("No state file yet");
+        return false;
+    }
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        if (error)
+            *error = parseError.errorString();
+        return false;
+    }
+    *root = doc.object();
+    return true;
 }
+
+AppState::SiteCredentials parseCredentials(const QJsonObject& root) {
+    AppState::SiteCredentials credentials;
+    const QJsonObject creds = root.value(QStringLiteral("siteCredentials")).toObject();
+    for (auto it = creds.begin(); it != creds.end(); ++it) {
+        const QJsonObject c = it.value().toObject();
+        const QString userId = c.value(QStringLiteral("user_id")).toString().trimmed();
+        const QString apiKey = c.value(QStringLiteral("api_key")).toString().trimmed();
+        if (!userId.isEmpty() && !apiKey.isEmpty())
+            credentials.insert(it.key(), qMakePair(userId, apiKey));
+    }
+    return credentials;
+}
+
+}  // namespace
 
 AppState::AppState() = default;
 
 bool AppState::load() {
-    QFile file(Paths::stateFile());
-    if (!file.exists()) {
-        m_lastError = QStringLiteral("No state file yet");
-        qDebug().noquote() << "AppState: no state file yet (first run)";
+    QJsonObject root;
+    if (!readStateRoot(&root, &m_lastError)) {
+        if (QFile::exists(Paths::stateFile()))
+            qWarning().noquote() << "AppState: cannot read state file:" << m_lastError;
+        else
+            qDebug().noquote() << "AppState: no state file yet (first run)";
         return false;
     }
-    if (!file.open(QIODevice::ReadOnly)) {
-        m_lastError = file.errorString();
-        qWarning().noquote() << "AppState: cannot open state file:" << m_lastError;
-        return false;
-    }
-
-    QJsonParseError parseError{};
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        m_lastError = parseError.errorString();
-        qWarning().noquote() << "AppState: state file is corrupt:" << m_lastError;
-        return false;
-    }
-
-    const QJsonObject root = doc.object();
 
     const QJsonObject win = root.value(QStringLiteral("window")).toObject();
     const QRect geo(win.value(QStringLiteral("x")).toInt(), win.value(QStringLiteral("y")).toInt(),
@@ -122,15 +164,7 @@ bool AppState::load() {
             m_blacklistTags.insert(tag);
     }
 
-    m_siteCredentials.clear();
-    const QJsonObject creds = root.value(QStringLiteral("siteCredentials")).toObject();
-    for (auto it = creds.begin(); it != creds.end(); ++it) {
-        const QJsonObject c = it.value().toObject();
-        const QString userId = c.value(QStringLiteral("user_id")).toString().trimmed();
-        const QString apiKey = c.value(QStringLiteral("api_key")).toString().trimmed();
-        if (!userId.isEmpty() && !apiKey.isEmpty())
-            m_siteCredentials.insert(it.key(), qMakePair(userId, apiKey));
-    }
+    m_siteCredentials = parseCredentials(root);
 
     m_lastError.clear();
     qDebug().noquote() << "AppState: loaded state with" << m_tabs.size() << "tab(s),"
@@ -139,32 +173,17 @@ bool AppState::load() {
 }
 
 QString AppState::readLibraryPath() {
-    QFile file(Paths::stateFile());
-    if (!file.open(QIODevice::ReadOnly))
+    QJsonObject root;
+    if (!readStateRoot(&root, nullptr))
         return {};
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    if (!doc.isObject())
-        return {};
-    return doc.object().value(QStringLiteral("libraryPath")).toString();
+    return root.value(QStringLiteral("libraryPath")).toString();
 }
 
 AppState::SiteCredentials AppState::readSiteCredentials() {
-    SiteCredentials credentials;
-    QFile file(Paths::stateFile());
-    if (!file.open(QIODevice::ReadOnly))
-        return credentials;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    if (!doc.isObject())
-        return credentials;
-    const QJsonObject creds = doc.object().value(QStringLiteral("siteCredentials")).toObject();
-    for (auto it = creds.begin(); it != creds.end(); ++it) {
-        const QJsonObject c = it.value().toObject();
-        const QString userId = c.value(QStringLiteral("user_id")).toString().trimmed();
-        const QString apiKey = c.value(QStringLiteral("api_key")).toString().trimmed();
-        if (!userId.isEmpty() && !apiKey.isEmpty())
-            credentials.insert(it.key(), qMakePair(userId, apiKey));
-    }
-    return credentials;
+    QJsonObject root;
+    if (!readStateRoot(&root, nullptr))
+        return {};
+    return parseCredentials(root);
 }
 
 QStringList AppState::blacklistTags() const {

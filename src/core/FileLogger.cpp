@@ -5,19 +5,21 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QMutex>
-#include <QStringList>
-#include <QTextStream>
 
 namespace Mosaic {
 
 namespace {
 
-// Lines older than this are dropped on boot.
-constexpr int kPruneDays = 2;
+// On boot the log is rotated to Mosaic.log.1 (replacing the previous one)
+// once it is older than this or larger than kRotateBytes.
+constexpr int kRotateDays = 2;
+constexpr qint64 kRotateBytes = 10LL * 1024 * 1024;
 
 QMutex s_mutex;
 bool s_initialized = false;
+QFile* s_file = nullptr;  // kept open; reopening per message was slow
 
 QString logFilePath() { return Paths::appDataDir() + QStringLiteral("/Mosaic.log"); }
 
@@ -37,30 +39,31 @@ const char* typeName(QtMsgType type) {
     return "?";
 }
 
-void pruneOldLines() {
-    QFile file(logFilePath());
+/** Date of the log's first line; invalid when unreadable or undated. */
+QDate firstLineDate(const QString& path) {
+    QFile file(path);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-        return;
+        return {};
+    return QDate::fromString(QString::fromUtf8(file.readLine(64)).left(10),
+                             QStringLiteral("yyyy-MM-dd"));
+}
 
-    const QStringList lines = QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'));
-    file.close();
-
-    const QDate cutoff = QDate::currentDate().addDays(-kPruneDays);
-    QStringList kept;
-    kept.reserve(lines.size());
-    for (const QString& line : lines) {
-        const QDate lineDate = QDate::fromString(line.left(10), QStringLiteral("yyyy-MM-dd"));
-        if (!lineDate.isValid() || lineDate >= cutoff)  // undated lines are kept
-            kept.append(line);
-    }
-    while (!kept.isEmpty() && kept.last().isEmpty()) kept.removeLast();
-    if (kept.size() == lines.size())
+/**
+ * Renames instead of rewriting in place: a crash mid-way can't lose the
+ * log, and the previous run stays readable in Mosaic.log.1.
+ */
+void rotateIfStale() {
+    const QString path = logFilePath();
+    const QFileInfo info(path);
+    if (!info.exists())
         return;
-
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+    const QDate first = firstLineDate(path);
+    const bool old = first.isValid() && first < QDate::currentDate().addDays(-kRotateDays);
+    if (!old && info.size() <= kRotateBytes)
         return;
-    QTextStream out(&file);
-    for (const QString& line : kept) out << line << '\n';
+    const QString previous = path + QStringLiteral(".1");
+    QFile::remove(previous);
+    QFile::rename(path, previous);
 }
 
 void handler(QtMsgType type, const QMessageLogContext& context, const QString& msg) {
@@ -68,20 +71,23 @@ void handler(QtMsgType type, const QMessageLogContext& context, const QString& m
     if (type == QtFatalMsg)
         fflush(stderr);
 
-    const QString line =
-        QStringLiteral("%1 [%2] %3")
+    const QString prefix =
+        QStringLiteral("%1 [%2] ")
             .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd hh:mm:ss")),
-                 QLatin1String(typeName(type)),
-                 context.category && *context.category
-                     ? QStringLiteral("%1: %2").arg(context.category, msg)
-                     : msg);
+                 QLatin1String(typeName(type)));
+    const QString body = context.category && *context.category
+                             ? QStringLiteral("%1: %2").arg(context.category, msg)
+                             : msg;
 
-    // Append-only, safe for live viewers.
+    // Append-only and flushed per message, safe for live viewers. Every
+    // line of a multi-line message carries the prefix.
     QMutexLocker lock(&s_mutex);
-    QFile file(logFilePath());
-    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-        QTextStream out(&file);
-        out << line << '\n';
+    if (s_file && s_file->isOpen()) {
+        QByteArray out;
+        for (const QStringView line : QStringView(body).split(QLatin1Char('\n')))
+            out += (prefix + line.toString() + QLatin1Char('\n')).toUtf8();
+        s_file->write(out);
+        s_file->flush();
     }
 
     if (type == QtFatalMsg)
@@ -97,7 +103,10 @@ void FileLogger::install() {
     s_initialized = true;
 
     Paths::ensureCreated();
-    pruneOldLines();
+    rotateIfStale();
+    s_file = new QFile(logFilePath());  // process lifetime
+    if (!s_file->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        fprintf(stderr, "FileLogger: cannot open %s\n", qPrintable(logFilePath()));
 
     qInstallMessageHandler(handler);
 }

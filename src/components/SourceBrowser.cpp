@@ -6,6 +6,7 @@
 #include "ViewerWindow.h"
 #include "../app/MainWindow.h"
 #include "../core/Paths.h"
+#include "../core/ThreadPools.h"
 
 #include <QtConcurrentRun>
 #include <QAbstractItemView>
@@ -108,7 +109,7 @@ void ThumbnailButton::paintEvent(QPaintEvent* event) {
         indicators.append(assetIcon(QStringLiteral("images.svg")).pixmap(18, 18));
     }
 
-    if (m_image.localPath.isEmpty() && m_image.isLocal()) {
+    if (m_image.localPath.isEmpty() && m_image.isInLibrary()) {
         indicators.append(assetIcon(QStringLiteral("file.svg")).pixmap(18, 18));
     }
 
@@ -343,7 +344,7 @@ void SourceBrowser::runSearch(int page, FetchMode mode) {
 
     QPointer<SourceBrowser> self(this);
     Source* source = m_source;
-    const auto future = QtConcurrent::run([self, source, query, page, mode]() {
+    const auto future = QtConcurrent::run(ThreadPools::network(), [self, source, query, page, mode]() {
         const SourceResult result = source->search(query);
         if (self) {
             QMetaObject::invokeMethod(
@@ -522,7 +523,7 @@ void SourceBrowser::requestPreview(const SourceImage& image) {
     Source* source = m_source;
     const QString md5 = image.md5;
     const QString cacheDir = thumbCacheDir();
-    const auto future = QtConcurrent::run([self, source, image, md5, cacheDir]() {
+    const auto future = QtConcurrent::run(ThreadPools::network(), [self, source, image, md5, cacheDir]() {
         QImage decoded;
         const QString cachePath = cacheDir + QLatin1Char('/') + md5 + QLatin1String(".jpg");
 

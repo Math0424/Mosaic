@@ -21,6 +21,9 @@ class VideoDecoder {
     static constexpr int kAudioChannels = 2;
     static constexpr int kBytesPerSample = static_cast<int>(sizeof(int16_t));
     static constexpr int kBytesPerSecond = kAudioSampleRate * kAudioChannels * kBytesPerSample;
+    // Bounds on decoded-but-unconsumed data (pump() decodes both streams).
+    static constexpr int kMaxQueuedFrames = 8;
+    static constexpr int kMaxQueuedAudioBytes = kBytesPerSecond * 10;
 
     struct Frame {
         QImage image;
@@ -91,6 +94,7 @@ class VideoDecoder {
     QByteArray m_audioBuffer;
 
     qint64 m_audioServedBytes = 0;
+    int m_decodeErrors = 0;
 
     double m_fps = 0.0;
     double m_videoTimeBase = 0.0;

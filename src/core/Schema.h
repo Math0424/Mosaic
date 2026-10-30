@@ -15,7 +15,7 @@ namespace Mosaic {
 namespace Schema {
 
 // Bump when ddlStatements() changes. Migrations are additive (IF NOT EXISTS).
-constexpr int kVersion = 2;
+constexpr int kVersion = 3;
 
 enum class TagCategory {
     General,

@@ -6,6 +6,7 @@
 #include "../../core/AppState.h"
 #include "../../core/Paths.h"
 #include "../../core/Schema.h"
+#include "../../core/Shutdown.h"
 #include "../SourceManager.h"
 
 #include <QCryptographicHash>
@@ -51,6 +52,18 @@ QStringList mediaFilters() {
 
 }  // namespace
 
+LibraryImporter::LibraryImporter() = default;
+
+LibraryImporter::~LibraryImporter() = default;
+
+QList<Source*> LibraryImporter::remoteSources() {
+    if (!m_sources) {
+        m_sources = std::make_unique<SourceManager>();
+        m_sources->applyGelbooruCredentials(AppState::readSiteCredentials());
+    }
+    return m_sources->remoteSources();
+}
+
 int LibraryImporter::importFolder(const QString& folder, int* skipped,
                                   const std::function<void(int, int)>& progress, QString* error,
                                   bool markFavorite, const QString& userTag) {
@@ -72,12 +85,13 @@ int LibraryImporter::importFolder(const QString& folder, int* skipped,
         return 0;
     }
 
-    LibraryCatalog catalog;
     int imported = 0;
     const int total = files.size();
     int done = 0;
 
     for (const QFileInfo& fi : files) {
+        if (Shutdown::requested())
+            break;
         if (progress)
             progress(++done, total);
         switch (importOneFile(fi, markFavorite, userTag, /*removeOriginal=*/false)) {
@@ -113,6 +127,8 @@ int LibraryImporter::scanLibrary(const std::function<void(int, int)>& progress, 
     QFileInfoList pending;
     const QFileInfoList files = dir.entryInfoList(mediaFilters(), QDir::Files, QDir::Name);
     for (const QFileInfo& fi : files) {
+        if (Shutdown::requested())
+            return 0;
         const QString base = fi.completeBaseName();
         if (LibraryUtils::isValidMd5(base) && catalog.hasImage(base))
             continue;  // already in the catalog
@@ -123,6 +139,8 @@ int LibraryImporter::scanLibrary(const std::function<void(int, int)>& progress, 
     const int total = pending.size();
     int done = 0;
     for (const QFileInfo& fi : pending) {
+        if (Shutdown::requested())
+            break;
         if (progress)
             progress(++done, total);
         if (importOneFile(fi, /*markFavorite=*/false, QString(), /*removeOriginal=*/true) ==
@@ -145,13 +163,14 @@ int LibraryImporter::refreshUntagged(const std::function<void(int, int)>& progre
         catalog.imagesWithTag(QStringLiteral("notags"), QStringLiteral("usergroup"));
     const int total = untagged.size();
     int refreshed = 0;
+    int failed = 0;
     int done = 0;
 
-    SourceManager manager;
-    manager.applyGelbooruCredentials(AppState::readSiteCredentials());
-    const QList<Source*> remotes = manager.remoteSources();
+    const QList<Source*> remotes = remoteSources();
 
     for (const SourceImage& img : untagged) {
+        if (Shutdown::requested())
+            break;
         if (progress)
             progress(++done, total);
 
@@ -194,12 +213,15 @@ int LibraryImporter::refreshUntagged(const std::function<void(int, int)>& progre
                                     .arg(result.error);
             qWarning().noquote() << msg;
             LibraryUtils::logImportFailure(msg);
+            ++failed;
             continue;
         }
         tagService.removeTag(md5, QStringLiteral("notags"));
         ++refreshed;
     }
 
+    if (failed > 0 && error)
+        *error = QStringLiteral("%1 tag refresh(es) failed - see the import log").arg(failed);
     if (progress)
         progress(total, total);
     return refreshed;
@@ -218,19 +240,49 @@ LibraryImporter::Outcome LibraryImporter::importOneFile(const QFileInfo& fi, boo
         return Outcome::Failed;
     }
 
-    // 1. Load the image
-    const QByteArray data = mediaFile.readAll();
-    mediaFile.close();
-
-    // 2. Check if its valid md5. if not get its md5.
-    QString md5 = fi.completeBaseName();
-    if (!LibraryUtils::isValidMd5(md5)) {
-        md5 = QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Md5).toHex());
+    // 1. md5 of the content, streamed - never load the whole file just to
+    // find out it is already cataloged. An md5-looking name is not trusted:
+    // a mislabeled file would be looked up remotely under the wrong post.
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    if (!hash.addData(&mediaFile)) {
+        const QString msg =
+            QStringLiteral("Could not read media file: %1").arg(fi.absoluteFilePath());
+        qWarning().noquote() << msg;
+        LibraryUtils::logImportFailure(msg);
+        return Outcome::Failed;
     }
+    const QString md5 = QString::fromLatin1(hash.result().toHex());
+    const QString nameMd5 = fi.completeBaseName().toLower();
+    if (LibraryUtils::isValidMd5(nameMd5) && nameMd5 != md5)
+        qWarning().noquote() << "Import: file name does not match its content md5, using"
+                             << md5 << "--" << fi.absoluteFilePath();
 
     LibraryCatalog catalog;
-    if (catalog.hasImage(md5))
+    if (catalog.hasImage(md5)) {
+        // Library scan: a stray copy of an already-cataloged image would be
+        // re-hashed on every launch. The stored md5-named file is kept.
+        if (removeOriginal) {
+            mediaFile.close();
+            SourceImage stored;
+            const QString storedPath =
+                catalog.lookupByMd5(md5, &stored) ? stored.localPath : QString();
+            if (!storedPath.isEmpty() &&
+                QFileInfo(storedPath).canonicalFilePath() != fi.canonicalFilePath()) {
+                if (QFile::remove(fi.absoluteFilePath()))
+                    qInfo().noquote() << "Import: removed duplicate stray" << fi.absoluteFilePath()
+                                      << "(already stored as" << storedPath << ")";
+                else
+                    qWarning().noquote() << "Import: could not remove duplicate stray"
+                                         << fi.absoluteFilePath();
+            }
+        }
         return Outcome::Skipped;
+    }
+
+    // 2. New file: load it (one at a time; importImage stores the bytes).
+    mediaFile.seek(0);
+    const QByteArray data = mediaFile.readAll();
+    mediaFile.close();
 
     // Try to resolve post metadata and tags
     QList<SourceTag> tags;
@@ -238,9 +290,7 @@ LibraryImporter::Outcome LibraryImporter::importOneFile(const QFileInfo& fi, boo
     bool match = false;
 
     // 3. Search all remote sources by md5 (e621, r34, gelbooru family, ...)
-    SourceManager manager;  // must outlive the pointers used below
-    manager.applyGelbooruCredentials(AppState::readSiteCredentials());
-    const QList<Source*> remotes = manager.remoteSources();
+    const QList<Source*> remotes = remoteSources();
     for (Source* s : remotes) {
         SourceQuery q;
         q.tags = QStringLiteral("md5:%1").arg(md5);
@@ -361,10 +411,8 @@ LibraryImporter::Outcome LibraryImporter::importOneFile(const QFileInfo& fi, boo
     // Apply import-wide options.
     if (markFavorite)
         catalog.setFavorite(md5, true);
-    if (!userTag.isEmpty()) {
-        LibraryTagService tags;
-        tags.addTag(md5, userTag);
-    }
+    if (!userTag.isEmpty())
+        LibraryTagService().addTag(md5, userTag);
 
     // md5 rename: the catalog copy is md5-named; drop the stray original
     // once it differs from the stored file. The original's modification

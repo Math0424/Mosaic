@@ -103,6 +103,11 @@ class AppState {
     // Reads only the persisted library path (usable before load()).
     static QString readLibraryPath();
 
+    // True when enough of a saved window's title bar lies on a connected
+    // screen to grab it; geometry saved on a since-disconnected monitor
+    // fails this and should not be restored.
+    static bool isGeometryOnScreen(const QRect& geometry);
+
     // Site credentials: sourceId -> {user_id, api_key}.
     using SiteCredentials = QHash<QString, QPair<QString, QString>>;
     SiteCredentials siteCredentials() const { return m_siteCredentials; }

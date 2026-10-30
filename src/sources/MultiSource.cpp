@@ -1,5 +1,7 @@
 #include "MultiSource.h"
 
+#include "../core/ThreadPools.h"
+
 #include <QDebug>
 #include <QFuture>
 #include <QSet>
@@ -21,7 +23,7 @@ SourceResult MultiSource::search(const SourceQuery& query) {
     QList<QFuture<SourceResult>> futures;
     futures.reserve(m_members.size());
     for (Source* member : m_members) {
-        futures.append(QtConcurrent::run([member, query]() { return member->search(query); }));
+        futures.append(QtConcurrent::run(ThreadPools::fanOut(), [member, query]() { return member->search(query); }));
     }
 
     QSet<QString> seen;

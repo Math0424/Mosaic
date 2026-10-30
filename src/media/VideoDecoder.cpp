@@ -1,18 +1,19 @@
 #include "VideoDecoder.h"
 
+#include "../core/Shutdown.h"
+
 #include <QDebug>
 
 #include <QMutexLocker>
 
-#include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
-#include <libavutil/imgutils.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -27,6 +28,13 @@ QString ffError(int err) {
     return QString::fromUtf8(buffer);
 }
 
+// Lets FFmpeg abandon blocking I/O when the app is closing.
+int interruptCallback(void*) { return Shutdown::requested() ? 1 : 0; }
+
+// Corrupt packets are skipped, not treated as end of stream; only the
+// first few are logged so a damaged file can't flood the log.
+constexpr int kMaxLoggedDecodeErrors = 5;
+
 }  // namespace
 
 VideoDecoder::VideoDecoder() = default;
@@ -38,9 +46,16 @@ bool VideoDecoder::open(const QString& path) {
 
     close();
     m_videoFlushed = false;
+    m_decodeErrors = 0;
 
     // Open container
 
+    m_fmt = avformat_alloc_context();
+    if (!m_fmt)
+        return false;
+    m_fmt->interrupt_callback.callback = interruptCallback;
+    m_fmt->interrupt_callback.opaque = nullptr;
+    // Frees and nulls m_fmt on failure.
     if (avformat_open_input(&m_fmt, path.toUtf8().constData(), nullptr, nullptr) < 0) {
         qWarning().noquote() << "VideoDecoder: cannot open container:" << path;
         return false;
@@ -301,7 +316,8 @@ bool VideoDecoder::convertVideoFrame(AVFrame* frame, Frame& output) {
                                nullptr, nullptr, nullptr);
 
         if (!m_sws) {
-            qWarning("sws_getContext failed: %s", qPrintable(ffError(AVERROR(EINVAL))));
+            const char* name = av_get_pix_fmt_name(format);
+            qWarning("sws_getContext failed for %s %dx%d", name ? name : "?", width, height);
             return false;
         }
 
@@ -315,28 +331,11 @@ bool VideoDecoder::convertVideoFrame(AVFrame* frame, Frame& output) {
     if (image.isNull())
         return false;
 
-    uint8_t* rgbData[4] = {nullptr, nullptr, nullptr, nullptr};
-    int rgbLinesize[4] = {0, 0, 0, 0};
-
-    const int bufSize = av_image_alloc(rgbData, rgbLinesize, width, height, AV_PIX_FMT_RGB24, 1);
-
-    if (bufSize < 0)
+    // Scale straight into the QImage's rows; no intermediate buffer.
+    uint8_t* dst[4] = {image.bits(), nullptr, nullptr, nullptr};
+    const int dstLinesize[4] = {static_cast<int>(image.bytesPerLine()), 0, 0, 0};
+    if (sws_scale(m_sws, frame->data, frame->linesize, 0, height, dst, dstLinesize) < 0)
         return false;
-
-    const int scaled =
-        sws_scale(m_sws, frame->data, frame->linesize, 0, height, rgbData, rgbLinesize);
-
-    if (scaled < 0) {
-        av_freep(&rgbData[0]);
-        return false;
-    }
-
-    for (int y = 0; y < height; ++y) {
-        std::memcpy(image.scanLine(y), rgbData[0] + static_cast<qint64>(y) * rgbLinesize[0],
-                    static_cast<size_t>(width) * 3);
-    }
-
-    av_freep(&rgbData[0]);
 
     output.image = std::move(image);
 
@@ -359,14 +358,23 @@ bool VideoDecoder::receiveVideoFrames() {
         }
 
         if (ret < 0) {
-            qWarning("Video decode error: %s", qPrintable(ffError(ret)));
-            return false;
+            if (ret == AVERROR_EXIT || ret == AVERROR(ENOMEM))
+                return false;
+            if (++m_decodeErrors <= kMaxLoggedDecodeErrors)
+                qWarning("Video decode error (skipped): %s", qPrintable(ffError(ret)));
+            return true;
         }
 
         Frame frame;
 
-        if (convertVideoFrame(m_videoFrame, frame))
+        if (convertVideoFrame(m_videoFrame, frame)) {
             m_videoFrames.enqueue(std::move(frame));
+            // takeAudio() decodes video it does not consume; if the video
+            // side stalls, keep only the newest frames (stale ones would be
+            // skipped for A/V sync anyway).
+            while (m_videoFrames.size() > kMaxQueuedFrames)
+                m_videoFrames.dequeue();
+        }
 
         av_frame_unref(m_videoFrame);
     }
@@ -376,8 +384,11 @@ bool VideoDecoder::decodeVideoPacket(AVPacket* packet) {
     const int ret = avcodec_send_packet(m_videoCodec, packet);
 
     if (ret < 0) {
-        qWarning("avcodec_send_packet(video): %s", qPrintable(ffError(ret)));
-        return false;
+        if (ret == AVERROR_EXIT || ret == AVERROR(ENOMEM))
+            return false;
+        if (++m_decodeErrors <= kMaxLoggedDecodeErrors)
+            qWarning("avcodec_send_packet(video, skipped): %s", qPrintable(ffError(ret)));
+        return true;
     }
 
     return receiveVideoFrames();
@@ -394,8 +405,11 @@ bool VideoDecoder::receiveAudioFrames() {
         }
 
         if (ret < 0) {
-            qWarning("Audio decode error: %s", qPrintable(ffError(ret)));
-            return false;
+            if (ret == AVERROR_EXIT || ret == AVERROR(ENOMEM))
+                return false;
+            if (++m_decodeErrors <= kMaxLoggedDecodeErrors)
+                qWarning("Audio decode error (skipped): %s", qPrintable(ffError(ret)));
+            return true;
         }
 
         // swr_get_out_samples() undershoots for WebMs with preroll metadata;
@@ -419,6 +433,14 @@ bool VideoDecoder::receiveAudioFrames() {
                 pcm.truncate(converted * kAudioChannels * kBytesPerSample);
 
                 m_audioBuffer.append(pcm);
+                // nextFrame() decodes audio it does not consume; when nobody
+                // drains it, drop the oldest PCM but count it as served so
+                // audioPositionMs() keeps following the stream.
+                const qint64 excess = m_audioBuffer.size() - kMaxQueuedAudioBytes;
+                if (excess > 0) {
+                    m_audioBuffer.remove(0, static_cast<int>(excess));
+                    m_audioServedBytes += excess;
+                }
             }
         }
 
@@ -433,8 +455,11 @@ bool VideoDecoder::decodeAudioPacket(AVPacket* packet) {
     const int ret = avcodec_send_packet(m_audioCodec, packet);
 
     if (ret < 0) {
-        qWarning("avcodec_send_packet(audio): %s", qPrintable(ffError(ret)));
-        return false;
+        if (ret == AVERROR_EXIT || ret == AVERROR(ENOMEM))
+            return false;
+        if (++m_decodeErrors <= kMaxLoggedDecodeErrors)
+            qWarning("avcodec_send_packet(audio, skipped): %s", qPrintable(ffError(ret)));
+        return true;
     }
 
     return receiveAudioFrames();

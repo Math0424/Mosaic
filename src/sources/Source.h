@@ -6,7 +6,6 @@
 #include <QMetaType>
 #include <QString>
 #include <QStringList>
-#include "../components/TagColors.h"
 
 #include <functional>
 
@@ -16,8 +15,6 @@ namespace Mosaic {
 struct SourceTag {
     QString name;
     QString category;
-
-    QString categoryColorHtml() const { return categoryColor(category).name(QColor::HexRgb); }
 };
 
 enum class FileKind {
@@ -50,7 +47,9 @@ struct SourceImage {
 
     // Set when the image already exists in the local library.
     QString localPath;
-    bool isLocal() const;
+    // True when localPath is set, else asks the library catalog (2-3 DB
+    // queries). Not for render loops or per-item UI paths.
+    bool isInLibrary() const;
 
     // Full copy of every attribute. Use this instead of hand-copying
     // fields when re-targeting an image (e.g. fetching through the local

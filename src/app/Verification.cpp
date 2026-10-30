@@ -2,6 +2,7 @@
 
 #include "../core/Schema.h"
 
+#include <QVersionNumber>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
 #include <QOffscreenSurface>
@@ -53,7 +54,10 @@ QString Verification::formatReport(const QList<CheckResult>& results) {
 CheckResult Verification::checkQt() {
     CheckResult r;
     r.name = QStringLiteral("Qt 6");
-    r.ok = (QT_VERSION >= QT_VERSION_CHECK(6, 5, 0));
+    // Runtime, not QT_VERSION: the compiled version is fixed at build time,
+    // but an older Qt DLL picked up next to the exe would still load.
+    r.ok = QVersionNumber::fromString(QString::fromLatin1(qVersion())) >=
+           QVersionNumber(6, 5, 0);
     r.detail = QStringLiteral("runtime %1 | compiled %2 | ABI: %3 | %4")
                    .arg(QString::fromLatin1(qVersion()), QStringLiteral(QT_VERSION_STR),
                         QSysInfo::buildAbi(), QSysInfo::prettyProductName());

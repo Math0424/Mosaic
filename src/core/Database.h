@@ -33,6 +33,27 @@ class DbConnection {
     duckdb_connection m_connection = nullptr;
 };
 
+// RAII transaction on one connection: BEGIN on construction, ROLLBACK on
+// destruction unless commit() succeeded. Multi-statement writes use it so a
+// failure (or crash) part-way leaves nothing half-applied.
+class DbTransaction {
+   public:
+    explicit DbTransaction(DbConnection& conn, QString* error = nullptr);
+    ~DbTransaction();
+
+    DbTransaction(const DbTransaction&) = delete;
+    DbTransaction& operator=(const DbTransaction&) = delete;
+
+    // False when BEGIN failed; the caller should not proceed.
+    bool isActive() const;
+
+    bool commit(QString* error = nullptr);
+
+   private:
+    DbConnection& m_conn;
+    bool m_active = false;
+};
+
 class Database {
    public:
     static Database& instance();
@@ -51,6 +72,10 @@ class Database {
     QString lastError() const;
 
     DbConnection connection();
+
+    // connection() for callers that report failures: on a closed database
+    // or a failed connect, sets *error and returns a closed connection.
+    DbConnection connect(QString* error = nullptr);
 
     duckdb_database handle() const;
 

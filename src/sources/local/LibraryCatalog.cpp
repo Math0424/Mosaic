@@ -12,6 +12,7 @@
 #include <QImageReader>
 #include <QHash>
 #include <QSaveFile>
+#include <QSet>
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -20,7 +21,25 @@ namespace Mosaic {
 
 namespace {
 
-/** Row -> SourceImage for the standard image query column layout. */
+/**
+ * The standard image column layout read by readImageRow(); the images table
+ * must be aliased `i`. parent_id holds the parent's internal id, but
+ * SourceImage::parentId is exposed in the same id space as remoteId (the
+ * parent's remote id, else its internal id) so the viewer can match them.
+ */
+const QString& imageColumns() {
+    static const QString columns = QStringLiteral(
+        "i.md5, i.width, i.height, i.file_size, i.format, i.rating, "
+        "i.source_id, i.remote_id, i.id, epoch(i.created_at) AS created, "
+        "epoch(i.imported_at) AS imported, "
+        "(SELECT COALESCE(NULLIF(p.remote_id, 0), p.id) FROM images p "
+        " WHERE p.id = i.parent_id) AS parent_display_id, "
+        "i.source_url, "
+        "EXISTS (SELECT 1 FROM images c WHERE c.parent_id = i.id) AS has_children ");
+    return columns;
+}
+
+/** Row -> SourceImage for the imageColumns() layout. */
 SourceImage readImageRow(duckdb_result* res, idx_t row) {
     SourceImage img;
     char* value = duckdb_value_varchar(res, 0, row);
@@ -47,12 +66,12 @@ SourceImage readImageRow(duckdb_result* res, idx_t row) {
     if (value)
         duckdb_free(value);
 
-    img.remoteId = duckdb_value_int32(res, 7, row);
+    img.remoteId = duckdb_value_int64(res, 7, row);
     if (img.remoteId == 0)
-        img.remoteId = duckdb_value_int32(res, 8, row);
+        img.remoteId = duckdb_value_int64(res, 8, row);
 
     img.createdAt = duckdb_value_int64(res, 9, row);
-    img.parentId = duckdb_value_int32(res, 11, row);
+    img.parentId = duckdb_value_int64(res, 11, row);
 
     value = duckdb_value_varchar(res, 12, row);
     img.sourceUrl = value ? QString::fromUtf8(value) : QString();
@@ -131,28 +150,16 @@ SourceResult LibraryCatalog::search(const SourceQuery& query) {
     SourceResult result;
     result.page = query.page;
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        result.error = QStringLiteral("Local database is not open");
+    DbConnection conn = Database::instance().connect(&result.error);
+    if (!conn.isOpen())
         return result;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        result.error = QStringLiteral("Could not open a database connection");
-        return result;
-    }
 
     QList<LibrarySql::TagGroup> groups;
     QStringList exclude;
     QString orderTerm;
     splitTagGroups(query.tags, groups, exclude, orderTerm);
 
-    QString sql = QStringLiteral(
-        "SELECT i.md5, i.width, i.height, i.file_size, i.format, i.rating, "
-        "       i.source_id, i.remote_id, i.id, epoch(i.created_at) AS created, "
-        "       epoch(i.imported_at) AS imported, i.parent_id, i.source_url, "
-        "       EXISTS (SELECT 1 FROM images c WHERE c.parent_id = i.id) AS has_children "
-        "FROM images i ");
+    QString sql = QStringLiteral("SELECT ") + imageColumns() + QStringLiteral("FROM images i ");
 
     QStringList conditions;
     for (const LibrarySql::TagGroup& group : groups) {
@@ -165,7 +172,11 @@ SourceResult LibraryCatalog::search(const SourceQuery& query) {
                 continue;
             }
             if (term.startsWith(QLatin1String("id:"))) {
-                conditions << QStringLiteral("i.remote_id = %1").arg(term.mid(3));
+                // Never splice user text into SQL: a non-numeric id matches nothing.
+                bool ok = false;
+                const qint64 id = term.mid(3).toLongLong(&ok);
+                conditions << (ok ? QStringLiteral("i.remote_id = %1").arg(id)
+                                  : QStringLiteral("FALSE"));
                 continue;
             }
         }
@@ -199,56 +210,51 @@ SourceResult LibraryCatalog::search(const SourceQuery& query) {
     const int offset = (qMax(1, query.page) - 1) * limit;
     sql += orderByClause(orderTerm) + QStringLiteral(" LIMIT %1 OFFSET %2").arg(limit).arg(offset);
 
-    try {
-        duckdb_result res{};
-        QString queryError;
-        if (!conn.query(sql, &res, &queryError)) {
-            result.error = queryError;
-            return result;
-        }
-
-        QStringList md5s;
-        const idx_t rowCount = duckdb_row_count(&res);
-        md5s.reserve(static_cast<int>(rowCount));
-        for (idx_t row = 0; row < rowCount; ++row) {
-            SourceImage img = readImageRow(&res, row);
-            img.localPath = filePathFor(img.md5, img.format);
-            img.status = QStringLiteral("active");
-            result.images.append(img);
-            md5s << quoted(img.md5);
-        }
-        duckdb_destroy_result(&res);
-
-        // Repair rows imported without dimensions (legacy imports, sources
-        // that did not report a size): read the real size from the stored
-        // file and fix the catalog so the UI stops showing 0x0.
-        for (auto& img : result.images) {
-            if (img.width > 0 && img.height > 0)
-                continue;
-            if (img.localPath.isEmpty() || !QFile::exists(img.localPath))
-                continue;
-            QImageReader reader(img.localPath);
-            const QSize size = reader.size();
-            if (size.width() <= 0 || size.height() <= 0)
-                continue;  // videos / unknown formats keep their 0x0
-            img.width = size.width();
-            img.height = size.height();
-            QString fixError;
-            conn.execute(QStringLiteral("UPDATE images SET width = %1, height = %2 WHERE md5 = %3")
-                             .arg(img.width)
-                             .arg(img.height)
-                             .arg(quoted(img.md5)),
-                         &fixError);
-        }
-
-        attachTags(conn, result.images, md5s);
-
-        result.ok = true;
-        return result;
-    } catch (const std::exception& e) {
-        result.error = QString::fromUtf8(e.what());
+    duckdb_result res{};
+    QString queryError;
+    if (!conn.query(sql, &res, &queryError)) {
+        result.error = queryError;
         return result;
     }
+
+    QStringList md5s;
+    const idx_t rowCount = duckdb_row_count(&res);
+    md5s.reserve(static_cast<int>(rowCount));
+    for (idx_t row = 0; row < rowCount; ++row) {
+        SourceImage img = readImageRow(&res, row);
+        img.localPath = filePathFor(img.md5, img.format);
+        img.status = QStringLiteral("active");
+        result.images.append(img);
+        md5s << quoted(img.md5);
+    }
+    duckdb_destroy_result(&res);
+
+    // Repair rows imported without dimensions (legacy imports, sources
+    // that did not report a size): read the real size from the stored
+    // file and fix the catalog so the UI stops showing 0x0.
+    for (auto& img : result.images) {
+        if (img.width > 0 && img.height > 0)
+            continue;
+        if (img.localPath.isEmpty() || !QFile::exists(img.localPath))
+            continue;
+        QImageReader reader(img.localPath);
+        const QSize size = reader.size();
+        if (size.width() <= 0 || size.height() <= 0)
+            continue;  // videos / unknown formats keep their 0x0
+        img.width = size.width();
+        img.height = size.height();
+        QString fixError;
+        conn.execute(QStringLiteral("UPDATE images SET width = %1, height = %2 WHERE md5 = %3")
+                         .arg(img.width)
+                         .arg(img.height)
+                         .arg(quoted(img.md5)),
+                     &fixError);
+    }
+
+    attachTags(conn, result.images, md5s);
+
+    result.ok = true;
+    return result;
 }
 
 bool LibraryCatalog::lookupByMd5(const QString& md5, SourceImage* out) const {
@@ -256,20 +262,12 @@ bool LibraryCatalog::lookupByMd5(const QString& md5, SourceImage* out) const {
 
     if (md5.isEmpty())
         return false;
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
 
-    const QString sql = QStringLiteral(
-                            "SELECT i.md5, i.width, i.height, i.file_size, i.format, i.rating, "
-                            "       i.source_id, i.remote_id, i.id, epoch(i.created_at), "
-                            "       epoch(i.imported_at), i.parent_id, i.source_url, "
-                            "       EXISTS (SELECT 1 FROM images c WHERE c.parent_id = i.id) "
-                            "FROM images i WHERE i.md5 = %1 LIMIT 1")
-                            .arg(quoted(md5));
+    const QString sql = QStringLiteral("SELECT ") + imageColumns() +
+                        QStringLiteral("FROM images i WHERE i.md5 = %1 LIMIT 1").arg(quoted(md5));
 
     duckdb_result res{};
     QString error;
@@ -296,25 +294,18 @@ bool LibraryCatalog::hasImage(const QString& md5) const {
 
     if (md5.isEmpty())
         return false;
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
-    try {
-        duckdb_result res{};
-        QString error;
-        const QString sql =
-            QStringLiteral("SELECT 1 FROM images WHERE md5 = %1 LIMIT 1").arg(quoted(md5));
-        if (!conn.query(sql, &res, &error))
-            return false;
-        const bool exists = duckdb_row_count(&res) > 0;
-        duckdb_destroy_result(&res);
-        return exists;
-    } catch (const std::exception&) {
+    duckdb_result res{};
+    QString error;
+    const QString sql =
+        QStringLiteral("SELECT 1 FROM images WHERE md5 = %1 LIMIT 1").arg(quoted(md5));
+    if (!conn.query(sql, &res, &error))
         return false;
-    }
+    const bool exists = duckdb_row_count(&res) > 0;
+    duckdb_destroy_result(&res);
+    return exists;
 }
 
 QString LibraryCatalog::md5ForPost(const QString& sourceId, qint64 remoteId) const {
@@ -323,35 +314,28 @@ QString LibraryCatalog::md5ForPost(const QString& sourceId, qint64 remoteId) con
     // Local imports carry no real post identity.
     if (sourceId.isEmpty() || sourceId == QLatin1String("local") || remoteId <= 0)
         return QString();
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return QString();
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return QString();
-    try {
-        duckdb_result res{};
-        QString error;
-        const QString sql = QStringLiteral(
-                                "SELECT md5 FROM images "
-                                "WHERE source_id = %1 AND remote_id = %2 LIMIT 1")
-                                .arg(quoted(sourceId))
-                                .arg(remoteId);
-        if (!conn.query(sql, &res, &error))
-            return QString();
-        QString md5;
-        if (duckdb_row_count(&res) > 0) {
-            char* value = duckdb_value_varchar(&res, 0, 0);
-            if (value) {
-                md5 = QString::fromUtf8(value);
-                duckdb_free(value);
-            }
-        }
-        duckdb_destroy_result(&res);
-        return md5;
-    } catch (const std::exception&) {
+    duckdb_result res{};
+    QString error;
+    const QString sql = QStringLiteral(
+                            "SELECT md5 FROM images "
+                            "WHERE source_id = %1 AND remote_id = %2 LIMIT 1")
+                            .arg(quoted(sourceId))
+                            .arg(remoteId);
+    if (!conn.query(sql, &res, &error))
         return QString();
+    QString md5;
+    if (duckdb_row_count(&res) > 0) {
+        char* value = duckdb_value_varchar(&res, 0, 0);
+        if (value) {
+            md5 = QString::fromUtf8(value);
+            duckdb_free(value);
+        }
     }
+    duckdb_destroy_result(&res);
+    return md5;
 }
 
 // files
@@ -365,23 +349,18 @@ QList<SourceImage> LibraryCatalog::imagesWithTag(const QString& tagName,
     if (name.isEmpty())
         return images;
 
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return images;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return images;
 
-    QString sql = QStringLiteral(
-        "SELECT i.md5, i.width, i.height, i.file_size, i.format, i.rating, "
-        "       i.source_id, i.remote_id, i.id, epoch(i.created_at), "
-        "       epoch(i.imported_at), i.parent_id, i.source_url, "
-        "       EXISTS (SELECT 1 FROM images c WHERE c.parent_id = i.id) "
-        "FROM images i "
-        "WHERE EXISTS ("
-        "  SELECT 1 FROM image_tags it "
-        "  JOIN tags t ON t.id = it.tag_id "
-        "  WHERE it.image_id = i.id AND lower(t.name) = %1");
+    QString sql = QStringLiteral("SELECT ") + imageColumns() +
+                  QStringLiteral(
+                      "FROM images i "
+                      "WHERE EXISTS ("
+                      "  SELECT 1 FROM image_tags it "
+                      "  JOIN tags t ON t.id = it.tag_id "
+                      "  WHERE it.image_id = i.id AND lower(t.name) = %1")
+                      .arg(quoted(name));
     if (!category.isEmpty())
         sql += QStringLiteral(" AND t.category = %2").arg(quoted(category));
     sql += QStringLiteral(")");
@@ -470,30 +449,17 @@ bool LibraryCatalog::downloadToFile(const SourceImage& image, FileKind kind, con
 SourceImage LibraryCatalog::parentOf(const SourceImage& image, QString* error) {
     using namespace LibrarySql;
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Local database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return {};
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open a database connection");
-        return {};
-    }
 
-    const QString sql = QStringLiteral(
-                            "SELECT "
-                            "p.md5, p.width, p.height, p.file_size, p.format, p.rating, "
-                            "p.source_url, epoch(p.created_at), epoch(p.imported_at), "
-                            "p.parent_id, "
-                            "EXISTS (SELECT 1 FROM images c "
-                            "        WHERE c.parent_id = p.id AND c.source_id = p.source_id) "
+    // Look the child up by md5: image.remoteId may be a remote post id,
+    // not the internal id that parent_id refers to.
+    const QString sql = QStringLiteral("SELECT ") + imageColumns() +
+                        QStringLiteral(
                             "FROM images i "
-                            "JOIN images p ON p.id = i.parent_id "
-                            "WHERE i.id = %1")
-                            .arg(QString::number(image.remoteId));
+                            "WHERE i.id = (SELECT parent_id FROM images WHERE md5 = %1)")
+                            .arg(quoted(image.md5));
 
     duckdb_result res{};
     QString queryError;
@@ -509,40 +475,27 @@ SourceImage LibraryCatalog::parentOf(const SourceImage& image, QString* error) {
         return {};
     }
     SourceImage parent = readImageRow(&res, 0);
-    parent.hasChildren = duckdb_value_boolean(&res, 10, 0);
     parent.localPath = filePathFor(parent.md5, parent.format);
     parent.status = QStringLiteral("active");
     duckdb_destroy_result(&res);
-    return parent;
+    QList<SourceImage> one{parent};
+    attachTags(conn, one, {quoted(parent.md5)});
+    return one.first();
 }
 
 QList<SourceImage> LibraryCatalog::childrenOf(const SourceImage& image, QString* error) {
     using namespace LibrarySql;
 
     QList<SourceImage> children;
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Local database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return children;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open a database connection");
-        return children;
-    }
 
-    const QString sql = QStringLiteral(
-                            "SELECT "
-                            "c.md5, c.width, c.height, c.file_size, c.format, c.rating, "
-                            "c.source_url, epoch(c.created_at), epoch(c.imported_at), "
-                            "c.parent_id, "
-                            "EXISTS (SELECT 1 FROM images gc WHERE gc.parent_id = c.id) "
-                            "FROM images c "
-                            "JOIN images p ON p.id = c.parent_id "
-                            "WHERE p.md5 = %1 "
-                            "ORDER BY c.imported_at DESC NULLS LAST")
+    const QString sql = QStringLiteral("SELECT ") + imageColumns() +
+                        QStringLiteral(
+                            "FROM images i "
+                            "WHERE i.parent_id = (SELECT id FROM images WHERE md5 = %1) "
+                            "ORDER BY i.imported_at DESC NULLS LAST")
                             .arg(quoted(image.md5));
 
     duckdb_result res{};
@@ -554,23 +507,23 @@ QList<SourceImage> LibraryCatalog::childrenOf(const SourceImage& image, QString*
     }
     const idx_t rowCount = duckdb_row_count(&res);
     children.reserve(static_cast<int>(rowCount));
+    QStringList md5s;
     for (idx_t row = 0; row < rowCount; ++row) {
         SourceImage child = readImageRow(&res, row);
         child.localPath = filePathFor(child.md5, child.format);
         child.status = QStringLiteral("active");
         children.append(child);
+        md5s << quoted(child.md5);
     }
     duckdb_destroy_result(&res);
+    attachTags(conn, children, md5s);
     return children;
 }
 
 bool LibraryCatalog::inParentChildChain(const QString& md5A, const QString& md5B) {
     using namespace LibrarySql;
 
-    Database& db = Database::instance();
-    if (!db.isOpen())
-        return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
 
@@ -687,19 +640,15 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
 
     // Catalog entry. Keep the original creation timestamp from the source;
     // imported_at is stamped now by the schema default.
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        result.error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(&result.error);
+    if (!conn.isOpen())
         return result;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        result.error = QStringLiteral("Could not open database connection");
-        return result;
-    }
 
+    // make_timestamp, not to_timestamp: to_timestamp yields TIMESTAMPTZ, and
+    // casting that into the TIMESTAMP column shifts it by the session time
+    // zone whenever DuckDB is built with ICU. epoch() reads it back as UTC.
     const QString createdAtSql = meta.createdAt > 0
-                                     ? QStringLiteral("to_timestamp(%1)").arg(meta.createdAt)
+                                     ? QStringLiteral("make_timestamp(%1::BIGINT * 1000000)").arg(meta.createdAt)
                                      : QStringLiteral("NULL");
 
     // Some sources do not report dimensions - read the real size from the
@@ -715,45 +664,140 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
         }
     }
 
+    const QString sourceId = meta.sourceId.isEmpty() ? QStringLiteral("local") : meta.sourceId;
+    // Only real posts carry an identity that parent links can refer to.
+    const bool hasPostIdentity = sourceId != QLatin1String("local") && meta.remoteId > 0;
+
+    // Image row, tags and parent links are written as one unit.
+    QString dbError;
+    DbTransaction tx(conn, &dbError);
+    if (!tx.isActive()) {
+        result.error = dbError;
+        return result;
+    }
+
+    // parent_id holds the parent's internal id; resolve the source's remote
+    // parent id when that post is already in the library.
+    qint64 parentInternalId = 0;
+    const bool wantsParent = sourceId != QLatin1String("local") && meta.parentId > 0;
+    if (wantsParent) {
+        duckdb_result res{};
+        const QString sql = QStringLiteral(
+                                "SELECT id FROM images "
+                                "WHERE source_id = %1 AND remote_id = %2 LIMIT 1")
+                                .arg(quoted(sourceId))
+                                .arg(meta.parentId);
+        if (!conn.query(sql, &res, &dbError)) {
+            result.error = dbError;
+            return result;
+        }
+        if (duckdb_row_count(&res) > 0)
+            parentInternalId = duckdb_value_int64(&res, 0, 0);
+        duckdb_destroy_result(&res);
+    }
+
+    // On conflict (re-import, tag refresh) fill in metadata the existing row
+    // is missing - e.g. a "local" scan import later resolved remotely - but
+    // never overwrite values that are already set.
     const QString upsert =
         QStringLiteral(
             "INSERT INTO images("
             "md5, width, height, file_size, format, rating, "
-            "source_id, remote_id, source_url, created_at"
+            "source_id, remote_id, source_url, created_at, parent_id"
             ") VALUES ("
-            "%1, %2, %3, %4, %5, %6, %7, %8, %9, %10"
+            "%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11"
             ") "
-            "ON CONFLICT (md5) DO UPDATE "
-            "SET updated_at = NOW()")
+            "ON CONFLICT (md5) DO UPDATE SET "
+            "updated_at = NOW(), "
+            "width = CASE WHEN COALESCE(width, 0) <= 0 THEN excluded.width ELSE width END, "
+            "height = CASE WHEN COALESCE(height, 0) <= 0 THEN excluded.height ELSE height END, "
+            "file_size = CASE WHEN COALESCE(file_size, 0) <= 0 "
+            "                 THEN excluded.file_size ELSE file_size END, "
+            "rating = COALESCE(NULLIF(rating, ''), excluded.rating), "
+            "source_id = CASE WHEN COALESCE(source_id, '') IN ('', 'local') "
+            "                 THEN excluded.source_id ELSE source_id END, "
+            "remote_id = CASE WHEN COALESCE(remote_id, 0) = 0 "
+            "                 THEN excluded.remote_id ELSE remote_id END, "
+            "source_url = COALESCE(NULLIF(source_url, ''), excluded.source_url), "
+            "created_at = COALESCE(created_at, excluded.created_at), "
+            "parent_id = COALESCE(parent_id, excluded.parent_id)")
             .arg(quoted(md5))
             .arg(width)
             .arg(height)
             .arg(meta.fileSize > 0 ? meta.fileSize : static_cast<qint64>(data.size()))
             .arg(quoted(ext))
             .arg(quoted(meta.rating))
-            .arg(quoted(meta.sourceId.isEmpty() ? QStringLiteral("local") : meta.sourceId))
+            .arg(quoted(sourceId))
             .arg(meta.remoteId)
             .arg(quoted(meta.sourceUrl))
-            .arg(createdAtSql);
-    QString dbError;
+            .arg(createdAtSql)
+            .arg(parentInternalId > 0 ? QString::number(parentInternalId)
+                                      : QStringLiteral("NULL"));
     if (!conn.execute(upsert, &dbError)) {
         result.error = dbError;
         return result;
     }
 
+    QStringList parentStatements;
+    if (wantsParent && parentInternalId <= 0) {
+        // Parent not imported yet: remember the link for when it is.
+        parentStatements << QStringLiteral(
+                                "INSERT INTO pending_parents(image_id, source_id, remote_parent_id) "
+                                "SELECT id, %2, %3 FROM images "
+                                "WHERE md5 = %1 AND parent_id IS NULL "
+                                "ON CONFLICT (image_id) DO UPDATE SET "
+                                "source_id = excluded.source_id, "
+                                "remote_parent_id = excluded.remote_parent_id")
+                                .arg(quoted(md5), quoted(sourceId))
+                                .arg(meta.parentId);
+    }
+    if (hasPostIdentity) {
+        // Adopt children that were imported before this (their parent) post.
+        const QString pending = QStringLiteral(
+                                    "SELECT image_id FROM pending_parents "
+                                    "WHERE source_id = %1 AND remote_parent_id = %2")
+                                    .arg(quoted(sourceId))
+                                    .arg(meta.remoteId);
+        parentStatements << QStringLiteral(
+                                "UPDATE images "
+                                "SET parent_id = (SELECT id FROM images WHERE md5 = %1) "
+                                "WHERE parent_id IS NULL AND md5 <> %1 AND id IN (%2)")
+                                .arg(quoted(md5), pending)
+                         << QStringLiteral(
+                                "DELETE FROM pending_parents "
+                                "WHERE source_id = %1 AND remote_parent_id = %2")
+                                .arg(quoted(sourceId))
+                                .arg(meta.remoteId);
+    }
+    for (const QString& sql : parentStatements) {
+        if (!conn.execute(sql, &dbError)) {
+            result.error = dbError;
+            return result;
+        }
+    }
+
+    // All tags in two statements instead of two per tag.
+    QStringList tagRows;
+    QSet<QString> seenTags;
     for (const SourceTag& tag : meta.tags) {
         const QString name = Schema::normalizeTagName(tag.name);
         if (name.isEmpty())
             continue;
-
         const QString category =
             tag.category.isEmpty() ? QStringLiteral("general") : tag.category.toLower();
-
+        const QString key = category + QLatin1Char(':') + name;
+        if (seenTags.contains(key))
+            continue;
+        seenTags.insert(key);
+        tagRows << QStringLiteral("(%1, %2)").arg(quoted(category), quoted(name));
+    }
+    if (!tagRows.isEmpty()) {
+        const QString values = tagRows.join(QStringLiteral(", "));
         const QString tagInsert = QStringLiteral(
                                       "INSERT INTO tags(category, name) "
-                                      "VALUES (%1, %2) "
+                                      "SELECT category, name FROM (VALUES %1) v(category, name) "
                                       "ON CONFLICT (category, name) DO NOTHING")
-                                      .arg(quoted(category), quoted(name));
+                                      .arg(values);
         if (!conn.execute(tagInsert, &dbError)) {
             result.error = dbError;
             return result;
@@ -762,19 +806,23 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
         const QString linkInsert = QStringLiteral(
                                        "INSERT INTO image_tags(image_id, tag_id) "
                                        "SELECT i.id, t.id "
-                                       "FROM images i "
+                                       "FROM (VALUES %2) v(category, name) "
                                        "JOIN tags t "
-                                       "  ON t.category = %2 "
-                                       " AND t.name = %3 "
-                                       "WHERE i.md5 = %1 "
+                                       "  ON t.category = v.category "
+                                       " AND t.name = v.name "
+                                       "JOIN images i ON i.md5 = %1 "
                                        "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                       .arg(quoted(md5), quoted(category), quoted(name));
+                                       .arg(quoted(md5), values);
         if (!conn.execute(linkInsert, &dbError)) {
             result.error = dbError;
             return result;
         }
     }
 
+    if (!tx.commit(&dbError)) {
+        result.error = dbError;
+        return result;
+    }
     result.ok = true;
     return result;
 }
@@ -782,56 +830,63 @@ ImportResult LibraryCatalog::importImage(const SourceImage& meta, const QByteArr
 bool LibraryCatalog::removeImage(const QString& md5, QString* error) {
     using namespace LibrarySql;
 
-    if (md5.isEmpty()) {
+    // Also guards the file glob below: '*' or '?' in md5 would match others.
+    if (!LibraryUtils::isValidMd5(md5)) {
         if (error)
-            *error = QStringLiteral("Empty md5");
+            *error = QStringLiteral("Invalid md5: %1").arg(md5);
         return false;
     }
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return false;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
+
+    // Catalog rows first, in one transaction; files only once that commits,
+    // so a failure never leaves a row pointing at a deleted file.
+    QString dbError;
+    DbTransaction tx(conn, &dbError);
+    if (!tx.isActive()) {
         if (error)
-            *error = QStringLiteral("Could not open database connection");
+            *error = dbError;
         return false;
     }
 
-    try {
-        QString dbError;
-        const QString dir = Paths::libraryDir();
-        const QStringList files = QDir(dir).entryList({md5 + QStringLiteral(".*")}, QDir::Files);
-        for (const QString& file : files) QFile::remove(dir + QLatin1Char('/') + file);
-
-        const QString deleteTags = QStringLiteral(
-                                       "DELETE FROM image_tags "
-                                       "WHERE image_id = ("
-                                       "    SELECT id FROM images WHERE md5 = %1"
-                                       ")")
-                                       .arg(quoted(md5));
-        if (!conn.execute(deleteTags, &dbError)) {
+    const QString imageId = QStringLiteral("(SELECT id FROM images WHERE md5 = %1)").arg(quoted(md5));
+    const QStringList statements{
+        // Children fall back to a pending link so re-importing this post
+        // relinks them.
+        QStringLiteral("INSERT INTO pending_parents(image_id, source_id, remote_parent_id) "
+                       "SELECT c.id, p.source_id, p.remote_id "
+                       "FROM images c JOIN images p ON p.id = c.parent_id "
+                       "WHERE p.md5 = %1 AND COALESCE(p.remote_id, 0) > 0 "
+                       "  AND COALESCE(p.source_id, '') NOT IN ('', 'local') "
+                       "ON CONFLICT (image_id) DO NOTHING")
+            .arg(quoted(md5)),
+        QStringLiteral("UPDATE images SET parent_id = NULL WHERE parent_id = %1").arg(imageId),
+        QStringLiteral("DELETE FROM pending_parents WHERE image_id = %1").arg(imageId),
+        QStringLiteral("DELETE FROM image_tags WHERE image_id = %1").arg(imageId),
+        QStringLiteral("DELETE FROM images WHERE md5 = %1").arg(quoted(md5)),
+    };
+    for (const QString& sql : statements) {
+        if (!conn.execute(sql, &dbError)) {
             if (error)
                 *error = dbError;
             return false;
         }
-
-        const QString deleteImage =
-            QStringLiteral("DELETE FROM images WHERE md5 = %1").arg(quoted(md5));
-        if (!conn.execute(deleteImage, &dbError)) {
-            if (error)
-                *error = dbError;
-            return false;
-        }
-        return true;
-    } catch (const std::exception& e) {
+    }
+    if (!tx.commit(&dbError)) {
         if (error)
-            *error = QString::fromUtf8(e.what());
+            *error = dbError;
         return false;
     }
+
+    const QString dir = Paths::libraryDir();
+    const QStringList files = QDir(dir).entryList({md5 + QStringLiteral(".*")}, QDir::Files);
+    for (const QString& file : files) {
+        if (!QFile::remove(dir + QLatin1Char('/') + file))
+            qWarning().noquote() << "LibraryCatalog: could not delete" << file;
+    }
+    return true;
 }
 
 // favorites
@@ -839,100 +894,80 @@ bool LibraryCatalog::removeImage(const QString& md5, QString* error) {
 bool LibraryCatalog::setFavorite(const QString& md5, bool favorite, QString* error) {
     using namespace LibrarySql;
 
-    Database& db = Database::instance();
-    if (!db.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Database is not open");
+    DbConnection conn = Database::instance().connect(error);
+    if (!conn.isOpen())
         return false;
-    }
-    DbConnection conn = db.connection();
-    if (!conn.isOpen()) {
-        if (error)
-            *error = QStringLiteral("Could not open database connection");
-        return false;
-    }
-    try {
-        QString dbError;
-        if (favorite) {
-            const QString insertTag = QStringLiteral(
-                "INSERT INTO tags(category, name) "
-                "VALUES ('usergroup', 'favorite') "
-                "ON CONFLICT (category, name) DO NOTHING");
-            if (!conn.execute(insertTag, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return false;
-            }
-            const QString linkTag = QStringLiteral(
-                                        "INSERT INTO image_tags(image_id, tag_id) "
-                                        "SELECT i.id, t.id "
-                                        "FROM images i "
-                                        "JOIN tags t "
-                                        "  ON t.category = 'usergroup' "
-                                        " AND t.name = 'favorite' "
-                                        "WHERE i.md5 = %1 "
-                                        "ON CONFLICT (image_id, tag_id) DO NOTHING")
-                                        .arg(quoted(md5));
-            if (!conn.execute(linkTag, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return false;
-            }
-        } else {
-            const QString removeTag = QStringLiteral(
-                                          "DELETE FROM image_tags "
-                                          "WHERE image_id = ("
-                                          "    SELECT id FROM images WHERE md5 = %1"
-                                          ") "
-                                          "AND tag_id IN ("
-                                          "    SELECT id FROM tags "
-                                          "    WHERE category = 'usergroup' "
-                                          "      AND name = 'favorite'"
-                                          ")")
-                                          .arg(quoted(md5));
-            if (!conn.execute(removeTag, &dbError)) {
-                if (error)
-                    *error = dbError;
-                return false;
-            }
+    QString dbError;
+    if (favorite) {
+        const QString insertTag = QStringLiteral(
+            "INSERT INTO tags(category, name) "
+            "VALUES ('usergroup', 'favorite') "
+            "ON CONFLICT (category, name) DO NOTHING");
+        if (!conn.execute(insertTag, &dbError)) {
+            if (error)
+                *error = dbError;
+            return false;
         }
-        return true;
-    } catch (const std::exception& e) {
-        if (error)
-            *error = QString::fromUtf8(e.what());
-        return false;
+        const QString linkTag = QStringLiteral(
+                                    "INSERT INTO image_tags(image_id, tag_id) "
+                                    "SELECT i.id, t.id "
+                                    "FROM images i "
+                                    "JOIN tags t "
+                                    "  ON t.category = 'usergroup' "
+                                    " AND t.name = 'favorite' "
+                                    "WHERE i.md5 = %1 "
+                                    "ON CONFLICT (image_id, tag_id) DO NOTHING")
+                                    .arg(quoted(md5));
+        if (!conn.execute(linkTag, &dbError)) {
+            if (error)
+                *error = dbError;
+            return false;
+        }
+    } else {
+        const QString removeTag = QStringLiteral(
+                                      "DELETE FROM image_tags "
+                                      "WHERE image_id = ("
+                                      "    SELECT id FROM images WHERE md5 = %1"
+                                      ") "
+                                      "AND tag_id IN ("
+                                      "    SELECT id FROM tags "
+                                      "    WHERE category = 'usergroup' "
+                                      "      AND name = 'favorite'"
+                                      ")")
+                                      .arg(quoted(md5));
+        if (!conn.execute(removeTag, &dbError)) {
+            if (error)
+                *error = dbError;
+            return false;
+        }
     }
+    return true;
 }
 
 bool LibraryCatalog::isFavorite(const QString& md5) const {
     using namespace LibrarySql;
 
-    Database& db = Database::instance();
-    if (!db.isOpen() || md5.isEmpty())
+    if (md5.isEmpty())
         return false;
-    DbConnection conn = db.connection();
+    DbConnection conn = Database::instance().connect();
     if (!conn.isOpen())
         return false;
-    try {
-        duckdb_result res{};
-        QString queryError;
-        const QString sql = QStringLiteral(
-                                "SELECT 1 "
-                                "FROM image_tags it "
-                                "JOIN tags t ON t.id = it.tag_id "
-                                "JOIN images i ON i.id = it.image_id "
-                                "WHERE i.md5 = %1 "
-                                "  AND t.category = 'usergroup' "
-                                "  AND t.name = 'favorite'")
-                                .arg(quoted(md5));
-        if (!conn.query(sql, &res, &queryError))
-            return false;
-        const bool fav = duckdb_row_count(&res) > 0;
-        duckdb_destroy_result(&res);
-        return fav;
-    } catch (const std::exception&) {
+    duckdb_result res{};
+    QString queryError;
+    const QString sql = QStringLiteral(
+                            "SELECT 1 "
+                            "FROM image_tags it "
+                            "JOIN tags t ON t.id = it.tag_id "
+                            "JOIN images i ON i.id = it.image_id "
+                            "WHERE i.md5 = %1 "
+                            "  AND t.category = 'usergroup' "
+                            "  AND t.name = 'favorite'")
+                            .arg(quoted(md5));
+    if (!conn.query(sql, &res, &queryError))
         return false;
-    }
+    const bool fav = duckdb_row_count(&res) > 0;
+    duckdb_destroy_result(&res);
+    return fav;
 }
 
 }  // namespace Mosaic

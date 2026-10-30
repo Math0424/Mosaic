@@ -1,8 +1,10 @@
 #include "SourceManager.h"
 
+#include "../components/TagColors.h"
+
 namespace Mosaic {
 
-bool SourceImage::isLocal() const {
+bool SourceImage::isInLibrary() const {
     if (!localPath.isEmpty()) {
         return true;
     }
@@ -12,7 +14,7 @@ bool SourceImage::isLocal() const {
 }
 
 QString SourceImage::tooltipHtml() const {
-    // "Saved" is a best-effort heuristic; isLocal() would query the DB.
+    // "Saved" is a best-effort heuristic; isInLibrary() would query the DB.
     const bool saved = !localPath.isEmpty();
     const QString savedText = saved ? QStringLiteral("yes") : QStringLiteral("no");
     const QString formatText = format.toHtmlEscaped();
@@ -24,7 +26,7 @@ QString SourceImage::tooltipHtml() const {
     QString tagHtml;
     for (const SourceTag& tag : tags) {
         tagHtml += QStringLiteral("<span style=\"color:%1; white-space:nowrap;\">%2</span> ")
-                       .arg(tag.categoryColorHtml())
+                       .arg(categoryColorHtml(tag.category))
                        .arg(tag.name.toHtmlEscaped());
     }
 
@@ -76,6 +78,13 @@ QList<Source*> SourceManager::remoteSources() const {
 MultiSource* SourceManager::createMultiSource(const QList<Source*>& members) {
     if (members.isEmpty())
         return nullptr;
+    // Reuse an instance with the same members: tabs come and go, and an
+    // instance can't be freed with a tab since a worker may still be
+    // searching it. Reuse keeps the count bounded instead.
+    for (const auto& multi : m_multis) {
+        if (multi->members() == members)
+            return multi.get();
+    }
     m_multis.push_back(std::make_unique<MultiSource>(members));
     return m_multis.back().get();
 }

@@ -19,6 +19,12 @@ namespace Mosaic {
 
 // Registry of all available image sources. Library first; remote sites
 // register here. Resolves tab sourceIds and supplies the new-tab menu.
+//
+// Lifetime contract: worker tasks (MediaCache, SourceBrowser, FeedPage,
+// ViewerWindow) capture raw Source* from here. That is safe only because
+// MainWindow's manager outlives every task: closeEvent drains all thread
+// pools (ThreadPools::waitForDone) before the window, and with it this
+// manager, is destroyed. Keep that ordering when touching shutdown.
 class SourceManager {
    public:
     SourceManager();

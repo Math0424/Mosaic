@@ -18,6 +18,13 @@ namespace Mosaic {
 namespace {
 constexpr quint32 kSiftMagic = 0x5446534B;  // 'KSFT'
 
+/** Decodes to grayscale straight from the caller's bytes (no copy). */
+cv::Mat decodeGray(const QByteArray& encodedImage) {
+    const cv::Mat view(1, static_cast<int>(encodedImage.size()), CV_8U,
+                       const_cast<char*>(encodedImage.constData()));
+    return cv::imdecode(view, cv::IMREAD_GRAYSCALE);
+}
+
 /** Reads the keypoint list of a KSFT blob into OpenCV structures. */
 bool decodeSiftBlob(const QByteArray& blob, std::vector<cv::KeyPoint>& keypoints,
                     cv::Mat& descriptors) {
@@ -65,9 +72,7 @@ QByteArray computeSiftBlob(const QByteArray& encodedImage, int maxFeatures,
     if (encodedImage.isEmpty())
         return {};
 
-    const std::vector<uchar> buf(encodedImage.constData(),
-                                 encodedImage.constData() + encodedImage.size());
-    cv::Mat img = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+    cv::Mat img = decodeGray(encodedImage);
     if (img.empty())
         return {};
 
@@ -118,9 +123,7 @@ int siftKeypointCount(const QByteArray& blob) {
 qint64 computePhash(const QByteArray& encodedImage) {
     if (encodedImage.isEmpty())
         return 0;
-    const std::vector<uchar> buf(encodedImage.constData(),
-                                 encodedImage.constData() + encodedImage.size());
-    cv::Mat img = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+    cv::Mat img = decodeGray(encodedImage);
     if (img.empty())
         return 0;
 
@@ -194,9 +197,7 @@ double matchSiftBlobs(const QByteArray& blobA, const QByteArray& blobB, int* inl
 double computeComplexity(const QByteArray& encodedImage) {
     if (encodedImage.isEmpty())
         return 0.0;
-    const std::vector<uchar> buf(encodedImage.constData(),
-                                 encodedImage.constData() + encodedImage.size());
-    cv::Mat img = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
+    cv::Mat img = decodeGray(encodedImage);
     if (img.empty())
         return 0.0;
 

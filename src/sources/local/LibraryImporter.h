@@ -1,12 +1,17 @@
 #pragma once
 
+#include <QList>
 #include <QString>
 
 #include <functional>
+#include <memory>
 
 class QFileInfo;
 
 namespace Mosaic {
+
+class Source;
+class SourceManager;
 
 // Bulk import of media files into the library: legacy folder imports
 // (md5.ext + sidecars) and scans for uncataloged strays. Metadata per file
@@ -16,7 +21,8 @@ class LibraryImporter {
    public:
     enum class Outcome { Imported, Skipped, Failed };
 
-    LibraryImporter() = default;
+    LibraryImporter();
+    ~LibraryImporter();
 
     int importFolder(const QString& folder, int* skipped = nullptr,
                      const std::function<void(int, int)>& progress = nullptr,
@@ -35,6 +41,11 @@ class LibraryImporter {
                         QString* error = nullptr);
 
    private:
+    // Remote sources (with credentials) for md5 lookups, built on first use
+    // and shared by every file of a batch.
+    QList<Source*> remoteSources();
+    std::unique_ptr<SourceManager> m_sources;
+
     // Shared by importFolder and scanLibrary; with removeOriginal the
     // source file is deleted once its md5-named copy exists.
     Outcome importOneFile(const QFileInfo& fi, bool markFavorite, const QString& userTag,
