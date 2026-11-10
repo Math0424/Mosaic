@@ -10,7 +10,10 @@
 #include "../components/MultiSourceDialog.h"
 #include "../components/SettingsDialog.h"
 #include "../components/SourceBrowser.h"
+#include "../feed/FeedEngine.h"
 #include "../feed/FeedPage.h"
+#include "../web/WebServer.h"
+#include "../web/WebServerDialog.h"
 #include "../core/Database.h"
 #include "../core/Paths.h"
 #include "../core/Shutdown.h"
@@ -84,6 +87,13 @@ MainWindow::MainWindow(Database& db, QWidget* parent) : QMainWindow(parent), m_d
 
     buildUi();
     restoreState();
+
+    m_webServer = new WebServer(m_sources, [this]() { return feedEngine(); }, this);
+    if (m_state.webServerEnabled()) {
+        QString error;
+        if (!applyWebServer(&error))
+            qWarning().noquote() << "Web server did not start:" << error;
+    }
 
     const qint64 cacheBytes = purgeOldCache();
     statusBar()->addPermanentWidget(
@@ -205,6 +215,7 @@ void MainWindow::buildUi() {
         m_tabs->setCurrentIndex(index);
     });
     toolsMenu->addAction(QStringLiteral("&For You feed…"), this, &MainWindow::showFeedPage);
+    toolsMenu->addAction(QStringLiteral("&Web server…"), this, &MainWindow::showWebServerDialog);
     toolsMenu->addSeparator();
     toolsMenu->addAction(QStringLiteral("&Settings…"), this, [this]() {
         const QString oldLibrary = m_state.libraryPath();
@@ -305,7 +316,7 @@ void MainWindow::applyFeedTabSetting() {
 
 void MainWindow::showFeedPage() {
     if (!m_feedPage) {
-        m_feedPage = new FeedPage(m_sources, m_state, m_tabs);
+        m_feedPage = new FeedPage(m_sources, feedEngine(), m_state, m_tabs);
         const int index = m_tabs->addTab(m_feedPage, QStringLiteral("For You"));
         m_tabs->tabBar()->setTabVisible(index, false);
         connect(m_feedPage, &FeedPage::tagSearchRequested, this,
@@ -320,6 +331,56 @@ void MainWindow::showFeedPage() {
                 });
     }
     m_tabs->setCurrentWidget(m_feedPage);
+}
+
+std::shared_ptr<FeedEngine> MainWindow::feedEngine() {
+    if (!m_feedEngine)
+        m_feedEngine = std::make_shared<FeedEngine>(m_sources, m_state.feedSourceIds());
+    return m_feedEngine;
+}
+
+bool MainWindow::applyWebServer(QString* error) {
+    if (!m_state.webServerEnabled()) {
+        m_webServer->stop();
+        m_state.save();
+        return true;
+    }
+    if (m_state.webServerToken().isEmpty())
+        m_state.setWebServerToken(WebServer::generateToken());
+    m_state.save();
+    // Restart so a new port or access key takes effect.
+    m_webServer->stop();
+    if (!m_webServer->start(static_cast<quint16>(m_state.webServerPort()),
+                            m_state.webServerToken(), error))
+        return false;
+    setStatus(QStringLiteral("Web server running on port %1").arg(m_webServer->port()));
+    return true;
+}
+
+bool MainWindow::startWebServerForSession(quint16 port, QString* error) {
+    if (m_state.webServerToken().isEmpty()) {
+        m_state.setWebServerToken(WebServer::generateToken());
+        m_state.save();
+    }
+    m_webServer->stop();
+    const quint16 p = port ? port : static_cast<quint16>(m_state.webServerPort());
+    if (!m_webServer->start(p, m_state.webServerToken(), error))
+        return false;
+    // The access key stays out of Mosaic.log; Tools > Web server shows the full links.
+    for (QString url : m_webServer->urls()) {
+        const int key = url.indexOf(QStringLiteral("?t="));
+        if (key >= 0)
+            url = url.left(key) + QStringLiteral("?t=<key>");
+        qInfo().noquote() << "Web server:" << url;
+    }
+    setStatus(QStringLiteral("Web server running on port %1").arg(m_webServer->port()));
+    return true;
+}
+
+void MainWindow::showWebServerDialog() {
+    WebServerDialog dialog(m_state, *m_webServer,
+                           [this](QString* error) { return applyWebServer(error); }, this);
+    dialog.exec();
 }
 
 void MainWindow::showTabContextMenu(const QPoint& pos) {
@@ -566,10 +627,14 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     // search, HTTP waits) to stop at their next safe point.
     Shutdown::request();
 
+    // No new web requests while the pools drain.
+    if (m_webServer)
+        m_webServer->stop();
+
     // Close the feed DB before waiting on the pool: its workers hold the
     // DB lock and duckdb_close must not race them. Also CHECKPOINTs the WAL.
-    if (m_feedPage)
-        m_feedPage->shutdown();
+    if (m_feedEngine)
+        m_feedEngine->shutdown();
 
     // Cancelled workers finish their current item (one file import or one
     // HTTP request, which aborts within ~100ms) and drain. The hard exit is

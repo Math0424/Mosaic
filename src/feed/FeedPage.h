@@ -25,6 +25,7 @@ class QTextBrowser;
 namespace Mosaic {
 
 class FeedDatabase;
+class FeedEngine;
 class FeedRecommender;
 class VisualFeatures;
 class AppState;
@@ -39,11 +40,9 @@ class FeedPage : public QWidget {
     Q_OBJECT
 
    public:
-    FeedPage(SourceManager& sources, const AppState& state, QWidget* parent = nullptr);
+    FeedPage(SourceManager& sources, std::shared_ptr<FeedEngine> engine, const AppState& state,
+             QWidget* parent = nullptr);
     ~FeedPage() override;
-
-    // Called at app shutdown before the pool drains: closes the feed DB.
-    void shutdown();
 
    protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -79,9 +78,6 @@ class FeedPage : public QWidget {
     void recordCurrent(FeedDatabase::Event event);
     void updateDebugPanel();
     void refreshHeavyStats();
-    // Runs the learned model's warm start in the background (no-op once
-    // it has completed).
-    void startWarmStart();
     void applySwayTags();
     void applyExplorationLevel();
     void updateExplorationLabel();
@@ -93,11 +89,9 @@ class FeedPage : public QWidget {
     void loadLikedPage();
 
     SourceManager& m_sources;
-    std::unique_ptr<FeedDatabase> m_db;
-    std::unique_ptr<VisualFeatures> m_visual;  // visual style descriptors
-    std::unique_ptr<FeedRecommender> m_recommender;
-    QFuture<void> m_warmStart;
-    std::atomic<bool> m_cancelWarmStart{false};
+    // Shared with the web server; owns feed.duckdb and the warm start.
+    std::shared_ptr<FeedEngine> m_engine;
+    FeedDatabase* m_db = nullptr;  // m_engine->db()
 
     // UI
     TagSidebar* m_tagSidebar = nullptr;  // collapsible tags, left of the stage
@@ -127,7 +121,9 @@ class FeedPage : public QWidget {
     QList<SourceImage> m_queue;      // upcoming posts (already ranked)
     QSet<QString> m_seenMd5s;        // md5s + "source:id" keys queued this session
     QSet<QString> m_interactedMd5s;  // posts that already recorded a signal -
-                                     // going BACK must never double-train them
+                                     // (explicit like/dislike/save) - never double-train
+    QSet<QString> m_dwelledMd5s;     // dwell already recorded (once per post); does NOT
+                                     // block an explicit reaction after going BACK
     int m_position = -1;             // index into m_queue of the current post
     qint64 m_shownAt = 0;            // when the current post went on screen
     bool m_fetching = false;

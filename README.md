@@ -31,6 +31,10 @@ simpler and built around a local, searchable library.
   one click.
 - **Tag tools** — merge similar tags, resolve conflicts, filter from a
   sidebar.
+- **Phone / browser access** — *Tools → Web server* serves a mobile web app
+  on your network: a swipe-up "For You" feed (double-tap to like, save to
+  the library) that trains the same recommender, plus library tag search
+  with autocomplete and a swipeable viewer. Mosaic must stay open.
 - **Fast** — GPU-accelerated rendering, background prefetching, and full
   video/animated post playback.
 

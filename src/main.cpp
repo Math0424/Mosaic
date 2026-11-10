@@ -69,6 +69,12 @@ int main(int argc, char* argv[]) {
         QStringList{QStringLiteral("s"), QStringLiteral("selftest")},
         QStringLiteral("Run stack verification headless and exit (code 0 = all pass)."));
     parser.addOption(selfTestOpt);
+    const QCommandLineOption serveOpt(
+        QStringList{QStringLiteral("serve")},
+        QStringLiteral("Serve the web app (feed + library) this session, on <port> "
+                       "(0 = the port from Tools > Web server)."),
+        QStringLiteral("port"), QStringLiteral("0"));
+    parser.addOption(serveOpt);
     parser.process(app);
 
     QTextStream out(stdout);
@@ -152,6 +158,12 @@ int main(int argc, char* argv[]) {
 
     Mosaic::MainWindow window(db);
     window.show();
+    if (parser.isSet(serveOpt)) {
+        QString error;
+        const int port = parser.value(serveOpt).toInt();
+        if (!window.startWebServerForSession(static_cast<quint16>(qBound(0, port, 65535)), &error))
+            qWarning().noquote() << "--serve: web server did not start:" << error;
+    }
     const int code = app.exec();
     qInfo().noquote() << "=== Mosaic exited with code" << code << "===";
     return code;

@@ -1,0 +1,1129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<title>Mosaic</title>
+<style>
+:root {
+  --bg: #000;
+  --surface: #121212;
+  --surface-2: #1e1e1e;
+  --line: #2a2a2a;
+  --text: #f2f2f2;
+  --muted: #9a9a9a;
+  --accent: #fe2c55;
+  --accent-2: #25f4ee;
+  --good: #3ddc84;
+  --nav-h: 56px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+svg { width: 1em; height: 1em; fill: currentColor; flex: none; }
+.hidden { display: none !important; }
+
+/* ---------- layout ---------- */
+.view { position: fixed; left: 0; right: 0; top: 0; bottom: calc(var(--nav-h) + var(--safe-b)); }
+nav.tabs { position: fixed; left: 0; right: 0; bottom: 0; height: calc(var(--nav-h) + var(--safe-b));
+  padding-bottom: var(--safe-b); display: flex; background: var(--bg); border-top: 1px solid var(--line); z-index: 30; }
+nav.tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 2px; font-size: 11px; color: var(--muted); }
+nav.tabs button svg { font-size: 24px; }
+nav.tabs button[aria-selected="true"] { color: var(--text); }
+
+/* ---------- feed ---------- */
+/* overflow-anchor: posts are inserted above the loading slide; anchoring would keep that slide on screen. */
+#feed { overflow-y: scroll; scroll-snap-type: y mandatory; overscroll-behavior: contain; scrollbar-width: none; overflow-anchor: none; }
+#feed::-webkit-scrollbar { display: none; }
+.slide { position: relative; height: 100%; scroll-snap-align: start; scroll-snap-stop: always;
+  overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000; }
+.slide .bg { position: absolute; inset: -40px; background-size: cover; background-position: center;
+  filter: blur(28px) brightness(.45); transform: scale(1.1); }
+.slide .media { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+.slide img, .slide video { max-width: 100%; max-height: 100%; object-fit: contain; display: block; user-select: none; -webkit-user-drag: none; }
+.slide .state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 14px; pointer-events: none; text-align: center; padding: 24px; }
+.slide .shade { position: absolute; left: 0; right: 0; bottom: 0; height: 45%;
+  background: linear-gradient(transparent, rgba(0,0,0,.7)); pointer-events: none; }
+.rail { position: absolute; right: 10px; bottom: 18px; display: flex; flex-direction: column; gap: 18px; align-items: center; z-index: 2; }
+.rail button { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 11px;
+  color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+.rail button svg { font-size: 32px; filter: drop-shadow(0 1px 3px rgba(0,0,0,.5)); transition: transform .15s; }
+.rail button:active svg { transform: scale(.85); }
+.rail button.on-save { color: var(--good); }
+/* Swipe: pan-y leaves vertical scrolling to the browser and hands horizontal drags to JS. */
+.slide { touch-action: pan-y; }
+.slide .media { transition: transform .22s ease-out; will-change: transform; }
+.slide.dragging .media, .slide.resetting .media { transition: none; }
+.stamp { position: absolute; top: 22%; z-index: 3; pointer-events: none; opacity: 0; font-size: 22px; font-weight: 800;
+  letter-spacing: .08em; padding: 6px 14px; border: 3px solid currentColor; border-radius: 10px;
+  display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,.35); }
+.stamp svg { font-size: 26px; }
+.stamp.like { left: 22px; color: var(--accent); transform: rotate(-12deg); }
+.stamp.nope { right: 22px; color: var(--accent-2); transform: rotate(12deg); }
+.slide.liked .meta .title::after { content: "  ♥"; color: var(--accent); }
+.slide.liked .rail .like-btn { color: var(--accent); }
+.slide.noped .rail .nope-btn { color: var(--accent-2); }
+/* Zoomed: every touch belongs to the image (pan), not the feed scroller. */
+.slide.zoomed { touch-action: none; }
+.slide.zoomed .meta, .slide.zoomed .shade, .slide.zoomed .stamp { opacity: 0; transition: opacity .15s; }
+.meta { position: absolute; left: 12px; right: 76px; bottom: 16px; z-index: 2; text-shadow: 0 1px 3px rgba(0,0,0,.8); }
+.meta .title { font-weight: 600; font-size: 15px; margin-bottom: 6px; }
+.meta .title span { color: #ddd; font-weight: 400; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; max-height: 4.6em; overflow: hidden; }
+.chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: rgba(255,255,255,.14);
+  color: #fff; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.chip[data-c="artist"] { color: #ffb36b; }
+.chip[data-c="character"], .chip[data-c="4"] { color: #7ee08a; }
+.chip[data-c="copyright"], .chip[data-c="3"] { color: #d59bff; }
+.chip[data-c="species"] { color: #ff8a8a; }
+.chip[data-c="meta"], .chip[data-c="5"] { color: #a9b4c2; }
+.burst { position: absolute; left: 50%; top: 50%; font-size: 110px; color: var(--accent); pointer-events: none;
+  transform: translate(-50%,-50%) scale(0); opacity: 0; z-index: 3; }
+.burst.go { animation: burst .7s ease-out; }
+@keyframes burst { 0% { transform: translate(-50%,-50%) scale(.3); opacity: 0; }
+  20% { transform: translate(-50%,-50%) scale(1.15); opacity: .95; }
+  60% { transform: translate(-50%,-50%) scale(1); opacity: .9; }
+  100% { transform: translate(-50%,-80%) scale(1); opacity: 0; } }
+.mute-badge { position: absolute; top: calc(12px + var(--safe-t)); left: 12px; z-index: 2; font-size: 22px;
+  background: rgba(0,0,0,.45); border-radius: 999px; padding: 8px; display: flex; }
+.feed-end { height: 100%; scroll-snap-align: start; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); text-align: center; padding: 32px; flex-direction: column; gap: 14px; }
+.btn { background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 9px 16px; }
+.spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.18);
+  border-top-color: #fff; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#feed-settings { position: fixed; top: calc(12px + var(--safe-t)); right: 12px; z-index: 20; font-size: 22px;
+  background: rgba(0,0,0,.45); border-radius: 999px; padding: 8px; display: flex; color: #fff; }
+.settings h2 { margin: 0 0 14px; font-size: 17px; }
+.settings .row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.settings .row b { font-size: 15px; }
+.settings .row span { color: var(--muted); font-size: 13px; }
+.settings input[type=range] { width: 100%; accent-color: var(--accent); margin: 6px 0 4px; }
+.settings .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+.settings p { color: var(--muted); font-size: 13px; line-height: 1.45; margin: 0 0 8px; }
+
+/* ---------- tag sheet ---------- */
+.sheet-wrap { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.5); display: flex; align-items: flex-end; }
+.sheet { width: 100%; max-height: 70%; overflow-y: auto; background: var(--surface); border-radius: 16px 16px 0 0;
+  padding: 10px 16px calc(20px + var(--safe-b)); }
+.sheet .grab { width: 40px; height: 4px; border-radius: 4px; background: #555; margin: 4px auto 12px; }
+.sheet h3 { margin: 0 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.sheet .chips { max-height: none; margin-bottom: 14px; }
+.sheet .chip { background: var(--surface-2); font-size: 13px; padding: 6px 11px; }
+.sheet .links { display: flex; gap: 10px; flex-wrap: wrap; }
+.sheet .links a { color: var(--accent-2); }
+
+/* ---------- library ---------- */
+#library { display: flex; flex-direction: column; background: var(--bg); }
+.searchbar { position: relative; padding: calc(10px + var(--safe-t)) 12px 10px; background: var(--bg);
+  border-bottom: 1px solid var(--line); display: flex; gap: 8px; z-index: 5; }
+.searchbar .field { flex: 1; display: flex; align-items: center; gap: 8px; background: var(--surface-2);
+  border-radius: 10px; padding: 0 10px; min-width: 0; }
+.searchbar .field svg { color: var(--muted); font-size: 18px; }
+.searchbar input { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: var(--text);
+  font: inherit; font-size: 16px; padding: 10px 0; }
+.searchbar select { background: var(--surface-2); color: var(--text); border: 0; border-radius: 10px;
+  padding: 0 8px; font: inherit; font-size: 14px; max-width: 34%; }
+.suggest { position: absolute; left: 12px; right: 12px; top: 100%; background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 10px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.6); max-height: 50vh; overflow-y: auto; }
+.suggest button { display: block; width: 100%; text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+.suggest button:last-child { border-bottom: 0; }
+.suggest button.sel, .suggest button:hover { background: #2c2c2c; }
+.grid-wrap { flex: 1; overflow-y: auto; overscroll-behavior: contain; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 2px; }
+.cell { position: relative; aspect-ratio: 1; background: var(--surface); overflow: hidden; }
+.cell img { width: 100%; height: 100%; object-fit: cover; display: block; opacity: 0; transition: opacity .2s; }
+.cell img.ok { opacity: 1; }
+.cell .badge { position: absolute; right: 5px; top: 5px; font-size: 10px; font-weight: 700; padding: 1px 5px;
+  border-radius: 4px; background: rgba(0,0,0,.65); text-transform: uppercase; }
+.lib-status { padding: 24px 16px; text-align: center; color: var(--muted); }
+.sentinel { height: 1px; }
+
+/* ---------- viewer ---------- */
+#viewer { position: fixed; inset: 0; z-index: 40; background: #000; display: flex; flex-direction: column; touch-action: pan-y; }
+#viewer .stage { flex: 1; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+#viewer .stage img, #viewer .stage video { max-width: 100%; max-height: 100%; object-fit: contain; }
+#viewer .top { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center;
+  padding: calc(8px + var(--safe-t)) 8px 8px; background: linear-gradient(rgba(0,0,0,.6), transparent); z-index: 2; }
+#viewer .top button { font-size: 26px; padding: 8px; display: flex; }
+#viewer .counter { font-size: 13px; color: #ccc; }
+#viewer .nav { position: absolute; top: 50%; transform: translateY(-50%); font-size: 34px; padding: 18px 8px;
+  background: rgba(0,0,0,.3); border-radius: 8px; display: flex; z-index: 2; }
+#viewer .nav.prev { left: 6px; } #viewer .nav.next { right: 6px; }
+@media (hover: none) { #viewer .nav { display: none; } }
+#viewer .info { max-height: 38%; overflow-y: auto; padding: 12px 14px calc(14px + var(--safe-b)); background: var(--surface);
+  border-top: 1px solid var(--line); }
+#viewer .info .line { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+#viewer .info .chips { max-height: none; }
+#viewer .info .chip { background: var(--surface-2); font-size: 13px; padding: 5px 10px; }
+
+.toast { position: fixed; left: 50%; bottom: calc(var(--nav-h) + var(--safe-b) + 20px); transform: translateX(-50%);
+  background: rgba(30,30,30,.95); border: 1px solid var(--line); padding: 10px 16px; border-radius: 10px; z-index: 60;
+  font-size: 14px; max-width: calc(100% - 32px); transition: opacity .25s; }
+</style>
+</head>
+<body>
+
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21.35 10.55 20C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54z"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2m4 0v12h4V3z"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="m21.41 11.58-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58s1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41s-.23-1.06-.59-1.42M5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7"/></symbol>
+  <symbol id="i-vol" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02M14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24"><path d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63m2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.8 8.8 0 0 0 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71M4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a9 9 0 0 0 3.69-1.81L19.73 21 21 19.73l-9-9zM12 4 9.91 6.09 12 8.18z"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm10 0h8v8h-8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87a.47.47 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.47.47 0 0 0-.12-.61zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2m0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8"/></symbol>
+</svg>
+
+<main id="feed" class="view" aria-label="For You feed"></main>
+<button id="feed-settings" aria-label="Feed settings"><svg><use href="#i-gear"/></svg></button>
+
+<section id="library" class="view hidden" aria-label="Library">
+  <form class="searchbar" id="search-form" autocomplete="off">
+    <label class="field"><svg><use href="#i-search"/></svg>
+      <input id="q" type="search" enterkeyhint="search" placeholder="Search tags (-exclude, ~or)" autocapitalize="off" spellcheck="false">
+    </label>
+    <select id="sort" aria-label="Sort">
+      <option value="">Newest</option>
+      <option value="random">Random</option>
+      <option value="date">Post date</option>
+      <option value="mpixels">Largest</option>
+      <option value="filesize">File size</option>
+      <option value="landscape">Landscape</option>
+      <option value="portrait">Portrait</option>
+    </select>
+    <div class="suggest hidden" id="suggest" role="listbox"></div>
+  </form>
+  <div class="grid-wrap" id="grid-wrap">
+    <div class="grid" id="grid"></div>
+    <div class="lib-status" id="lib-status"></div>
+    <div class="sentinel" id="sentinel"></div>
+  </div>
+</section>
+
+<div id="viewer" class="hidden" role="dialog" aria-label="Viewer">
+  <div class="stage" id="v-stage">
+    <div class="top">
+      <button id="v-close" aria-label="Close"><svg><use href="#i-close"/></svg></button>
+      <span class="counter" id="v-counter"></span>
+      <button id="v-info-btn" aria-label="Info"><svg><use href="#i-info"/></svg></button>
+    </div>
+    <button class="nav prev" id="v-prev" aria-label="Previous"><svg><use href="#i-left"/></svg></button>
+    <button class="nav next" id="v-next" aria-label="Next"><svg><use href="#i-right"/></svg></button>
+  </div>
+  <div class="info" id="v-info"></div>
+</div>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" id="tab-feed" aria-selected="true"><svg><use href="#i-home"/></svg>For You</button>
+  <button role="tab" id="tab-library" aria-selected="false"><svg><use href="#i-grid"/></svg>Library</button>
+</nav>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const icon = (id) => { const ns = "http://www.w3.org/2000/svg"; const s = document.createElementNS(ns, "svg"); const u = document.createElementNS(ns, "use"); u.setAttribute("href", "#" + id); s.appendChild(u); return s; };
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("mosaic." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("mosaic." + k, JSON.stringify(v)); } catch {} },
+};
+async function getJson(url) {
+  const r = await fetch(url, { credentials: "same-origin" });
+  if (r.status === 401) throw new Error("Not authorized - open the link from Mosaic (Tools > Web server).");
+  return r.json();
+}
+function postEvent(body) {
+  return fetch("/api/feed/event", { method: "POST", credentials: "same-origin", keepalive: true,
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    .then(r => r.json()).catch(() => ({ ok: false, error: "offline" }));
+}
+let toastTimer;
+function toast(msg) {
+  let t = $(".toast");
+  if (!t) { t = el("div", "toast"); document.body.appendChild(t); }
+  t.textContent = msg; t.style.opacity = "1";
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.opacity = "0", 1800);
+}
+function tagChips(tags, onTap, limit) {
+  const box = el("div", "chips");
+  const list = limit ? tags.slice(0, limit) : tags;
+  for (const t of list) {
+    const c = el("button", "chip", t.n.replace(/_/g, " "));
+    if (t.c) c.dataset.c = t.c;
+    c.addEventListener("click", (e) => { e.stopPropagation(); onTap(t.n); });
+    box.appendChild(c);
+  }
+  return box;
+}
+
+/* ================= tabs ================= */
+let currentTab = "feed";
+function showTab(name) {
+  if (name === currentTab) return;
+  currentTab = name;
+  $("#feed").classList.toggle("hidden", name !== "feed");
+  $("#library").classList.toggle("hidden", name !== "library");
+  $("#feed-settings").classList.toggle("hidden", name !== "feed");
+  $("#tab-feed").setAttribute("aria-selected", name === "feed");
+  $("#tab-library").setAttribute("aria-selected", name === "library");
+  if (name === "feed") Feed.resume(); else Feed.pause();
+  if (name === "library") Library.ensureLoaded();
+  store.set("tab", name);
+}
+$("#tab-feed").addEventListener("click", () => currentTab === "feed" ? Feed.scrollTo(Feed.active) : showTab("feed"));
+$("#tab-library").addEventListener("click", () => showTab("library"));
+
+/* ================= feed ================= */
+const Feed = (() => {
+  const root = $("#feed");
+  const posts = [];
+  const slides = [];
+  const trained = new Set();    // posts that already sent a training signal
+  const impressed = new Set();
+  let active = -1, loading = false, shownAt = 0, endEl = null, failures = 0;
+  let muted = true;
+
+  function endSlide(content) {
+    if (!endEl) { endEl = el("section", "feed-end"); root.appendChild(endEl); if (io) io.observe(endEl); }
+    endEl.replaceChildren(...content);
+  }
+  function loadingState() { endSlide([el("div", "spinner"), el("div", null, "Finding posts you might like...")]); }
+
+  // Endless feed: keep this many posts queued past the one on screen and
+  // fetch again as soon as the queue dips below it (well before the end).
+  const AHEAD = 12;
+  const ahead = () => posts.length - Math.max(active, 0) - 1;
+  let retryTimer = 0;
+  // An empty or failed batch is retried by itself, waiting a little longer
+  // each time (2s, 4s, 8s ... 30s), so the feed never stalls on the spinner.
+  function scheduleRetry() {
+    clearTimeout(retryTimer);
+    const wait = Math.min(30000, 2000 * 2 ** Math.min(failures - 1, 4));
+    retryTimer = setTimeout(loadMore, wait);
+  }
+
+  async function loadMore() {
+    if (loading) return;
+    clearTimeout(retryTimer);
+    loading = true;
+    if (!posts.length) loadingState();
+    let again = false;
+    try {
+      const data = await getJson("/api/feed/next");
+      const known = new Set(posts.map(p => p.md5));
+      const fresh = (data.posts || []).filter(p => !known.has(p.md5));
+      const firstBatch = !posts.length && fresh.length;
+      for (const p of fresh) addSlide(p);
+      if (firstBatch) {
+        root.scrollTop = 0;  // start on the first post, not the loading slide
+        if (!store.get("swipeHint", false)) { store.set("swipeHint", true); toast("Swipe right to like, left to pass"); }
+      }
+      if (fresh.length) { failures = 0; again = ahead() < AHEAD; }
+      else { failures++; scheduleRetry(); }
+      if (!posts.length) {
+        const retry = el("button", "btn", "Try again");
+        retry.addEventListener("click", loadMore);
+        endSlide([el("div", null, data.error || data.message || "Nothing to show yet."), retry]);
+      } else {
+        loadingState();
+      }
+      if (active < 0 && posts.length) observeAll();
+    } catch (e) {
+      failures++;
+      const retry = el("button", "btn", "Try again");
+      retry.addEventListener("click", () => { loading = false; loadMore(); });
+      endSlide([el("div", null, e.message || "Could not reach Mosaic."), retry]);
+      scheduleRetry();
+    } finally {
+      loading = false;
+    }
+    // Still short of the buffer: go straight for the next batch.
+    if (again) loadMore();
+  }
+
+  function addSlide(p) {
+    const i = posts.length;
+    posts.push(p);
+    const s = el("section", "slide");
+    s.dataset.i = i;
+    const bg = el("div", "bg"); s.appendChild(bg);
+    s._bg = bg;
+    const media = el("div", "media"); s.appendChild(media); s._media = media;
+    const state = el("div", "state"); s.appendChild(state); s._state = state;
+    s.appendChild(el("div", "shade"));
+    const burst = el("div", "burst"); burst.appendChild(icon("i-heart")); s.appendChild(burst); s._burst = burst;
+
+    const rail = el("div", "rail");
+    const mk = (id, label, fn) => { const b = el("button"); b.setAttribute("aria-label", label); b.appendChild(icon(id)); b.appendChild(el("span", null, label)); b.addEventListener("click", (e) => { e.stopPropagation(); fn(i); }); rail.appendChild(b); return b; };
+    s._like = mk("i-heart", "Like", toggleLike);
+    s._like.classList.add("like-btn");
+    mk("i-down", "Nope", (j) => swipeOut(j, -1)).classList.add("nope-btn");
+    s._save = mk("i-save", p.saved ? "Saved" : "Save", save);
+    if (p.saved) s._save.classList.add("on-save");
+    mk("i-tag", "Tags", showTags);
+    s.appendChild(rail);
+
+    // Tags stay out of the way; the Tags button opens the full list.
+    const meta = el("div", "meta");
+    const title = el("div", "title", p.sourceName || p.source || "");
+    title.appendChild(el("span", null, (p.score ? "  ★" + p.score : "") + (p.format ? "  · " + p.format : "")));
+    meta.appendChild(title);
+    s.appendChild(meta);
+
+    if (p.video) {
+      const mb = el("button", "mute-badge"); mb.setAttribute("aria-label", "Sound");
+      mb.appendChild(icon(muted ? "i-mute" : "i-vol"));
+      mb.addEventListener("click", (e) => { e.stopPropagation(); toggleMute(); });
+      s.appendChild(mb); s._muteBtn = mb;
+    }
+
+    const stampLike = el("div", "stamp like"); stampLike.append(icon("i-heart"), "LIKE");
+    const stampNope = el("div", "stamp nope"); stampNope.append(icon("i-down"), "NOPE");
+    s.append(stampLike, stampNope); s._stampLike = stampLike; s._stampNope = stampNope;
+    attachSwipe(s, i);
+    attachZoom(s);
+
+    // Single tap: play/pause videos. Double tap: like (and stay), or reset zoom.
+    let lastTap = 0, tapTimer;
+    s.addEventListener("click", () => {
+      if (s._swiped) return;  // the click that ends a drag or pan
+      const now = Date.now();
+      if (now - lastTap < 300) {
+        clearTimeout(tapTimer); lastTap = 0;
+        if (s._zoom && s._zoom.s > 1) { resetZoom(s); return; }
+        burstAt(i); like(i); return;
+      }
+      lastTap = now;
+      tapTimer = setTimeout(() => { const v = s.querySelector("video"); if (v) v.paused ? v.play().catch(() => {}) : v.pause(); }, 300);
+    });
+
+    if (endEl) root.insertBefore(s, endEl); else root.appendChild(s);
+    slides.push(s);
+    if (io) io.observe(s);
+  }
+
+  function mount(i) {
+    const s = slides[i], p = posts[i];
+    if (!s || s._mounted) return;
+    s._mounted = true;
+    s._bg.style.backgroundImage = `url("${p.thumb}")`;
+    s._state.textContent = "";
+    s._state.replaceChildren(el("div", "spinner"));
+    let m;
+    if (p.video) {
+      m = document.createElement("video");
+      m.playsInline = true; m.loop = true; m.muted = muted; m.preload = i === active ? "auto" : "metadata";
+      m.poster = p.thumb;
+      m.addEventListener("loadeddata", () => loaded(i));
+      m.addEventListener("error", () => failed(i));
+    } else {
+      m = document.createElement("img");
+      m.decoding = "async"; m.alt = "";
+      m.addEventListener("load", () => loaded(i));
+      m.addEventListener("error", () => {
+        // Sample missing on the site: fall back to the full file once.
+        if (!m._triedFull && p.full && p.media !== p.full) { m._triedFull = true; m.src = p.full; } else failed(i);
+      });
+    }
+    m.src = p.media;
+    s._media.replaceChildren(m);
+    if (i === active && p.video) m.play().catch(() => {});
+  }
+  function unmount(i) {
+    const s = slides[i];
+    if (!s || !s._mounted) return;
+    s._mounted = false; s._loaded = false;
+    const v = s.querySelector("video");
+    if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+    s._media.replaceChildren();
+  }
+  function loaded(i) {
+    const s = slides[i];
+    s._loaded = true; s._state.replaceChildren();
+    if (i === active && !shownAt && !document.hidden && currentTab === "feed") shownAt = Date.now();
+  }
+  function failed(i) {
+    const s = slides[i];
+    s._state.replaceChildren(el("div", null, "Couldn't load this post - swipe on."));
+  }
+
+  function activate(i) {
+    if (i === active) return;
+    leave(active);
+    active = i;
+    const s = slides[i], p = posts[i];
+    shownAt = s._loaded && !document.hidden ? Date.now() : 0;
+    if (!impressed.has(p.md5)) { impressed.add(p.md5); postEvent({ md5: p.md5, type: "impression" }); }
+    flushBehind(i);
+    // Keep a small window of mounted media around the current post.
+    for (let j = 0; j < slides.length; j++) {
+      if (j >= i - 1 && j <= i + 2) mount(j); else if (j < i - 3 || j > i + 4) unmount(j);
+    }
+    const v = s.querySelector("video");
+    if (v) { v.muted = muted; v.preload = "auto"; v.play().catch(() => {}); }
+    if (ahead() < AHEAD) loadMore();
+  }
+  function leave(i) {
+    if (i < 0) return;
+    const s = slides[i], p = posts[i];
+    if (s && isZoomed(s)) resetZoom(s);
+    const v = s && s.querySelector("video");
+    if (v) v.pause();
+    if (s && s._loaded && shownAt && !trained.has(p.md5) && !pending.has(p.md5)) {
+      trained.add(p.md5);
+      postEvent({ md5: p.md5, type: "dwell", dwellMs: Date.now() - shownAt });
+    }
+    shownAt = 0;
+  }
+  const dwell = () => (shownAt ? Date.now() - shownAt : 0);
+
+  // One training signal per post. Likes and nopes wait in `pending` until the
+  // user is two posts past them (or leaves the page), so they can be taken
+  // back or switched before the recommender ever sees them.
+  const pending = new Map();  // md5 -> { i, type, dwellMs }
+  const UNDO_DISTANCE = 2;
+  function flush(md5) {
+    const r = pending.get(md5);
+    if (!r) return;
+    pending.delete(md5);
+    trained.add(md5);
+    postEvent({ md5, type: r.type, dwellMs: r.dwellMs });
+  }
+  function flushBehind(i) {
+    for (const [md5, r] of [...pending]) if (r.i <= i - UNDO_DISTANCE) flush(md5);
+  }
+  function flushAll() { for (const md5 of [...pending.keys()]) flush(md5); }
+  // type: "like" | "dislike" | null (take back). Returns false when the
+  // reaction was already sent and can't change any more.
+  function react(i, type) {
+    const p = posts[i], s = slides[i];
+    if (trained.has(p.md5)) {
+      if (type === null || (type === "like") !== s.classList.contains("liked")) {
+        toast("Already counted - it can only be changed until you're 2 posts past it");
+        return false;
+      }
+      return true;
+    }
+    s.classList.toggle("liked", type === "like");
+    s.classList.toggle("noped", type === "dislike");
+    if (type === null) { pending.delete(p.md5); return true; }
+    const prev = pending.get(p.md5);
+    // Keep the linger time from the first reaction (a later switch isn't a new look).
+    const dwellMs = prev ? prev.dwellMs : (i === active ? dwell() : 0);
+    pending.set(p.md5, { i, type, dwellMs });
+    return true;
+  }
+  const like = (i) => react(i, "like");
+  const dislike = (i) => react(i, "dislike");
+  function toggleLike(i) {
+    if (slides[i].classList.contains("liked")) { if (react(i, null)) toast("Like removed"); }
+    else { burstAt(i); like(i); }
+  }
+
+  /* ---- swipe: right = like, left = nope; either one moves on ---- */
+  const SWIPE_FRACTION = 0.25;  // of the screen width, or a quick flick
+  function setDrag(s, dx) {
+    s._media.style.transform = dx ? `translateX(${dx}px) rotate(${dx / 22}deg)` : "";
+    const k = Math.min(1, Math.abs(dx) / 110);
+    s._stampLike.style.opacity = dx > 0 ? k : 0;
+    s._stampNope.style.opacity = dx < 0 ? k : 0;
+  }
+  // Flies the post off-screen, records the reaction and scrolls to the next one.
+  function swipeOut(i, dir) {
+    const s = slides[i];
+    if (!s || s._flying) return;
+    s._flying = true;
+    const w = root.clientWidth;
+    s.classList.remove("dragging");
+    setDrag(s, dir * w * 1.3);
+    if (dir > 0) like(i); else dislike(i);
+    setTimeout(() => {
+      if (active <= i) scrollTo(i + 1);  // unless the user already moved past it
+      // Put the post back once it is off-screen, for when the user scrolls up.
+      setTimeout(() => {
+        s.classList.add("resetting"); setDrag(s, 0);
+        void s.offsetWidth; s.classList.remove("resetting");
+        s._flying = false;
+      }, 450);
+    }, 200);
+  }
+  /* ---- zoom: pinch (touch), ctrl+wheel / trackpad pinch (desktop); pan while zoomed ---- */
+  const MAX_ZOOM = 5;
+  const isZoomed = (s) => !!(s._zoom && s._zoom.s > 1.001);
+  function applyZoom(s) {
+    const z = s._zoom, m = s._media.firstElementChild;
+    if (!m) return;
+    // Keep the image covering its box: no panning past the edges.
+    const w = s._media.clientWidth, h = s._media.clientHeight;
+    const mw = m.offsetWidth || w, mh = m.offsetHeight || h;  // unscaled, centered in the box
+    const maxX = Math.max(0, (mw * z.s - w) / 2);
+    const maxY = Math.max(0, (mh * z.s - h) / 2);
+    z.x = Math.max(-maxX, Math.min(maxX, z.x));
+    z.y = Math.max(-maxY, Math.min(maxY, z.y));
+    m.style.transformOrigin = "50% 50%";
+    m.style.transform = z.s > 1.001 ? `translate(${z.x}px, ${z.y}px) scale(${z.s})` : "";
+    s.classList.toggle("zoomed", z.s > 1.001);
+  }
+  function resetZoom(s) {
+    if (!s._zoom) return;
+    s._zoom = { s: 1, x: 0, y: 0 };
+    const m = s._media.firstElementChild;
+    if (m) { m.style.transition = "transform .2s ease-out"; applyZoom(s); setTimeout(() => { m.style.transition = ""; }, 220); }
+    s.classList.remove("zoomed");
+  }
+  // Scales around a screen point (cx, cy) so that point stays put.
+  function zoomAround(s, newScale, cx, cy, base) {
+    const r = s._media.getBoundingClientRect();
+    const ox = cx - (r.left + r.width / 2), oy = cy - (r.top + r.height / 2);
+    const b = base || s._zoom;
+    const ns = Math.max(1, Math.min(MAX_ZOOM, newScale));
+    const px = (ox - b.x) / b.s, py = (oy - b.y) / b.s;  // content point under the cursor
+    s._zoom = { s: ns, x: ox - px * ns, y: oy - py * ns };
+    applyZoom(s);
+  }
+  function attachZoom(s) {
+    s._zoom = { s: 1, x: 0, y: 0 };
+    const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    const mid = (a, b) => [(a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2];
+    let pinch = null;
+    // Touch events (not pointer events) so preventDefault reliably stops the
+    // browser from scrolling the feed while two fingers are down.
+    s.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 2 || !s._media.firstElementChild) return;
+      e.preventDefault();
+      if (s._cancelDrag) s._cancelDrag();
+      s._pinching = true;
+      const [a, b] = e.touches;
+      const [mx, my] = mid(a, b);
+      pinch = { d: dist(a, b), mx, my, base: { ...s._zoom } };
+    }, { passive: false });
+    s.addEventListener("touchmove", (e) => {
+      if (pinch && e.touches.length === 2) {
+        e.preventDefault();
+        const [a, b] = e.touches;
+        const [mx, my] = mid(a, b);
+        zoomAround(s, pinch.base.s * dist(a, b) / pinch.d, pinch.mx, pinch.my, pinch.base);
+        // Two-finger drag pans too.
+        s._zoom.x += mx - pinch.mx; s._zoom.y += my - pinch.my;
+        applyZoom(s);
+      } else if (isZoomed(s)) {
+        e.preventDefault();  // one finger pans the image, not the feed
+      }
+    }, { passive: false });
+    const endPinch = (e) => {
+      if (!pinch || e.touches.length >= 2) return;
+      pinch = null;
+      setTimeout(() => { s._pinching = false; }, 50);
+      if (!isZoomed(s)) resetZoom(s);
+    };
+    s.addEventListener("touchend", endPinch);
+    s.addEventListener("touchcancel", endPinch);
+
+    // Desktop: ctrl+wheel and trackpad pinch (which arrives as ctrl+wheel).
+    s.addEventListener("wheel", (e) => {
+      if (!e.ctrlKey || !s._media.firstElementChild) return;
+      e.preventDefault();
+      zoomAround(s, s._zoom.s * Math.exp(-e.deltaY * 0.01), e.clientX, e.clientY);
+      if (!isZoomed(s)) resetZoom(s);
+    }, { passive: false });
+
+    // One-pointer pan while zoomed (mouse drag or one finger).
+    let pan = null;
+    s.addEventListener("pointerdown", (e) => {
+      if (!isZoomed(s) || s._pinching || e.target.closest(".rail, .meta, .mute-badge")) return;
+      pan = { id: e.pointerId, x: e.clientX, y: e.clientY, zx: s._zoom.x, zy: s._zoom.y, moved: false };
+      try { s.setPointerCapture(e.pointerId); } catch {}
+    });
+    s.addEventListener("pointermove", (e) => {
+      if (!pan || e.pointerId !== pan.id || s._pinching) return;
+      const dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+      if (Math.abs(dx) + Math.abs(dy) > 6) pan.moved = true;
+      s._zoom.x = pan.zx + dx; s._zoom.y = pan.zy + dy;
+      applyZoom(s);
+    });
+    const endPan = (e) => {
+      if (!pan || e.pointerId !== pan.id) return;
+      if (pan.moved) { s._swiped = true; setTimeout(() => { s._swiped = false; }, 0); }
+      pan = null;
+    };
+    s.addEventListener("pointerup", endPan);
+    s.addEventListener("pointercancel", endPan);
+  }
+
+  function attachSwipe(s, i) {
+    let id = null, x0 = 0, y0 = 0, t0 = 0, dx = 0, dragging = false;
+    s._cancelDrag = () => {
+      id = null;
+      if (dragging) { dragging = false; s.classList.remove("dragging"); setDrag(s, 0); }
+    };
+    s.addEventListener("pointerdown", (e) => {
+      if (s._flying || isZoomed(s) || s._pinching || e.target.closest(".rail, .meta, .mute-badge")) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      id = e.pointerId; x0 = e.clientX; y0 = e.clientY; t0 = Date.now(); dx = 0; dragging = false;
+    });
+    s.addEventListener("pointermove", (e) => {
+      if (e.pointerId !== id) return;
+      if (s._pinching) { s._cancelDrag(); return; }
+      const mx = e.clientX - x0, my = e.clientY - y0;
+      if (!dragging) {
+        if (Math.abs(mx) < 10 && Math.abs(my) < 10) return;
+        // Mostly vertical: leave it to the scroller.
+        if (Math.abs(mx) < Math.abs(my) * 1.2) { id = null; return; }
+        dragging = true;
+        s.classList.add("dragging");
+        try { s.setPointerCapture(id); } catch {}
+      }
+      dx = mx;
+      setDrag(s, dx);
+    });
+    const finish = (e, cancelled) => {
+      if (e.pointerId !== id) return;
+      id = null;
+      if (!dragging) return;
+      dragging = false;
+      s._swiped = true; setTimeout(() => { s._swiped = false; }, 0);
+      const speed = Math.abs(dx) / Math.max(1, Date.now() - t0);  // px/ms
+      const commit = !cancelled && (Math.abs(dx) > root.clientWidth * SWIPE_FRACTION ||
+                                    (Math.abs(dx) > 40 && speed > 0.6));
+      if (commit) { swipeOut(i, dx > 0 ? 1 : -1); return; }
+      s.classList.remove("dragging");
+      setDrag(s, 0);
+    };
+    s.addEventListener("pointerup", (e) => finish(e, false));
+    s.addEventListener("pointercancel", (e) => finish(e, true));
+  }
+  async function save(i) {
+    const p = posts[i], s = slides[i];
+    s._save.classList.add("on-save");
+    s._save.lastChild.textContent = "Saving";
+    // Saving is the strongest signal: it replaces a held like/nope.
+    const held = pending.get(p.md5);
+    pending.delete(p.md5);
+    const d = held ? held.dwellMs : (i === active ? dwell() : 0);
+    trained.add(p.md5);
+    const r = await postEvent({ md5: p.md5, type: "favorite", dwellMs: d });
+    if (r.ok) { s._save.lastChild.textContent = "Saved"; toast(r.alreadyExisted ? "Already in your library" : "Saved to library"); }
+    else { s._save.classList.remove("on-save"); s._save.lastChild.textContent = "Save"; toast("Save failed" + (r.error ? ": " + r.error : "")); }
+  }
+  function burstAt(i) {
+    const b = slides[i]._burst;
+    b.classList.remove("go"); void b.offsetWidth; b.classList.add("go");
+  }
+  function toggleMute() {
+    muted = !muted;
+    for (const s of slides) {
+      const v = s.querySelector("video"); if (v) v.muted = muted;
+      if (s._muteBtn) s._muteBtn.replaceChildren(icon(muted ? "i-mute" : "i-vol"));
+    }
+  }
+  function showTags(i) {
+    const p = posts[i];
+    const wrap = el("div", "sheet-wrap");
+    const sheet = el("div", "sheet");
+    sheet.appendChild(el("div", "grab"));
+    const groups = {};
+    for (const t of p.tags) (groups[t.c || "general"] ||= []).push(t);
+    const order = ["artist", "copyright", "character", "species", "general", "meta"];
+    const keys = Object.keys(groups).sort((a, b) => (order.indexOf(a) + 99) % 99 - (order.indexOf(b) + 99) % 99);
+    for (const k of keys) {
+      sheet.appendChild(el("h3", null, /^\d+$/.test(k) ? "tags" : k));
+      sheet.appendChild(tagChips(groups[k], (tag) => { wrap.remove(); searchLibrary(tag); }));
+    }
+    const links = el("div", "links");
+    const a = el("a", null, "Open full file"); a.href = p.full; a.target = "_blank"; a.rel = "noopener";
+    links.appendChild(a);
+    sheet.appendChild(links);
+    wrap.appendChild(sheet);
+    wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
+    document.body.appendChild(wrap);
+  }
+  function scrollTo(i) {
+    const target = i >= slides.length ? endEl : slides[i];
+    if (target) target.scrollIntoView({ behavior: "smooth" });
+  }
+
+  let io = null;
+  function observeAll() {
+    if (io) return;
+    io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        // Reached the loading slide: make sure a batch is on its way.
+        if (e.target === endEl) { if (!loading) loadMore(); continue; }
+        activate(+e.target.dataset.i);
+      }
+    }, { root, threshold: 0.6 });
+    for (const s of slides) io.observe(s);
+    if (endEl) io.observe(endEl);
+  }
+
+  function pause() {
+    const s = slides[active]; const v = s && s.querySelector("video");
+    if (v) v.pause();
+    shownAt = 0;  // time away from the feed never counts as watching
+  }
+  function resume() {
+    const s = slides[active];
+    if (!s) return;
+    const v = s.querySelector("video");
+    if (v) v.play().catch(() => {});
+    if (s._loaded && !document.hidden) shownAt = Date.now();
+  }
+
+  // Held reactions go out before the page can be closed or frozen.
+  window.addEventListener("pagehide", flushAll);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) flushAll();
+    if (currentTab !== "feed") return;
+    if (document.hidden) pause(); else resume();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (currentTab !== "feed" || e.target.closest("input, select") || !$("#viewer").classList.contains("hidden")) return;
+    const k = e.key;
+    if (k === "ArrowDown" || k === "j" || k === " ") { e.preventDefault(); scrollTo(active + 1); }
+    else if (k === "ArrowUp" || k === "k") { e.preventDefault(); scrollTo(Math.max(0, active - 1)); }
+    else if ((k === "ArrowRight" || k === "l") && active >= 0) swipeOut(active, 1);
+    else if ((k === "ArrowLeft" || k === "d") && active >= 0) swipeOut(active, -1);
+    else if (k === "s" && active >= 0) save(active);
+    else if (k === "m") toggleMute();
+    else if (k === "Escape" && slides[active]) resetZoom(slides[active]);
+  });
+
+  // After a settings change: forget loaded posts the user hasn't reached
+  // (keeping the next couple so the screen doesn't jump), then fetch posts
+  // ranked under the new settings. Only the tail is removed, so the indexes
+  // captured by earlier slides stay valid.
+  function refreshUpcoming() {
+    const keep = Math.max(active, -1) + 2;
+    while (slides.length - 1 > keep) {
+      const s = slides.pop(); posts.pop();
+      if (io) io.unobserve(s);
+      s.remove();
+    }
+    loadMore();
+  }
+
+  return { start: loadMore, pause, resume, scrollTo, refreshUpcoming, get active() { return active; } };
+})();
+
+function searchLibrary(tag) {
+  showTab("library");
+  Library.search(tag);
+}
+
+/* ================= library ================= */
+const Library = (() => {
+  const grid = $("#grid"), status = $("#lib-status"), input = $("#q"), sort = $("#sort"), suggest = $("#suggest");
+  const posts = [];
+  let page = 0, more = true, loading = false, query = null, gen = 0, started = false;
+
+  function fullQuery() {
+    const q = input.value.trim();
+    return sort.value ? (q + " order:" + sort.value).trim() : q;
+  }
+  function search(q) {
+    if (q != null) input.value = q;
+    hideSuggest();
+    input.blur();
+    store.set("q", input.value); store.set("sort", sort.value);
+    query = fullQuery();
+    gen++; page = 0; more = true; posts.length = 0;
+    grid.replaceChildren();
+    $("#grid-wrap").scrollTop = 0;
+    started = true;
+    loadPage();
+  }
+  async function loadPage() {
+    if (loading || !more) return;
+    loading = true;
+    const my = gen;
+    status.replaceChildren(el("div", "spinner"));
+    status.firstChild.style.margin = "0 auto";
+    try {
+      const data = await getJson(`/api/library/search?q=${encodeURIComponent(query)}&page=${page + 1}&limit=60`);
+      if (my !== gen) return;
+      page++;
+      more = !!data.hasMore;
+      for (const p of data.posts || []) addCell(p);
+      status.textContent = data.error ? data.error : !posts.length ? "No posts match." : more ? "" : posts.length + " posts";
+    } catch (e) {
+      if (my === gen) status.textContent = e.message || "Could not reach Mosaic.";
+      more = false;
+    } finally {
+      if (my === gen) loading = false;
+    }
+    // Short pages on tall screens never reach the sentinel: keep filling.
+    if (my === gen && more && sentinelVisible()) loadPage();
+  }
+  function addCell(p) {
+    const i = posts.length;
+    posts.push(p);
+    const c = el("button", "cell");
+    c.setAttribute("aria-label", "Open post");
+    const img = el("img"); img.loading = "lazy"; img.decoding = "async"; img.alt = "";
+    img.addEventListener("load", () => img.classList.add("ok"));
+    img.src = p.thumb;
+    c.appendChild(img);
+    if (p.video || p.format === "gif") c.appendChild(el("span", "badge", p.video ? "▶ " + p.format : p.format));
+    c.addEventListener("click", () => Viewer.open(posts, i, more ? loadPage : null));
+    grid.appendChild(c);
+  }
+  const sentinel = $("#sentinel");
+  function sentinelVisible() {
+    const r = sentinel.getBoundingClientRect();
+    return r.top < window.innerHeight + 600;
+  }
+  new IntersectionObserver((e) => { if (e[0].isIntersecting && started) loadPage(); },
+    { root: $("#grid-wrap"), rootMargin: "600px" }).observe(sentinel);
+
+  // --- autocomplete on the word being typed ---
+  let sugTimer, sugIndex = -1, sugGen = 0;
+  function currentToken() {
+    const v = input.value, end = input.selectionEnd ?? v.length;
+    const start = v.lastIndexOf(" ", end - 1) + 1;
+    const raw = v.slice(start, end);
+    const prefix = (raw.match(/^[-~]*/) || [""])[0];
+    return { start, end, prefix, word: raw.slice(prefix.length) };
+  }
+  function hideSuggest() { suggest.classList.add("hidden"); suggest.replaceChildren(); sugIndex = -1; }
+  function pick(name) {
+    const t = currentToken(), v = input.value;
+    input.value = v.slice(0, t.start) + t.prefix + name + " " + v.slice(t.end).replace(/^\s+/, "");
+    hideSuggest();
+    input.focus();
+  }
+  input.addEventListener("input", () => {
+    clearTimeout(sugTimer);
+    const t = currentToken();
+    if (t.word.length < 1 || t.word.includes(":")) { hideSuggest(); return; }
+    sugTimer = setTimeout(async () => {
+      const my = ++sugGen;
+      try {
+        const names = await getJson("/api/tags?q=" + encodeURIComponent(t.word));
+        if (my !== sugGen) return;
+        if (!names.length) { hideSuggest(); return; }
+        suggest.replaceChildren(...names.map(n => {
+          const b = el("button", null, n.replace(/_/g, " "));
+          b.type = "button";
+          b.addEventListener("mousedown", (e) => e.preventDefault());
+          b.addEventListener("click", () => pick(n));
+          return b;
+        }));
+        sugIndex = -1;
+        suggest.classList.remove("hidden");
+      } catch { hideSuggest(); }
+    }, 120);
+  });
+  input.addEventListener("keydown", (e) => {
+    const items = [...suggest.children];
+    if (!items.length || suggest.classList.contains("hidden")) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      sugIndex = (sugIndex + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      items.forEach((b, j) => b.classList.toggle("sel", j === sugIndex));
+    } else if ((e.key === "Enter" || e.key === "Tab") && sugIndex >= 0) {
+      e.preventDefault(); items[sugIndex].click();
+    } else if (e.key === "Escape") hideSuggest();
+  });
+  input.addEventListener("blur", () => setTimeout(hideSuggest, 150));
+  $("#search-form").addEventListener("submit", (e) => { e.preventDefault(); search(); });
+  sort.addEventListener("change", () => search());
+
+  input.value = store.get("q", "");
+  sort.value = store.get("sort", "");
+
+  return {
+    search,
+    ensureLoaded() { if (!started) search(); },
+  };
+})();
+
+/* ================= viewer ================= */
+const Viewer = (() => {
+  const box = $("#viewer"), stage = $("#v-stage"), info = $("#v-info"), counter = $("#v-counter");
+  let list = [], index = 0, loadMore = null, open = false;
+  let showInfo = store.get("viewerInfo", false);
+
+  function render() {
+    const p = list[index];
+    stage.querySelectorAll("img.m, video.m").forEach(n => { if (n.pause) n.pause(); n.remove(); });
+    let m;
+    if (p.video) {
+      m = document.createElement("video");
+      m.controls = true; m.playsInline = true; m.loop = true; m.autoplay = true; m.poster = p.thumb;
+    } else {
+      m = document.createElement("img"); m.alt = ""; m.decoding = "async";
+    }
+    m.className = "m"; m.src = p.media;
+    stage.insertBefore(m, stage.firstChild);
+    counter.textContent = `${index + 1} / ${list.length}`;
+    $("#v-prev").classList.toggle("hidden", index === 0);
+    $("#v-next").classList.toggle("hidden", index >= list.length - 1);
+
+    info.replaceChildren();
+    info.classList.toggle("hidden", !showInfo);
+    const bits = [p.w && p.h ? `${p.w}×${p.h}` : "", p.format, p.source && p.source !== "library" ? `${p.source} #${p.id}` : "", p.score ? "★" + p.score : ""].filter(Boolean);
+    info.appendChild(el("div", "line", bits.join("  ·  ")));
+    info.appendChild(tagChips(p.tags, (tag) => { close(); Library.search(tag); }));
+
+    // Warm the neighbours.
+    for (const j of [index + 1, index - 1]) {
+      const n = list[j]; if (n && !n.video) { const pre = new Image(); pre.src = n.media; }
+    }
+    if (loadMore && index >= list.length - 4) loadMore();
+  }
+  function go(delta) {
+    const next = index + delta;
+    if (next < 0 || next >= list.length) return;
+    index = next; render();
+  }
+  function openViewer(posts, i, more) {
+    list = posts; index = i; loadMore = more;
+    if (!open) { open = true; history.pushState({ viewer: true }, ""); }
+    box.classList.remove("hidden");
+    render();
+  }
+  function close() {
+    if (!open) return;
+    history.back();  // popstate does the rest
+  }
+  function hide() {
+    open = false;
+    stage.querySelectorAll("video").forEach(v => v.pause());
+    stage.querySelectorAll("img.m, video.m").forEach(n => n.remove());
+    box.classList.add("hidden");
+  }
+  window.addEventListener("popstate", () => { if (open) hide(); });
+
+  $("#v-close").addEventListener("click", close);
+  $("#v-prev").addEventListener("click", () => go(-1));
+  $("#v-next").addEventListener("click", () => go(1));
+  $("#v-info-btn").addEventListener("click", () => { showInfo = !showInfo; store.set("viewerInfo", showInfo); info.classList.toggle("hidden", !showInfo); });
+
+  // Swipe left/right to page, down to close.
+  let sx = 0, sy = 0, st = 0, tracking = false;
+  stage.addEventListener("pointerdown", (e) => { if (e.target.tagName === "VIDEO" && e.offsetY > e.target.clientHeight - 60) return; tracking = true; sx = e.clientX; sy = e.clientY; st = Date.now(); });
+  stage.addEventListener("pointerup", (e) => {
+    if (!tracking) return; tracking = false;
+    const dx = e.clientX - sx, dy = e.clientY - sy;
+    if (Date.now() - st > 800) return;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.3) go(dx < 0 ? 1 : -1);
+    else if (dy > 90 && Math.abs(dy) > Math.abs(dx) * 1.3) close();
+  });
+  stage.addEventListener("pointercancel", () => tracking = false);
+  document.addEventListener("keydown", (e) => {
+    if (!open) return;
+    if (e.key === "ArrowRight") go(1);
+    else if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === "Escape") close();
+    else if (e.key === "i") $("#v-info-btn").click();
+  });
+
+  return { open: openViewer };
+})();
+
+/* ================= feed settings ================= */
+// Same exploration level as the desktop feed's slider (stored in the feed DB).
+const FeedSettings = (() => {
+  const levelName = (v) => v < 20 ? "Comfort" : v < 45 ? "Familiar" : v < 65 ? "Balanced"
+                         : v < 85 ? "Curious" : v < 95 ? "Adventurous" : "Wild";
+  async function open() {
+    const wrap = el("div", "sheet-wrap");
+    const sheet = el("div", "sheet settings");
+    sheet.appendChild(el("div", "grab"));
+    sheet.appendChild(el("h2", null, "Feed settings"));
+    const row = el("div", "row");
+    const name = el("b", null, "Explore"), value = el("span", null, "...");
+    row.append(name, value);
+    const slider = document.createElement("input");
+    slider.type = "range"; slider.min = 0; slider.max = 100; slider.step = 1; slider.disabled = true;
+    slider.setAttribute("aria-label", "Exploration level");
+    const ends = el("div", "ends"); ends.append(el("span", null, "Stick to what I like"), el("span", null, "Try new things"));
+    sheet.append(row, slider, ends,
+      el("p", null, "How adventurous the feed is. Left: stick to what you already like. Right: more " +
+        "tangents - new tags and looks the feed is unsure about, so it can discover what else you " +
+        "enjoy. The far right also mixes in random posts unrelated to anything you like."),
+      el("p", null, "Shared with the desktop feed. Posts you haven't reached yet are re-picked when you change it."));
+    wrap.appendChild(sheet);
+    wrap.addEventListener("click", (e) => { if (e.target === wrap) wrap.remove(); });
+    document.body.appendChild(wrap);
+
+    const show = () => { value.textContent = levelName(+slider.value) + " · " + slider.value + "%"; };
+    let saved = null;
+    try {
+      const d = await getJson("/api/feed/settings");
+      if (d.ok === false) throw new Error("Feed unavailable");
+      saved = Math.round(d.exploration * 100);
+      slider.value = saved; slider.disabled = false; show();
+    } catch (e) { value.textContent = e.message || "Could not reach Mosaic"; return; }
+    slider.addEventListener("input", show);
+    // "change" fires on release: one save per adjustment, not per pixel.
+    slider.addEventListener("change", async () => {
+      const v = +slider.value;
+      if (v === saved) return;
+      try {
+        const r = await fetch("/api/feed/settings", { method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ exploration: v / 100 }) });
+        if (!r.ok) throw new Error();
+        saved = v;
+        toast("Explore: " + levelName(v) + " - re-picking upcoming posts");
+        Feed.refreshUpcoming();
+      } catch { toast("Couldn't save the setting"); slider.value = saved; show(); }
+    });
+  }
+  $("#feed-settings").addEventListener("click", open);
+  return { open };
+})();
+
+/* ================= fullscreen ================= */
+// Hides the browser's address bar where the browser allows it (Android
+// Chrome etc.). Browsers only grant this from a tap, so it's asked on the
+// first tap of a visit. If the user backs out of fullscreen, it isn't asked
+// again until they come back to the page. iPhone Safari has no fullscreen
+// for pages: there, Share > Add to Home Screen opens the app without bars.
+(() => {
+  const standalone = matchMedia("(display-mode: fullscreen), (display-mode: standalone)").matches ||
+                     navigator.standalone === true;
+  const de = document.documentElement;
+  const request = de.requestFullscreen || de.webkitRequestFullscreen;
+  const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (standalone || !request || !matchMedia("(pointer: coarse)").matches) return;
+  let wanted = true;
+  document.addEventListener("click", () => {
+    if (!wanted || isFull()) return;
+    wanted = false;
+    try {
+      const r = request.call(de, { navigationUI: "hide" });
+      if (r && r.catch) r.catch(() => {});
+    } catch {}
+  }, true);
+  // Returning to the page (fullscreen ends when switching apps): ask again.
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && !isFull()) wanted = true; });
+})();
+
+/* ================= boot ================= */
+Feed.start();
+if (store.get("tab", "feed") === "library") showTab("library");
+</script>
+</body>
+</html>

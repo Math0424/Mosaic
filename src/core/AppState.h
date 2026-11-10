@@ -92,6 +92,18 @@ class AppState {
     QStringList feedSourceIds() const { return m_feedSourceIds; }
     void setFeedSourceIds(const QStringList& ids) { m_feedSourceIds = ids; }
 
+    // Local web server (phone / browser access to the feed and library).
+    bool webServerEnabled() const { return m_webServerEnabled; }
+    void setWebServerEnabled(bool v) { m_webServerEnabled = v; }
+
+    int webServerPort() const { return m_webServerPort; }
+    void setWebServerPort(int port) { m_webServerPort = qBound(1024, port, 65535); }
+
+    // Access token for clients other than this machine; generated on first
+    // use and persisted so a phone's bookmark keeps working.
+    QString webServerToken() const { return m_webServerToken; }
+    void setWebServerToken(const QString& token) { m_webServerToken = token; }
+
     // Tag blacklist: tags always excluded from remote searches.
     QStringList blacklistTags() const;
     void setBlacklistTags(const QStringList& tags);
@@ -134,6 +146,9 @@ class AppState {
     bool m_feedTabEnabled = true;
     QStringList m_feedSourceIds = {QStringLiteral("e621"), QStringLiteral("r34")};
     QSet<QString> m_blacklistTags;
+    bool m_webServerEnabled = false;
+    int m_webServerPort = 8787;
+    QString m_webServerToken;
     QString m_libraryPath;
     SiteCredentials m_siteCredentials;
     mutable QString m_lastError;

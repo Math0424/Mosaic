@@ -157,6 +157,11 @@ bool AppState::load() {
 
     m_libraryPath = root.value(QStringLiteral("libraryPath")).toString();
 
+    const QJsonObject web = root.value(QStringLiteral("webServer")).toObject();
+    m_webServerEnabled = web.value(QStringLiteral("enabled")).toBool(false);
+    m_webServerPort = qBound(1024, web.value(QStringLiteral("port")).toInt(8787), 65535);
+    m_webServerToken = web.value(QStringLiteral("token")).toString();
+
     m_blacklistTags.clear();
     for (const auto& v : root.value(QStringLiteral("blacklistTags")).toArray()) {
         const QString tag = v.toString().trimmed();
@@ -281,6 +286,12 @@ bool AppState::save() const {
     root[QStringLiteral("feedSources")] = feedSources;
     root[QStringLiteral("blacklistTags")] = blacklist;
     root[QStringLiteral("siteCredentials")] = creds;
+    QJsonObject web;
+    web[QStringLiteral("enabled")] = m_webServerEnabled;
+    web[QStringLiteral("port")] = m_webServerPort;
+    if (!m_webServerToken.isEmpty())
+        web[QStringLiteral("token")] = m_webServerToken;
+    root[QStringLiteral("webServer")] = web;
     if (!m_libraryPath.isEmpty())
         root[QStringLiteral("libraryPath")] = m_libraryPath;
 

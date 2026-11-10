@@ -39,7 +39,7 @@ QReadWriteLock s_lock;
 constexpr qint64 kNoRepeatWindow = 100000;
 
 constexpr qint64 kMaxImpressionEvents = 25000;
-constexpr qint64 kMaxInteractionEvents = 100000;
+constexpr qint64 kMaxInteractionEvents = 50000;
 
 // Interaction weights (taste updates).
 constexpr double kWeightFavorite = 1.00;

@@ -19,6 +19,7 @@ add_executable(Mosaic
     main.cpp
     "${CMAKE_SOURCE_DIR}/app.rc"
     "${CMAKE_SOURCE_DIR}/assets/assets.qrc"
+    web/www/web.qrc
     app/InstanceGuard.h
     app/InstanceGuard.cpp
     app/MainWindow.h
@@ -71,6 +72,8 @@ add_executable(Mosaic
     core/ThreadPools.cpp
     feed/FeedDatabase.h
     feed/FeedDatabase.cpp
+    feed/FeedEngine.h
+    feed/FeedEngine.cpp
     feed/FeedRecommender.h
     feed/FeedRecommender.cpp
     feed/FeedModel.h
@@ -110,6 +113,12 @@ add_executable(Mosaic
     sources/local/LibraryUtils.cpp
     sources/local/LibrarySource.h
     sources/local/LibrarySource.cpp
+    web/HttpServer.h
+    web/HttpServer.cpp
+    web/WebServer.h
+    web/WebServer.cpp
+    web/WebServerDialog.h
+    web/WebServerDialog.cpp
 )
 
 # Option to build a publishable executable without a console window

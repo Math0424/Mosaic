@@ -263,6 +263,7 @@ Mosaic/
 │   │   ├── FeedModel.*     # learned Bayesian model + Thompson sampling + arm bandit
 │   │   ├── VisualFeatures.* # lightweight visual style descriptor (no ONNX)
 │   │   ├── FeedWarmStart.* # seeds the model from history on first run
+│   │   ├── FeedEngine.*    # shared feed DB + warm start + reaction rules (desktop & web)
 │   │   └── FeedDatabase.*  # learning state (feed.duckdb)
 │   ├── sources/            # pluggable image sources (remote + local)
 │   │   ├── Source.h        # shared query/search/fetch interface
@@ -282,6 +283,11 @@ Mosaic/
 │   │       ├── DuplicateDetector.* # perceptual duplicate detection
 │   │       ├── LibrarySql.*  # SQL helpers
 │   │       └── LibraryUtils.*# md5 / file helpers
+│   ├── web/                # local web app for phones / browsers
+│   │   ├── HttpServer.*    # minimal HTTP/1.1 server (QTcpServer, keep-alive, Range)
+│   │   ├── WebServer.*     # routes: library search/tags/thumbs, feed batches/events/media
+│   │   ├── WebServerDialog.* # Tools > Web server: on/off, port, links
+│   │   └── www/index.html  # the single-page app (embedded via web.qrc)
 │   └── core/               # services (no UI)
 │       ├── Paths.*         # AppData / library / temp directory resolution
 │       ├── Database.*      # DuckDB connection + schema bootstrap
@@ -387,6 +393,27 @@ model as the model proves itself:
 The heuristic stack (tag tastes, session vector, hard-negative filter) stays
 in place: it is the cold-start prior and supplies inputs to the model. All
 state lives in `feed.duckdb`.
+
+### Web server
+
+*Tools → Web server* (or `Mosaic.exe --serve 8787` for one session) serves
+a mobile single-page app from inside the running app. It has to live
+in-process: the catalog and `feed.duckdb` each allow only one open.
+
+- **`web/HttpServer`** is a small HTTP/1.1 server on `QTcpServer` (Qt
+  HttpServer is not required). Handlers run on the GUI thread and hand slow
+  work to a pool; `HttpResponder` answers from any thread. Files stream in
+  chunks with single-range support, so `<video>` can seek.
+- **Feed**: the web feed uses its own `FeedRecommender` over the shared
+  `FeedEngine` (DB, visual features, warm start), so desktop and web train
+  one profile with the same dwell / skip / like rules. Remote media is
+  proxied and cached in `%TEMP%/Mosaic/webmedia` (capped at 2 GB).
+- **Library**: search uses the same syntax as the desktop (`-tag`, `~or`,
+  `order:`); thumbnails are cached in `%TEMP%/Mosaic/webthumbs`.
+- **Access**: this machine is always allowed. Other devices need the access
+  key once (`?t=…` in the link from the dialog), then keep it in a cookie.
+  The key is stored in `state.json` (`webServer`); "New access key" revokes
+  old links. Plain HTTP on the LAN; there is no TLS.
 
 ### Sources
 

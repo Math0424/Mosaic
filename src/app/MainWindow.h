@@ -3,6 +3,8 @@
 #include <QMainWindow>
 #include <QPointer>
 
+#include <memory>
+
 #include "../core/AppState.h"
 #include "../sources/SourceManager.h"
 
@@ -17,7 +19,9 @@ namespace Mosaic {
 
 class Database;
 class FavoritesPage;
+class FeedEngine;
 class FeedPage;
+class WebServer;
 class Source;
 class SourceBrowser;
 
@@ -31,6 +35,10 @@ class MainWindow : public QMainWindow {
     ~MainWindow() override;
 
     static MainWindow* instance;
+
+    // --serve: runs the web server this session without changing the saved
+    // setting (port 0 = the saved port).
+    bool startWebServerForSession(quint16 port, QString* error = nullptr);
 
    protected:
     void closeEvent(QCloseEvent* event) override;
@@ -56,6 +64,11 @@ class MainWindow : public QMainWindow {
     void addFavoritesTab();
     void applyFeedTabSetting();
     void showFeedPage();
+    // Shared feed state, created on first use (feed tab or web feed).
+    std::shared_ptr<FeedEngine> feedEngine();
+    // Starts / restarts / stops the web server to match the settings.
+    bool applyWebServer(QString* error = nullptr);
+    void showWebServerDialog();
     void showTabContextMenu(const QPoint& pos);
     void reopenClosedTab();  // Ctrl+Shift+T
     void setStatus(const QString& text);
@@ -70,6 +83,8 @@ class MainWindow : public QMainWindow {
     QTabWidget* m_tabs = nullptr;
     FavoritesPage* m_favoritesTab = nullptr;
     FeedPage* m_feedPage = nullptr;
+    std::shared_ptr<FeedEngine> m_feedEngine;
+    WebServer* m_webServer = nullptr;
     QToolButton* m_feedButton = nullptr;
     QList<TabState> m_closedTabs;
     QLabel* m_status = nullptr;

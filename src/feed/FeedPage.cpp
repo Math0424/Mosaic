@@ -1,6 +1,7 @@
 #include "FeedPage.h"
 
 #include "FeedDatabase.h"
+#include "FeedEngine.h"
 #include "FeedRecommender.h"
 #include "FeedWarmStart.h"
 #include "VisualFeatures.h"
@@ -54,19 +55,6 @@ namespace Mosaic {
 namespace {
 
 constexpr int kBatchSize = 15;
-constexpr qint64 kSkipMs = 1500;
-constexpr qint64 kFullWatchMs = 8000;
-constexpr qint64 kAbandonMs = 60000;
-
-// Clamp band for the adaptive skip threshold.
-constexpr qint64 kSkipFloorMs = 1000;
-constexpr qint64 kSkipCeilingMs = 4000;
-constexpr qint64 kWatchFloorMs = 3000;
-constexpr qint64 kWatchCeilingMs = 15000;
-// The skip cutoff never falls below this fraction of the user's average
-// watch time - that's what lets the threshold rise with their pace.
-// Skip cutoff never falls below this fraction of the average watch time.
-constexpr double kSkipShareOfWatchMs = 0.35;
 
 // mouse wheel debounce
 constexpr int kWheelDebounceMs = 250;
@@ -107,22 +95,18 @@ QString sourceLabel(SourceManager& sources, const SourceImage& image) {
 
 }  // namespace
 
-FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* parent)
-    : QWidget(parent), m_sources(sources) {
+FeedPage::FeedPage(SourceManager& sources, std::shared_ptr<FeedEngine> engine,
+                   const AppState& state, QWidget* parent)
+    : QWidget(parent), m_sources(sources), m_engine(std::move(engine)) {
     // One shuffle seed per launch: the liked-posts walk starts somewhere
     // different every boot, but stays consistent while paging this session.
     m_likedSeed = QRandomGenerator::global()->generate() | 1u;
     m_media = new MediaCache(this);
     m_media->setMaxEntries(24);
-    m_db = std::make_unique<FeedDatabase>();
-    QString dbError;
-    if (!m_db->open(&dbError))
-        qWarning().noquote() << "FeedPage: feed database failed to open, feed disabled:" << dbError;
-    m_visual = std::make_unique<VisualFeatures>(*m_db, m_sources);
-    m_recommender =
-        std::make_unique<FeedRecommender>(*m_db, m_sources, state.feedSourceIds(), m_visual.get());
+    Q_UNUSED(state);  // feed sources now live on the shared FeedEngine
+    m_db = &m_engine->db();
     buildUi();
-    startWarmStart();
+    m_engine->startWarmStart();
 
     // Kick off the first batch once the page is visible.
     QTimer::singleShot(0, this, [this]() {
@@ -131,32 +115,7 @@ FeedPage::FeedPage(SourceManager& sources, const AppState& state, QWidget* paren
     });
 }
 
-FeedPage::~FeedPage() {
-    shutdown();
-    // The warm start holds raw pointers to the members deleted below.
-    m_warmStart.waitForFinished();
-    // Members are released in reverse declaration order (recommender,
-    // visual, db), matching their dependencies.
-}
-
-void FeedPage::shutdown() {
-    // Idempotent; pool workers' writes fail fast instead of blocking exit.
-    m_cancelWarmStart = true;
-    if (m_db)
-        m_db->close();
-}
-
-void FeedPage::startWarmStart() {
-    if (m_warmStart.isRunning() || !m_db || !m_db->isOpen())
-        return;
-    m_cancelWarmStart = false;
-    FeedDatabase* db = m_db.get();
-    SourceManager* sources = &m_sources;
-    VisualFeatures* visual = m_visual.get();
-    std::atomic<bool>* cancel = &m_cancelWarmStart;
-    m_warmStart = QtConcurrent::run(
-        [db, sources, visual, cancel]() { FeedWarmStart(*db, *sources, *visual).run(*cancel); });
-}
+FeedPage::~FeedPage() = default;
 
 void FeedPage::buildUi() {
     auto* root = new QHBoxLayout(this);
@@ -581,12 +540,9 @@ void FeedPage::requestMore() {
     m_statusLabel->setText(QStringLiteral("Finding posts you might like…"));
 
     QPointer<FeedPage> self(this);
-    QThreadPool::globalInstance()->start([self]() {
-        QList<SourceImage> batch;
-        QString error;
-        if (self) {
-            batch = self->m_recommender->nextBatch(kBatchSize);
-        }
+    std::shared_ptr<FeedEngine> engine = m_engine;
+    QThreadPool::globalInstance()->start([self, engine]() {
+        const QList<SourceImage> batch = engine->nextBatch(kBatchSize);
         if (!self)
             return;
         QMetaObject::invokeMethod(
@@ -696,7 +652,7 @@ void FeedPage::showPost(const SourceImage& image) {
     if (!image.md5.isEmpty() && !m_interactedMd5s.contains(image.md5)) {
         QStringList tags;
         for (const SourceTag& t : image.tags) tags << t.name;
-        FeedDatabase* db = m_db.get();
+        FeedDatabase* db = m_db;
         const SourceImage img = image;
         const int pos = m_position;
         QThreadPool::globalInstance()->start([db, img, tags, pos]() {
@@ -765,7 +721,7 @@ void FeedPage::showPost(const SourceImage& image) {
 
     // Decoding a full-res image (or a video first frame) takes tens to
     // hundreds of ms - do it off-thread, render on the GUI thread.
-    FeedDatabase* db = m_db.get();
+    FeedDatabase* db = m_db;
     auto decodeOffThread = [db](const SourceImage& post, const QByteArray& bytes,
                                 bool allowSkipOnFailure, QPointer<FeedPage> self) {
         QThreadPool::globalInstance()->start([self, db, post, bytes, allowSkipOnFailure]() {
@@ -914,56 +870,33 @@ void FeedPage::recordCurrent(FeedDatabase::Event event) {
     if (m_interactedMd5s.contains(img.md5))
         return;
     m_interactedMd5s.insert(img.md5);
-    QStringList tags;
-    for (const SourceTag& t : img.tags) tags << t.name;
-    const double dwellSecs =
-        m_shownAt > 0 ? (QDateTime::currentMSecsSinceEpoch() - m_shownAt) / 1000.0 : 0.0;
     const qint64 dwell = m_shownAt > 0 ? QDateTime::currentMSecsSinceEpoch() - m_shownAt : 0;
 
     // Training writes run off the GUI thread (DB write lock).
-    FeedDatabase* db = m_db.get();
-    QThreadPool::globalInstance()->start([db, event, img, tags, dwellSecs, dwell]() {
-        db->recordEvent(event, img.sourceId, img.md5, tags, dwellSecs, -1);
-        if (dwell > 0 && dwell < kAbandonMs)
-            db->recordLinger(QStringLiteral("liked"), dwell);
-    });
+    FeedEngine* engine = m_engine.get();
+    const SourceImage imgCopy = img;
+    QThreadPool::globalInstance()->start(
+        [engine, event, imgCopy, dwell]() { engine->recordReaction(event, imgCopy, dwell); });
 }
 
 void FeedPage::advance(bool train) {
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
 
+    // Dwell is recorded once per post, ever: revisiting via Back never
+    // re-records it. It is tracked separately from explicit reactions so
+    // moving on doesn't block a like/dislike after going back.
     if (train && m_mediaLoaded && m_position >= 0 && m_position < m_queue.size() && m_shownAt > 0 &&
-        !m_interactedMd5s.contains(m_queue.at(m_position).md5)) {
+        !m_interactedMd5s.contains(m_queue.at(m_position).md5) &&
+        !m_dwelledMd5s.contains(m_queue.at(m_position).md5)) {
         // Mark before the async write so a fast double-swipe can't double-train.
-        m_interactedMd5s.insert(m_queue.at(m_position).md5);
+        m_dwelledMd5s.insert(m_queue.at(m_position).md5);
         const qint64 dwell = now - m_shownAt;
         const SourceImage img = m_queue.at(m_position);
-        QStringList tags;
-        for (const SourceTag& t : img.tags) tags << t.name;
 
-        // Training writes happen off the GUI thread: recordEvent runs
-        // several SQL updates plus a history prune.
-        FeedDatabase* db = m_db.get();
-        QThreadPool::globalInstance()->start([db, img, tags, dwell]() {
-            // Adaptive thresholds from this user's linger history.
-            const QHash<QString, qint64> lingers = db->averageLingers();
-            const qint64 avgWatchedRaw = lingers.value(QStringLiteral("watched"), kFullWatchMs);
-            const qint64 skippedAvg = lingers.value(QStringLiteral("skipped"), kSkipMs);
-            const qint64 paceFloor = kSkipShareOfWatchMs * avgWatchedRaw;
-            const qint64 skipCandidate = qMax(skippedAvg, paceFloor);
-            const qint64 skipMs = qBound(kSkipFloorMs, skipCandidate, kSkipCeilingMs);
-
-            const double dwellSecs = dwell / 1000.0;
-            if (dwell >= kAbandonMs) {
-                // A minute-long "watch" is absence, not engagement.
-            } else if (dwell < skipMs) {
-                // A skip is a weak negative, not a dislike.
-                db->recordEvent(FeedDatabase::Event::Skip, img.sourceId, img.md5, tags, dwellSecs);
-                db->recordLinger(QStringLiteral("skipped"), dwell);
-            } else {
-                db->recordEvent(FeedDatabase::Event::View, img.sourceId, img.md5, tags, dwellSecs);
-                db->recordLinger(QStringLiteral("watched"), dwell);
-            }
+        // Training writes happen off the GUI thread.
+        FeedEngine* engine = m_engine.get();
+        QThreadPool::globalInstance()->start([engine, img, dwell]() {
+            engine->recordDwell(img, dwell);
         });
     }
 
@@ -980,10 +913,9 @@ void FeedPage::onSoftReset() {
     if (answer != QMessageBox::Yes)
         return;
     // A running warm start would keep writing into the wiped profile.
-    m_cancelWarmStart = true;
-    m_warmStart.waitForFinished();
+    m_engine->stopWarmStart();
     m_db->reset(/*rerunWarmStart=*/true);
-    startWarmStart();
+    m_engine->startWarmStart();
     m_queue.clear();
     m_seenMd5s.clear();
     m_position = -1;
@@ -1001,8 +933,7 @@ void FeedPage::onHardReset() {
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes)
         return;
-    m_cancelWarmStart = true;
-    m_warmStart.waitForFinished();
+    m_engine->stopWarmStart();
     m_db->reset(/*rerunWarmStart=*/false);
     m_queue.clear();
     m_seenMd5s.clear();
@@ -1014,7 +945,7 @@ void FeedPage::onHardReset() {
 }
 
 void FeedPage::toggleDropped() {
-    const auto dropped = m_recommender->lastFunnelStats().dropped;
+    const auto dropped = m_engine->recommender().lastFunnelStats().dropped;
     auto* dialog = new QDialog(this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setWindowTitle(QStringLiteral("Dropped images (last funnel run)"));
@@ -1150,7 +1081,7 @@ void FeedPage::loadLikedPage() {
     const int offset = m_likedOffset;
     const int generation = m_likedGeneration;
     const quint32 seed = m_likedSeed;
-    FeedDatabase* db = m_db.get();
+    FeedDatabase* db = m_db;
     SourceManager* sources = &m_sources;
     QPointer<FeedPage> self(this);
 
@@ -1302,7 +1233,7 @@ void FeedPage::applyExplorationLevel() {
 
     // The DB write can wait on the training lock: off the GUI thread, and
     // the re-rank starts only once the new level is in place.
-    FeedDatabase* db = m_db.get();
+    FeedDatabase* db = m_db;
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([self, db, level]() {
         db->setExplorationLevel(level);
@@ -1355,8 +1286,8 @@ void FeedPage::updateDebugPanel() {
     const SourceImage current =
         (position >= 0 && position < queue.size()) ? queue.at(position) : SourceImage{};
 
-    FeedDatabase* db = m_db.get();
-    FeedRecommender* rec = m_recommender.get();
+    FeedDatabase* db = m_db;
+    FeedRecommender* rec = &m_engine->recommender();
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([self, db, rec, position, sessionStart, queue, current]() {
         DebugSnapshot snap;
@@ -1564,8 +1495,8 @@ void FeedPage::refreshHeavyStats() {
         FeedRecommender::FunnelStats funnel;
     };
 
-    FeedDatabase* db = m_db.get();
-    FeedRecommender* rec = m_recommender.get();
+    FeedDatabase* db = m_db;
+    FeedRecommender* rec = &m_engine->recommender();
     QPointer<FeedPage> self(this);
     QThreadPool::globalInstance()->start([db, rec, self]() {
         HeavyStats stats;
@@ -1827,20 +1758,16 @@ void FeedPage::onDislikeClicked() {
     if (m_interactedMd5s.contains(img.md5))
         return;
     m_interactedMd5s.insert(img.md5);
-    QStringList tags;
-    for (const SourceTag& t : img.tags) tags << t.name;
     const qint64 dwell =
         m_mediaLoaded && m_shownAt > 0 ? QDateTime::currentMSecsSinceEpoch() - m_shownAt : 0;
 
     // Explicit thumbs down: strong negative signal for every tag of the
     // post. OFF the GUI thread - same lock-contention reason as
     // recordCurrent() above.
-    FeedDatabase* db = m_db.get();
+    FeedEngine* engine = m_engine.get();
     const SourceImage imgCopy = img;
-    QThreadPool::globalInstance()->start([db, imgCopy, tags, dwell]() {
-        db->recordEvent(FeedDatabase::Event::Dislike, imgCopy.sourceId, imgCopy.md5, tags);
-        if (dwell > 0 && dwell < kAbandonMs)
-            db->recordLinger(QStringLiteral("disliked"), dwell);
+    QThreadPool::globalInstance()->start([engine, imgCopy, dwell]() {
+        engine->recordReaction(FeedDatabase::Event::Dislike, imgCopy, dwell);
     });
 
     m_dislikeButton->setText(QStringLiteral("Disliked"));
@@ -1852,8 +1779,6 @@ void FeedPage::onSaveClicked() {
     if (m_position < 0 || m_position >= m_queue.size())
         return;
     const SourceImage img = m_queue.at(m_position);
-    QStringList tags;
-    for (const SourceTag& t : img.tags) tags << t.name;
 
     // Strongest training signal + actual library import, off-thread.
     recordCurrent(FeedDatabase::Event::Favorite);
@@ -1861,42 +1786,9 @@ void FeedPage::onSaveClicked() {
     m_statusLabel->setText(QStringLiteral("Saving…"));
 
     QPointer<FeedPage> self(this);
-    QThreadPool::globalInstance()->start([self, img]() {
-        // Download from the post's REMOTE source - LibrarySource only reads
-        // files already in the library, so fetching through it would fail.
-        Source* remote =
-            self ? self->m_sources.source(self->m_sources.remoteSources().isEmpty()
-                                              ? QString()
-                                              : self->m_sources.remoteSources().first()->id())
-                 : nullptr;
-        const QString sourceId = img.sourceId.isEmpty() && remote ? remote->id() : img.sourceId;
-        Source* downloadSource = self ? self->m_sources.source(sourceId) : nullptr;
-
-        LibrarySource library;
-        SourceImage post = img;
-        post.sourceId = sourceId;
-
-        ImportResult result;
-        if (library.hasImage(post)) {
-            // Already saved (same md5, or same source + post id): skip the download.
-            result.ok = true;
-            result.alreadyExisted = true;
-        } else {
-            QByteArray bytes;
-            QString error;
-            if (downloadSource) {
-                bytes = downloadSource->fetch(img, FileKind::Full, &error);
-            } else {
-                error = QStringLiteral("source not available");
-            }
-
-            if (bytes.isEmpty()) {
-                result.error = error;
-            } else {
-                // Import the downloaded bytes into the local library catalog.
-                result = library.importImage(post, bytes);
-            }
-        }
+    FeedEngine* engine = m_engine.get();
+    QThreadPool::globalInstance()->start([self, engine, img]() {
+        const ImportResult result = engine->saveToLibrary(img);
         if (!self)
             return;
         QMetaObject::invokeMethod(
