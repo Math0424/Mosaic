@@ -10,6 +10,7 @@
 #include "../components/MultiSourceDialog.h"
 #include "../components/SettingsDialog.h"
 #include "../components/SourceBrowser.h"
+#include "../components/ViewerWindow.h"
 #include "../feed/FeedEngine.h"
 #include "../feed/FeedPage.h"
 #include "../web/WebServer.h"
@@ -96,6 +97,9 @@ MainWindow::MainWindow(Database& db, QWidget* parent) : QMainWindow(parent), m_d
     }
 
     const qint64 cacheBytes = purgeOldCache();
+    // No viewer is open yet, so anything here is from a session that ended
+    // without closing its viewer (crash): those deletions are final.
+    ViewerWindow::purgeDeletedTrash();
     statusBar()->addPermanentWidget(
         new QLabel(QStringLiteral("cache: %1").arg(formatBytes(cacheBytes)), this));
 
@@ -348,8 +352,10 @@ void MainWindow::showFeedPage() {
                         const QList<Source*> remotes = m_sources.remoteSources();
                         source = remotes.isEmpty() ? nullptr : remotes.first();
                     }
-                    if (source)
+                    if (source) {
                         addSourceTab(source, tag);
+                        bringToFront();
+                    }
                 });
     }
     m_tabs->setCurrentWidget(m_feedPage);
@@ -619,6 +625,7 @@ SourceBrowser* MainWindow::addSourceTab(Source* source, const QString& tags, con
                 if (!source)
                     return;
                 addSourceTab(source, tag);
+                bringToFront();  // the request usually comes from a viewer window
             });
     if (!tags.isEmpty()) {
         browser->setTags(tags);
@@ -801,6 +808,13 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void MainWindow::setStatus(const QString& text) { m_status->setText(text); }
+
+void MainWindow::bringToFront() {
+    if (isMinimized())
+        showNormal();
+    raise();
+    activateWindow();
+}
 
 void MainWindow::startLibraryScan() {
     if (!m_db.isOpen())

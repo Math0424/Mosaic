@@ -70,6 +70,7 @@ class MediaPlaybackController : public QObject {
     MosaicAudioDevice* m_audioDevice = nullptr;
     QAudioSink* m_audioSink = nullptr;
     QTimer* m_timer = nullptr;
+    int m_baseInterval = 40;  // ms per frame from the stream's average rate
     bool m_playing = false;
 };
 

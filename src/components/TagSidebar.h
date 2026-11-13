@@ -52,7 +52,12 @@ class TagSidebar : public QWidget {
     SourceImage m_image;
     bool m_editable = false;
     bool m_collapsed = false;
-    QHash<QWidget*, QString> m_tagLabels;  // label -> tag name
+    // Clickable rows: click copies `copy`, double-click searches `search`.
+    struct LabelAction {
+        QString copy;
+        QString search;
+    };
+    QHash<QWidget*, LabelAction> m_tagLabels;
 };
 
 }  // namespace Mosaic

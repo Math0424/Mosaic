@@ -9,6 +9,7 @@
 #include "../core/Schema.h"
 #include "../media/ImageFingerprint.h"
 #include "../media/VideoDecoder.h"
+#include "../sources/local/LibraryCatalog.h"
 #include "../sources/local/LibrarySource.h"
 
 #include <QtMath>
@@ -194,11 +195,22 @@ ViewerWindow::ViewerWindow(Source* source, const QList<SourceImage>& images, int
         showAt(m_index);
 }
 
-ViewerWindow::~ViewerWindow() { stopMedia(); }
+ViewerWindow::~ViewerWindow() {
+    stopMedia();
+    discardDeletedFiles();
+}
 
 void ViewerWindow::setImages(Source* source, const QList<SourceImage>& images, int index) {
     m_source = source;
     m_images = images;
+    // The grid may still list posts deleted in this viewer: show them from trash.
+    for (SourceImage& img : m_images) {
+        const auto it = m_deleted.constFind(img.md5);
+        if (it != m_deleted.constEnd()) {
+            img.localPath = it->trashPath;
+            img.favorite = false;
+        }
+    }
     m_index = qBound(0, index, qMax(0, static_cast<int>(m_images.size()) - 1));
     if (!m_images.isEmpty())
         showAt(m_index);
@@ -246,6 +258,9 @@ void ViewerWindow::closeEvent(QCloseEvent* event) {
         state.setViewerLoupeDiameter(m_loupeDiameter);
         state.save();
     }
+    // Deletions become permanent once the viewer closes.
+    stopMedia();
+    discardDeletedFiles();
     QWidget::closeEvent(event);
 }
 
@@ -1231,12 +1246,15 @@ void ViewerWindow::setInfo(const SourceImage& image) {
 }
 
 void ViewerWindow::updateSidebars() {
-    const bool editable = currentIsLocal();
+    // A post deleted in this session is read-only until un-deleted.
+    const bool deleted = currentIsDeleted();
+    const bool editable = !deleted && currentIsLocal();
     m_tagSidebar->setImage(m_current, editable);
 
-    m_saveButton->setEnabled(!editable && !m_current.md5.isEmpty());
-    m_saveFavButton->setEnabled(!editable && !m_current.md5.isEmpty());
-    m_deleteButton->setEnabled(editable);
+    m_saveButton->setEnabled(!deleted && !editable && !m_current.md5.isEmpty());
+    m_saveFavButton->setEnabled(!deleted && !editable && !m_current.md5.isEmpty());
+    m_deleteButton->setEnabled(editable || deleted);
+    updateDeleteButton();
     m_revealButton->setEnabled(editable && !m_current.localPath.isEmpty());
     m_favoriteButton->setEnabled(editable);
 
@@ -1797,45 +1815,216 @@ void ViewerWindow::onSlideshowTick() {
 }
 
 void ViewerWindow::onDeleteClicked() {
+    if (currentIsDeleted())
+        undeleteCurrent();
+    else
+        deleteCurrent();
+}
+
+QString ViewerWindow::deletedTrashDir() {
+    return QDir(Paths::tempDir()).filePath(QStringLiteral("deleted"));
+}
+
+void ViewerWindow::purgeDeletedTrash() { QDir(deletedTrashDir()).removeRecursively(); }
+
+bool ViewerWindow::currentIsDeleted() const {
+    return !m_current.md5.isEmpty() && m_deleted.contains(m_current.md5);
+}
+
+void ViewerWindow::updateDeleteButton() {
+    const bool deleted = currentIsDeleted();
+    m_deleteButton->setText(deleted ? QStringLiteral("Un-delete") : QStringLiteral("Delete"));
+    m_deleteButton->setIcon(
+        assetIcon(deleted ? QStringLiteral("restore.svg") : QStringLiteral("delete.svg")));
+    m_deleteButton->setToolTip(deleted ? QStringLiteral("Put this post back into the library")
+                                       : QStringLiteral("Remove from library (can be undone "
+                                                        "until this viewer is closed)"));
+    // Red hover only for the destructive direction.
+    if (m_deleteButton->property("danger").toBool() == deleted) {
+        m_deleteButton->setProperty("danger", !deleted);
+        m_deleteButton->style()->unpolish(m_deleteButton);
+        m_deleteButton->style()->polish(m_deleteButton);
+    }
+}
+
+void ViewerWindow::discardDeletedFiles() {
+    const QDir trash(deletedTrashDir());
+    for (const DeletedEntry& entry : std::as_const(m_deleted)) {
+        for (const QString& file :
+             trash.entryList({entry.storedMd5 + QStringLiteral(".*")}, QDir::Files))
+            QFile::remove(trash.filePath(file));
+    }
+    m_deleted.clear();
+}
+
+void ViewerWindow::deleteCurrent() {
     if (m_current.md5.isEmpty() || !currentIsLocal())
         return;
 
-    const QString md5 = m_current.md5;
+    const SourceImage image = m_current;
+    // Windows cannot move a file that is open: release a playing video first
+    // and reload it from its new location afterwards.
+    const bool reload = mediaKindOf(image) == MediaKind::Video;
+    if (reload)
+        stopMedia();
+    m_deleteButton->setEnabled(false);
     m_statusLabel->setText(QStringLiteral("Deleting…"));
     QPointer<ViewerWindow> self(this);
-    QThreadPool::globalInstance()->start([self, md5]() {
+    QThreadPool::globalInstance()->start([self, image, reload]() {
         LibrarySource library;
+        LibraryCatalog catalog;
         QString error;
-        const bool ok = library.removeImage(md5, &error);
+        DeletedEntry entry;
+        entry.storedMd5 = library.savedMd5(image);
+
+        bool ok = !entry.storedMd5.isEmpty() && catalog.lookupByMd5(entry.storedMd5, &entry.meta);
+        if (!ok)
+            error = QStringLiteral("not found in the library catalog");
+
+        // Move the file(s) aside first so the post can be restored. The
+        // catalog removal below then has nothing left to delete.
+        QStringList moved;  // library file names now in the trash
+        const QString libDir = Paths::libraryDir();
+        const QDir trash(deletedTrashDir());
+        if (ok) {
+            QDir().mkpath(trash.path());
+            const QStringList files =
+                QDir(libDir).entryList({entry.storedMd5 + QStringLiteral(".*")}, QDir::Files);
+            for (const QString& file : files) {
+                const QString from = libDir + QLatin1Char('/') + file;
+                const QString to = trash.filePath(file);
+                QFile::remove(to);
+                // Rename is instant on the same drive; copy covers a library
+                // on another drive (removeImage deletes the original).
+                if (QFile::rename(from, to) || QFile::copy(from, to)) {
+                    moved << file;
+                } else {
+                    ok = false;
+                    error = QStringLiteral("could not move %1 to the trash folder").arg(file);
+                    break;
+                }
+            }
+            if (ok && moved.isEmpty()) {
+                ok = false;
+                error = QStringLiteral("file not found in the library folder");
+            }
+        }
+        if (ok)
+            ok = library.removeImage(entry.storedMd5, &error);
+
+        if (!ok) {
+            // Put back anything already moved.
+            for (const QString& file : std::as_const(moved)) {
+                const QString from = libDir + QLatin1Char('/') + file;
+                if (!QFile::exists(from))
+                    QFile::rename(trash.filePath(file), from);
+                QFile::remove(trash.filePath(file));
+            }
+        } else {
+            const QString expected = QFileInfo(entry.meta.localPath).fileName();
+            entry.trashPath =
+                trash.filePath(moved.contains(expected) ? expected : moved.first());
+        }
+
         if (!self)
             return;
         QMetaObject::invokeMethod(
             self.data(),
-            [self, md5, ok, error]() {
+            [self, image, entry, ok, error, reload]() {
                 if (!self)
                     return;
                 if (!ok) {
+                    if (reload && self->m_current.md5 == image.md5)
+                        self->showAt(self->m_index);
                     self->m_statusLabel->setText(QStringLiteral("Delete failed: %1").arg(error));
+                    self->updateSidebars();
                     return;
                 }
-                // Drop the post and show the neighbour.
-                int index = self->m_index;
-                for (int i = 0; i < self->m_images.size(); ++i) {
-                    if (self->m_images.at(i).md5 == md5) {
-                        self->m_images.removeAt(i);
-                        if (i < index)
-                            --index;
-                        break;
+                // Keep the post in the list, now shown from the trash copy.
+                self->m_deleted.insert(image.md5, entry);
+                for (SourceImage& img : self->m_images) {
+                    if (img.md5 == image.md5) {
+                        img.localPath = entry.trashPath;
+                        img.favorite = false;
                     }
                 }
-                self->m_cache.remove(cacheKey(md5, FileKind::Full));
-                self->m_cache.remove(cacheKey(md5, FileKind::Preview));
-                if (self->m_images.isEmpty()) {
-                    self->close();
+                if (self->m_current.md5 == image.md5) {
+                    self->m_current.localPath = entry.trashPath;
+                    self->m_current.favorite = false;
+                    if (reload)
+                        self->showAt(self->m_index);
+                    self->updateSidebars();
+                    self->m_statusLabel->setText(
+                        QStringLiteral("Removed from library - Un-delete restores it until "
+                                       "this viewer is closed"));
+                }
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void ViewerWindow::undeleteCurrent() {
+    const auto it = m_deleted.constFind(m_current.md5);
+    if (it == m_deleted.constEnd())
+        return;
+
+    const QString shownMd5 = m_current.md5;
+    const DeletedEntry entry = *it;
+    const bool reload = mediaKindOf(m_current) == MediaKind::Video;
+    if (reload)
+        stopMedia();
+    m_deleteButton->setEnabled(false);
+    m_statusLabel->setText(QStringLiteral("Restoring…"));
+    QPointer<ViewerWindow> self(this);
+    QThreadPool::globalInstance()->start([self, shownMd5, entry, reload]() {
+        ImportResult result;
+        QFile file(entry.trashPath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            result.error = file.errorString();
+        } else {
+            const QByteArray data = file.readAll();
+            file.close();
+            LibrarySource library;
+            result = library.importImage(entry.meta, data);
+            if (result.ok && entry.meta.favorite)
+                library.setFavorite(entry.storedMd5, true);
+        }
+        if (result.ok) {
+            const QDir trash(deletedTrashDir());
+            for (const QString& name :
+                 trash.entryList({entry.storedMd5 + QStringLiteral(".*")}, QDir::Files))
+                QFile::remove(trash.filePath(name));
+        }
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, shownMd5, entry, result, reload]() {
+                if (!self)
+                    return;
+                if (!result.ok) {
+                    if (reload && self->m_current.md5 == shownMd5)
+                        self->showAt(self->m_index);
+                    self->m_statusLabel->setText(
+                        QStringLiteral("Un-delete failed: %1").arg(result.error));
+                    self->updateSidebars();
                     return;
                 }
-                self->showAt(qBound(0, index, self->m_images.size() - 1));
-                self->m_statusLabel->setText(QStringLiteral("Removed from library"));
+                self->m_deleted.remove(shownMd5);
+                for (SourceImage& img : self->m_images) {
+                    if (img.md5 == shownMd5) {
+                        img.localPath = result.filePath;
+                        img.favorite = entry.meta.favorite;
+                    }
+                }
+                if (self->m_current.md5 == shownMd5) {
+                    self->m_current.localPath = result.filePath;
+                    self->m_current.favorite = entry.meta.favorite;
+                    if (reload)
+                        self->showAt(self->m_index);
+                    self->updateSidebars();
+                    self->m_statusLabel->setText(QStringLiteral("Restored to library"));
+                }
             },
             Qt::QueuedConnection);
     });

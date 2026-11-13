@@ -46,6 +46,12 @@ class ViewerWindow : public QWidget {
     // one; used by progressive lists (e.g. the feed's liked-posts viewer).
     void appendImages(const QList<SourceImage>& images);
 
+    // Folder holding files deleted from the library while a viewer is open,
+    // so they can be un-deleted. Emptied when the viewer closes; anything
+    // left over (crash) is cleared at startup via purgeDeletedTrash().
+    static QString deletedTrashDir();
+    static void purgeDeletedTrash();
+
    protected:
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
@@ -63,6 +69,8 @@ class ViewerWindow : public QWidget {
    private slots:
     void onSaveClicked();
     void onDeleteClicked();
+    void deleteCurrent();
+    void undeleteCurrent();
     void onFavoriteClicked();
     void onPlayPauseClicked();
     void onVideoFrame(const Mosaic::VideoDecoder::Frame& frame);
@@ -179,6 +187,19 @@ class ViewerWindow : public QWidget {
     QMovie* m_gif = nullptr;
     bool m_scrubbing = false;
     bool m_loading = false;
+
+    // Posts deleted from the library during this viewer session, keyed by
+    // the md5 shown in the viewer. They stay in m_images (shown from the
+    // trash copy) until un-deleted or the viewer closes.
+    struct DeletedEntry {
+        QString storedMd5;   // md5 the library stored the file under
+        SourceImage meta;    // full catalog row (tags, source, dates) for re-import
+        QString trashPath;   // the moved file
+    };
+    QHash<QString, DeletedEntry> m_deleted;
+    bool currentIsDeleted() const;
+    void updateDeleteButton();
+    void discardDeletedFiles();
 
     // Preload cache
     QHash<QString, QByteArray> m_cache;

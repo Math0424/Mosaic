@@ -6,12 +6,15 @@
 
 #include <QMutexLocker>
 
+#include <cstring>
+
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
@@ -35,6 +38,9 @@ int interruptCallback(void*) { return Shutdown::requested() ? 1 : 0; }
 // first few are logged so a damaged file can't flood the log.
 constexpr int kMaxLoggedDecodeErrors = 5;
 
+// Upper bound on packets read to measure a missing duration.
+constexpr int kMaxDurationScanPackets = 20000;
+
 }  // namespace
 
 VideoDecoder::VideoDecoder() = default;
@@ -43,8 +49,20 @@ VideoDecoder::~VideoDecoder() { close(); }
 
 bool VideoDecoder::open(const QString& path) {
     QMutexLocker lock(&m_mutex);
+    return openLocked(path);
+}
 
+bool VideoDecoder::rewindByReopen() const {
+    // FFmpeg's animated WebP demuxer has no working seek: av_seek_frame
+    // "succeeds" but leaves it reading garbage ("Skipping chunk: [0][0][0][0]")
+    // and the animation never restarts.
+    return m_fmt && m_fmt->iformat && m_fmt->iformat->name &&
+           std::strcmp(m_fmt->iformat->name, "webp_anim") == 0;
+}
+
+bool VideoDecoder::openLocked(const QString& path) {
     close();
+    m_path = path;
     m_videoFlushed = false;
     m_decodeErrors = 0;
 
@@ -140,6 +158,31 @@ bool VideoDecoder::open(const QString& path) {
         fps = 30.0;
 
     m_fps = fps;
+
+    // Container reports no duration (FFmpeg's animated WebP demuxer): add up
+    // the video packet durations once, then start over from the top.
+    if (m_durationMs <= 0 && path == m_measuredPath) {
+        m_durationMs = m_measuredDurationMs;
+    } else if (m_durationMs <= 0) {
+        m_measuredPath = path;
+        m_measuredDurationMs = 0;
+        AVPacket* packet = av_packet_alloc();
+        if (packet) {
+            int64_t total = 0;
+            for (int i = 0; i < kMaxDurationScanPackets && av_read_frame(m_fmt, packet) >= 0; ++i) {
+                if (packet->stream_index == m_videoStreamIndex && packet->duration > 0)
+                    total += packet->duration;
+                av_packet_unref(packet);
+            }
+            av_packet_free(&packet);
+            if (total > 0) {
+                m_measuredDurationMs =
+                    av_rescale_q(total, m_videoStream->time_base, AVRational{1, 1000});
+            }
+        }
+        // The scan consumed the stream; reopen (some demuxers can't seek back).
+        return openLocked(QString(path));
+    }
 
     // Audio stream
 
@@ -307,12 +350,21 @@ bool VideoDecoder::convertVideoFrame(AVFrame* frame, Frame& output) {
     if (width <= 0 || height <= 0)
         return false;
 
-    // Recreate SwsContext if the actual decoded format changes.
+    // Keep transparency (animated WebP/GIF/PNG, VP9 alpha); RGB24 would turn
+    // transparent areas black.
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
+    const bool hasAlpha = desc && (desc->flags & AV_PIX_FMT_FLAG_ALPHA);
+    const AVPixelFormat dstFormat = hasAlpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+    const QImage::Format qtFormat = hasAlpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888;
+    const int bytesPerPixel = hasAlpha ? 4 : 3;
+
+    // Recreate SwsContext if the actual decoded format changes (the output
+    // format follows the input format, so it is covered too).
     if (!m_sws || m_swsPixelFormat != format || m_swsWidth != width || m_swsHeight != height) {
         if (m_sws)
             sws_freeContext(m_sws);
 
-        m_sws = sws_getContext(width, height, format, width, height, AV_PIX_FMT_RGB24, SWS_BILINEAR,
+        m_sws = sws_getContext(width, height, format, width, height, dstFormat, SWS_BILINEAR,
                                nullptr, nullptr, nullptr);
 
         if (!m_sws) {
@@ -326,22 +378,39 @@ bool VideoDecoder::convertVideoFrame(AVFrame* frame, Frame& output) {
         m_swsHeight = height;
     }
 
-    QImage image(width, height, QImage::Format_RGB888);
-
-    if (image.isNull())
+    // swscale's SIMD paths may write up to a vector width past the end of a
+    // row, so a QImage's own unpadded rows are not a safe destination (heap
+    // corruption on the last row). Convert into 64-byte aligned rows with
+    // slack at the end, then wrap that buffer as the QImage without copying.
+    constexpr int kAlign = 64;
+    const int linesize = (width * bytesPerPixel + kAlign - 1) & ~(kAlign - 1);
+    const size_t bytes = static_cast<size_t>(linesize) * static_cast<size_t>(height) + kAlign;
+    auto* buffer = static_cast<uchar*>(av_malloc(bytes));
+    if (!buffer)
         return false;
 
-    // Scale straight into the QImage's rows; no intermediate buffer.
-    uint8_t* dst[4] = {image.bits(), nullptr, nullptr, nullptr};
-    const int dstLinesize[4] = {static_cast<int>(image.bytesPerLine()), 0, 0, 0};
-    if (sws_scale(m_sws, frame->data, frame->linesize, 0, height, dst, dstLinesize) < 0)
+    uint8_t* dst[4] = {buffer, nullptr, nullptr, nullptr};
+    const int dstLinesize[4] = {linesize, 0, 0, 0};
+    if (sws_scale(m_sws, frame->data, frame->linesize, 0, height, dst, dstLinesize) < 0) {
+        av_free(buffer);
         return false;
+    }
 
+    QImage image(buffer, width, height, linesize, qtFormat,
+                 [](void* data) { av_free(data); }, buffer);
+    if (image.isNull()) {
+        av_free(buffer);
+        return false;
+    }
     output.image = std::move(image);
 
     if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
         output.ptsMs = av_rescale_q(frame->best_effort_timestamp, m_videoStream->time_base,
                                     AVRational{1, 1000});
+    }
+    if (frame->duration > 0) {
+        output.durationMs =
+            av_rescale_q(frame->duration, m_videoStream->time_base, AVRational{1, 1000});
     }
 
     return true;
@@ -529,10 +598,19 @@ bool VideoDecoder::seek(qint64 ms) {
 
     ms = qMax<qint64>(0, ms);
 
+    // Rewinding a demuxer that can't seek: reopen from the start instead.
+    // Any other target on such a demuxer also restarts (frames before it are
+    // skipped by the caller).
+    if (rewindByReopen() && !m_path.isEmpty())
+        return openLocked(QString(m_path));
+
     const int64_t timestamp = av_rescale_q(ms, AVRational{1, 1000}, m_videoStream->time_base);
 
     if (av_seek_frame(m_fmt, m_videoStreamIndex, timestamp, AVSEEK_FLAG_BACKWARD) < 0 &&
         av_seek_frame(m_fmt, m_videoStreamIndex, 0, AVSEEK_FLAG_BACKWARD) < 0) {
+        // Last resort for a rewind: start over from the file.
+        if (ms == 0 && !m_path.isEmpty())
+            return openLocked(QString(m_path));
         return false;
     }
 

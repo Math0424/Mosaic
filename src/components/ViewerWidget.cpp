@@ -7,7 +7,9 @@ namespace Mosaic {
 ViewerWidget::ViewerWidget(QWidget* parent) : QOpenGLWidget(parent) { setMinimumSize(320, 240); }
 
 void ViewerWidget::showImage(const QImage& image) {
-    if (image == m_image)
+    // cacheKey, not operator==: == compares pixel data, which cost a full
+    // frame comparison for every video frame.
+    if (image.cacheKey() == m_image.cacheKey())
         return;
     m_image = image;
     update();

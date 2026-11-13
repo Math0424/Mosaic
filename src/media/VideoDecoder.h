@@ -28,6 +28,9 @@ class VideoDecoder {
     struct Frame {
         QImage image;
         qint64 ptsMs = 0;
+        // How long this frame should stay on screen (0 = unknown). Animated
+        // GIF/WebP frames each carry their own delay.
+        qint64 durationMs = 0;
     };
 
     VideoDecoder();
@@ -54,6 +57,10 @@ class VideoDecoder {
     qint64 audioPositionMs() const;
 
    private:
+    bool openLocked(const QString& path);  // open() body; caller holds m_mutex
+    // True when this demuxer cannot seek reliably, so a rewind reopens the file.
+    bool rewindByReopen() const;
+
     bool pump();
 
     bool decodeVideoPacket(AVPacket* packet);
@@ -102,6 +109,12 @@ class VideoDecoder {
     bool m_videoFlushed = false;
     bool m_animationChecked = false;
     bool m_isAnimated = false;
+
+    QString m_path;  // for rewinds that reopen the input
+    // Duration measured from packet timings for containers that report none
+    // (animated WebP); kept across close() so loop rewinds don't re-measure.
+    QString m_measuredPath;
+    qint64 m_measuredDurationMs = 0;
 
     mutable QMutex m_mutex;
 };

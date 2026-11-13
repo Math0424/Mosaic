@@ -49,6 +49,16 @@ MediaPlaybackController::MediaPlaybackController(QObject* parent) : QObject(pare
             }
         }
 
+        // Without an audio clock, honour each frame's own delay (animated
+        // GIF/WebP mix long and short frames); otherwise keep the base rate.
+        if (!m_decoder->hasAudio()) {
+            const int interval = frame.durationMs >= 20 && frame.durationMs <= 10000
+                                     ? static_cast<int>(frame.durationMs)
+                                     : m_baseInterval;
+            if (m_timer->interval() != interval)
+                m_timer->setInterval(interval);
+        }
+
         emit frameReady(frame);
     });
 }
@@ -85,8 +95,8 @@ void MediaPlaybackController::start(VideoDecoder* decoder) {
     }
 
     const double fps = m_decoder->fps() > 1.0 ? m_decoder->fps() : 25.0;
-    const int interval = qMax(1, qRound(1000.0 / fps));
-    m_timer->setInterval(interval);
+    m_baseInterval = qMax(1, qRound(1000.0 / fps));
+    m_timer->setInterval(m_baseInterval);
     m_playing = true;
     m_timer->start();
 }

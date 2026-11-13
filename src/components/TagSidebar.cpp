@@ -4,6 +4,11 @@
 #include "TagColors.h"
 
 #include <QAbstractItemView>
+#include <QClipboard>
+#include <QCursor>
+#include <QGuiApplication>
+#include <QMouseEvent>
+#include <QToolTip>
 #include <QCompleter>
 #include <QEvent>
 #include <QFontMetrics>
@@ -120,10 +125,22 @@ void TagSidebar::buildUi() {
 }
 
 bool TagSidebar::eventFilter(QObject* watched, QEvent* event) {
-    if (event->type() == QEvent::MouseButtonPress) {
-        if (auto* widget = qobject_cast<QWidget*>(watched);
-            widget && m_tagLabels.contains(widget)) {
-            emit tagSearchRequested(m_tagLabels.value(widget));
+    // Tag / md5 rows: click copies, double-click opens a search tab. The
+    // first click of a double-click also copies, which is harmless.
+    if (event->type() == QEvent::MouseButtonPress ||
+        event->type() == QEvent::MouseButtonDblClick) {
+        auto* widget = qobject_cast<QWidget*>(watched);
+        const auto it = widget ? m_tagLabels.constFind(widget) : m_tagLabels.constEnd();
+        if (it != m_tagLabels.constEnd() &&
+            static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton) {
+            if (event->type() == QEvent::MouseButtonDblClick) {
+                emit tagSearchRequested(it->search);
+            } else if (QClipboard* clipboard = QGuiApplication::clipboard()) {
+                clipboard->setText(it->copy);
+                QToolTip::showText(QCursor::pos(),
+                                   QStringLiteral("Copied \u201C%1\u201D").arg(it->copy),
+                                   widget, {}, 1500);
+            }
             return true;
         }
     }
@@ -242,9 +259,9 @@ void TagSidebar::rebuildList() {
         label->setTextInteractionFlags(Qt::NoTextInteraction);
         label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         label->setCursor(Qt::PointingHandCursor);
-        const QString tagName = tag.name;
+        const LabelAction action{tag.name, tag.name};
         label->installEventFilter(this);
-        m_tagLabels.insert(label, tagName);
+        m_tagLabels.insert(label, action);
         rowLayout->addWidget(label, 1);
 
         if (removable) {
@@ -268,6 +285,31 @@ void TagSidebar::rebuildList() {
         auto* item = new QListWidgetItem(QStringLiteral("No tags"), m_tagList);
         item->setFlags(Qt::NoItemFlags);
         item->setForeground(palette().placeholderText());
+    }
+
+    // File hash: copy it, or double-click to search md5:<hash>.
+    if (!m_image.md5.isEmpty()) {
+        auto* headerItem = new QListWidgetItem(m_tagList);
+        headerItem->setFlags(Qt::NoItemFlags);
+        auto* header = new QLabel(QStringLiteral("MD5"), m_tagList);
+        header->setProperty("role", QStringLiteral("sectionHeader"));
+        header->setContentsMargins(6, 12, 6, 2);
+        headerItem->setSizeHint(header->sizeHint());
+        m_tagList->setItemWidget(headerItem, header);
+
+        auto* item = new QListWidgetItem(m_tagList);
+        auto* label = new QLabel(m_tagList);
+        label->setContentsMargins(6, 2, 6, 2);
+        const QFontMetrics fm(label->font());
+        label->setText(fm.elidedText(m_image.md5, Qt::ElideMiddle, kTextBudgetPlain));
+        label->setToolTip(QStringLiteral("%1\nClick to copy, double-click to search")
+                              .arg(m_image.md5));
+        label->setCursor(Qt::PointingHandCursor);
+        label->setProperty("role", QStringLiteral("hint"));
+        label->installEventFilter(this);
+        m_tagLabels.insert(label, {m_image.md5, QStringLiteral("md5:") + m_image.md5});
+        item->setSizeHint(label->sizeHint());
+        m_tagList->setItemWidget(item, label);
     }
 }
 

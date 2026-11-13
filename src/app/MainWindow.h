@@ -72,6 +72,7 @@ class MainWindow : public QMainWindow {
     void showTabContextMenu(const QPoint& pos);
     void reopenClosedTab();  // Ctrl+Shift+T
     void setStatus(const QString& text);
+    void bringToFront();
     void startLibraryScan();
     void startTabNameEdit(int index);
     bool eventFilter(QObject* watched, QEvent* event) override;
