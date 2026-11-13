@@ -3,6 +3,7 @@
 #include "Icons.h"
 #include "TagSidebar.h"
 #include "ViewerWidget.h"
+#include "../app/Theme.h"
 #include "../core/AppState.h"
 #include "../core/Paths.h"
 #include "../core/Schema.h"
@@ -263,8 +264,8 @@ void ViewerWindow::buildUi() {
     // --- center column ---
     auto* center = new QWidget(this);
     auto* centerLayout = new QVBoxLayout(center);
-    centerLayout->setContentsMargins(6, 6, 6, 6);
-    centerLayout->setSpacing(4);
+    centerLayout->setContentsMargins(8, 8, 8, 8);
+    centerLayout->setSpacing(6);
 
     m_mediaStack = new QStackedWidget(center);
     m_viewer = new ViewerWidget(m_mediaStack);
@@ -283,9 +284,7 @@ void ViewerWindow::buildUi() {
 
     m_animatedBadge = new QLabel(m_mediaStack);
     m_animatedBadge->setText(QStringLiteral("▶ animated"));
-    m_animatedBadge->setStyleSheet(
-        QStringLiteral("QLabel { background: rgba(20,20,24,190); color: #e8e9ec;"
-                       " border-radius: 6px; padding: 3px 8px; font-weight: bold; }"));
+    m_animatedBadge->setObjectName(QStringLiteral("overlayBadge"));  // styled in Theme.cpp
     m_animatedBadge->setAttribute(Qt::WA_TransparentForMouseEvents);
     m_animatedBadge->adjustSize();
     m_animatedBadge->hide();
@@ -330,19 +329,19 @@ void ViewerWindow::buildUi() {
     toolbar->setSpacing(4);
     const QSize iconSize(16, 16);
     m_leftButton = new QToolButton(center);
-    m_leftButton->setIcon(assetIcon(QStringLiteral("prev.svg")));
+    m_leftButton->setIcon(assetIcon(QStringLiteral("chevron-left.svg")));
     m_leftButton->setIconSize(iconSize);
     m_leftButton->setToolTip(QStringLiteral("Previous (Left)"));
     m_rightButton = new QToolButton(center);
-    m_rightButton->setIcon(assetIcon(QStringLiteral("next.svg")));
+    m_rightButton->setIcon(assetIcon(QStringLiteral("chevron-right.svg")));
     m_rightButton->setIconSize(iconSize);
     m_rightButton->setToolTip(QStringLiteral("Next (Right)"));
     m_upButton = new QToolButton(center);
-    m_upButton->setIcon(assetIcon(QStringLiteral("up.svg")));
+    m_upButton->setIcon(assetIcon(QStringLiteral("chevron-up.svg")));
     m_upButton->setToolTip(QStringLiteral("Parent (Up)"));
     m_upButton->setIconSize(iconSize);
     m_downButton = new QToolButton(center);
-    m_downButton->setIcon(assetIcon(QStringLiteral("down.svg")));
+    m_downButton->setIcon(assetIcon(QStringLiteral("chevron-down.svg")));
     m_downButton->setIconSize(iconSize);
     m_downButton->setToolTip(QStringLiteral("Child (Down)"));
     toolbar->addWidget(m_leftButton);
@@ -361,14 +360,19 @@ void ViewerWindow::buildUi() {
     m_repeatButton->setChecked(true);
     m_repeatButton->setToolTip(QStringLiteral("Repeat video/gif at the end"));
     m_saveButton = new QPushButton(QStringLiteral("Save"), center);
+    m_saveButton->setIcon(assetIcon(QStringLiteral("download.svg")));
+    m_saveButton->setProperty("accent", true);
     m_saveButton->setToolTip(QStringLiteral("Save to library (Ctrl+S)"));
-    m_saveFavButton = new QPushButton(QStringLiteral("Save"), center);
+    m_saveFavButton = new QPushButton(QStringLiteral("Save + favorite"), center);
     m_saveFavButton->setIcon(assetIcon(QStringLiteral("save-favorite.svg")));
     m_saveFavButton->setToolTip(QStringLiteral("Save to library and mark favorite (Ctrl+Shift+S)"));
     m_deleteButton = new QPushButton(QStringLiteral("Delete"), center);
+    m_deleteButton->setIcon(assetIcon(QStringLiteral("delete.svg")));
+    m_deleteButton->setProperty("danger", true);
     m_deleteButton->setToolTip(QStringLiteral("Remove from library"));
     m_revealButton = new QToolButton(center);
-    m_revealButton->setIcon(assetIcon(QStringLiteral("file.svg")));
+    m_revealButton->setIcon(assetIcon(QStringLiteral("folder-open.svg")));
+    m_revealButton->setIconSize(iconSize);
     m_revealButton->setToolTip(QStringLiteral("Reveal in File Explorer"));
     connect(m_revealButton, &QToolButton::clicked, this, [this]() {
         if (m_current.localPath.isEmpty())
@@ -387,11 +391,16 @@ void ViewerWindow::buildUi() {
     m_favoriteButton->setIconSize(iconSize);
     m_favoriteButton->setCheckable(true);
     m_favoriteButton->setToolTip(QStringLiteral("Toggle favorite"));
+    m_slideshowButton->setIconSize(iconSize);
+    m_repeatButton->setIconSize(iconSize);
+    // Groups: playback | library actions | file & favorite.
     toolbar->addWidget(m_slideshowButton);
     toolbar->addWidget(m_repeatButton);
+    toolbar->addSpacing(12);
     toolbar->addWidget(m_saveButton);
     toolbar->addWidget(m_saveFavButton);
     toolbar->addWidget(m_deleteButton);
+    toolbar->addSpacing(12);
     toolbar->addWidget(m_revealButton);
     toolbar->addWidget(m_favoriteButton);
     centerLayout->addLayout(toolbar);
@@ -1216,8 +1225,8 @@ void ViewerWindow::setInfo(const SourceImage& image) {
     if (!image.sourceUrl.isEmpty())
         html += QStringLiteral(" · <a href=\"%1\">post page</a>").arg(image.sourceUrl);
     if (image.hasChildren)
-        html += QStringLiteral(
-            " · <span style=\"color:#1e78d6; font-weight:bold;\">children available</span>");
+        html += QStringLiteral(" · <span style=\"color:%1; font-weight:bold;\">children available</span>")
+                    .arg(QLatin1String(Theme::Color::Accent));
     m_infoLabel->setText(html);
 }
 

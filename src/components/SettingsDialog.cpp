@@ -50,7 +50,7 @@ void SettingsDialog::buildUi() {
         QStringLiteral("Image files and the Mosaic.duckdb catalog live in this folder.\n"
                        "Existing files are moved when you change it (takes effect on restart)."),
         libBox);
-    libHint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+    libHint->setProperty("role", QStringLiteral("hint"));
     libLayout->addWidget(libHint);
     root->addWidget(libBox);
 
@@ -93,7 +93,7 @@ void SettingsDialog::buildUi() {
     addCredRow(QStringLiteral("safebooru"), QStringLiteral("safebooru.org:"));
     auto* credHint =
         new QLabel(QStringLiteral("gelbooru.com and safebooru.org require an API key."), credBox);
-    credHint->setStyleSheet(QStringLiteral("color: #9aa0ab;"));
+    credHint->setProperty("role", QStringLiteral("hint"));
     credLayout->addRow(credHint);
     root->addWidget(credBox);
 

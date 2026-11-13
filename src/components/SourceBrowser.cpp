@@ -5,6 +5,7 @@
 #include "TagColors.h"
 #include "ViewerWindow.h"
 #include "../app/MainWindow.h"
+#include "../app/Theme.h"
 #include "../core/Paths.h"
 #include "../core/ThreadPools.h"
 
@@ -19,6 +20,7 @@
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QStringListModel>
 #include <QPointer>
 #include <QPushButton>
@@ -75,6 +77,7 @@ QSize ThumbnailButton::sizeHint() const { return QSize(kThumbSize, kThumbSize); 
 
 void ThumbnailButton::setPixmap(const QPixmap& pixmap) {
     m_pixmap = pixmap;
+    m_scaled = {};
     update();
 }
 
@@ -82,44 +85,77 @@ void ThumbnailButton::paintEvent(QPaintEvent* event) {
     Q_UNUSED(event);
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    const QRect content = rect().adjusted(1, 1, -1, -1);
-    p.fillRect(content, palette().window());
+    // Card: a rounded tile per cell so the grid reads evenly whatever the
+    // image aspect ratios are. The 2px inset keeps a gutter at spacing 0.
+    const QRectF card = QRectF(rect()).adjusted(2, 2, -2, -2);
+    const qreal radius = qBound(4.0, width() / 22.0, 10.0);
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(m_hovered ? Theme::Color::Hover : Theme::Color::Panel));
+    p.drawRoundedRect(card, radius, radius);
 
-    const int padding = qMax(2, width() / 48);
-    const QRect imgRect = content.adjusted(padding, padding, -padding, -padding);
+    const qreal padding = qBound(4.0, width() / 48.0, 8.0);
+    const QRectF imgArea = card.adjusted(padding, padding, -padding, -padding);
+
     if (m_pixmap.isNull()) {
-        p.setPen(palette().placeholderText().color());
-        p.drawRoundedRect(imgRect, 6, 6);
-        p.drawText(imgRect, Qt::AlignCenter, QStringLiteral("…"));
+        // Skeleton block while the thumbnail loads.
+        p.setBrush(QColor(Theme::Color::Raised));
+        p.drawRoundedRect(imgArea, radius - 2, radius - 2);
     } else {
-        const QPixmap scaled =
-            m_pixmap.scaled(imgRect.size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        p.drawPixmap(imgRect.x() + (imgRect.width() - scaled.width()) / 2,
-                     imgRect.y() + (imgRect.height() - scaled.height()) / 2, scaled);
+        // Scaled in device pixels (sharp on HiDPI) and cached across repaints.
+        const qreal dpr = devicePixelRatioF();
+        const QSize target = (imgArea.size() * dpr).toSize();
+        const bool fits = !m_scaled.isNull() && m_scaled.width() <= target.width() &&
+                          m_scaled.height() <= target.height() &&
+                          (m_scaled.width() == target.width() ||
+                           m_scaled.height() == target.height());
+        if (!fits) {
+            m_scaled = m_pixmap.scaled(target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            m_scaled.setDevicePixelRatio(dpr);
+        }
+        const QSizeF shown = m_scaled.deviceIndependentSize();
+        const QRectF imgRect(imgArea.x() + (imgArea.width() - shown.width()) / 2.0,
+                             imgArea.y() + (imgArea.height() - shown.height()) / 2.0,
+                             shown.width(), shown.height());
+        QPainterPath clip;
+        clip.addRoundedRect(imgRect, radius - 3, radius - 3);
+        p.save();
+        p.setClipPath(clip);
+        p.drawPixmap(imgRect.topLeft(), m_scaled);
+        p.restore();
     }
 
-    QVector<QPixmap> indicators;
-
-    if (isAnimatedFormat(m_image)) {
-        indicators.append(assetIcon(QStringLiteral("play.svg")).pixmap(18, 18));
+    if (m_hovered) {
+        QPen ring{QColor(Theme::Color::Accent)};
+        ring.setWidthF(1.5);
+        p.setPen(ring);
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(card.adjusted(0.75, 0.75, -0.75, -0.75), radius, radius);
+        p.setPen(Qt::NoPen);
     }
 
-    if (m_image.hasChildren) {
-        indicators.append(assetIcon(QStringLiteral("images.svg")).pixmap(18, 18));
-    }
+    // Badges: icons on dark pills so they stay readable on light images.
+    QStringList badges;
+    if (isAnimatedFormat(m_image))
+        badges << QStringLiteral("play.svg");
+    if (m_image.hasChildren)
+        badges << QStringLiteral("images.svg");
+    if (m_image.localPath.isEmpty() && m_image.isInLibrary())
+        badges << QStringLiteral("file.svg");
 
-    if (m_image.localPath.isEmpty() && m_image.isInLibrary()) {
-        indicators.append(assetIcon(QStringLiteral("file.svg")).pixmap(18, 18));
-    }
-
-    const int s = qMax(18, width() / 18);
-    const int icon_padding = 2;
-
-    for (int i = 0; i < indicators.size(); ++i) {
-        const int x = imgRect.right() - s - icon_padding - (i * (s + icon_padding));
-        const QRect iconRect(x, imgRect.top() + icon_padding, s, s);
-        p.drawPixmap(iconRect, indicators[i]);
+    const int iconSize = qBound(14, width() / 14, 20);
+    const int pill = iconSize + 8;
+    const qreal gap = 4;
+    qreal x = imgArea.right() - pill - 2;
+    const qreal y = imgArea.top() + 2;
+    for (const QString& badge : badges) {
+        const QRectF pillRect(x, y, pill, pill);
+        p.setBrush(QColor(15, 16, 19, 190));
+        p.drawRoundedRect(pillRect, pill / 2.0 - 2, pill / 2.0 - 2);
+        const QRect iconRect = pillRect.adjusted(4, 4, -4, -4).toRect();
+        p.drawPixmap(iconRect, assetIcon(badge).pixmap(iconRect.size(), devicePixelRatioF()));
+        x -= pill + gap;
     }
 }
 
@@ -128,6 +164,18 @@ void ThumbnailButton::mousePressEvent(QMouseEvent* event) {
         emit clicked();
     }
     QWidget::mousePressEvent(event);
+}
+
+void ThumbnailButton::enterEvent(QEnterEvent* event) {
+    m_hovered = true;
+    update();
+    QWidget::enterEvent(event);
+}
+
+void ThumbnailButton::leaveEvent(QEvent* event) {
+    m_hovered = false;
+    update();
+    QWidget::leaveEvent(event);
 }
 
 // SourceBrowser
@@ -143,12 +191,13 @@ SourceBrowser::~SourceBrowser() {
 
 void SourceBrowser::buildUi() {
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(6, 6, 6, 6);
-    root->setSpacing(6);
+    root->setContentsMargins(10, 10, 4, 0);
+    root->setSpacing(8);
 
     // --- Search bar ---
     auto* bar = new QHBoxLayout();
-    bar->setSpacing(6);
+    bar->setContentsMargins(0, 0, 6, 0);
+    bar->setSpacing(8);
 
     // Completes the word under the cursor, not just the whole query.
     m_completer = new QCompleter(this);
@@ -172,6 +221,7 @@ void SourceBrowser::buildUi() {
     m_tagEdit = new QLineEdit(this);
     m_tagEdit->setPlaceholderText(QStringLiteral("Tags (space separated, -tag to exclude)…"));
     m_tagEdit->setClearButtonEnabled(true);
+    m_tagEdit->addAction(assetIcon(QStringLiteral("search.svg")), QLineEdit::LeadingPosition);
     m_completer->setWidget(m_tagEdit);
     if (m_completer->popup())
         m_completer->popup()->installEventFilter(this);
@@ -195,7 +245,8 @@ void SourceBrowser::buildUi() {
 
     // Editable page field: type a number and press Enter to jump.
     m_pageLabel = new QLineEdit(this);
-    m_pageLabel->setFixedWidth(90);
+    m_pageLabel->setFixedWidth(96);
+    m_pageLabel->setProperty("segment", QStringLiteral("middle"));
     m_pageLabel->setAlignment(Qt::AlignCenter);
     m_pageLabel->setPlaceholderText(QStringLiteral("page"));
     m_pageLabel->setToolTip(QStringLiteral("Type a page number and press Enter to jump to it"));
@@ -208,21 +259,28 @@ void SourceBrowser::buildUi() {
         }
     });
 
-    m_prevButton = new QPushButton(QStringLiteral("Prev"), this);
-    m_prevButton->setIcon(assetIcon(QStringLiteral("page-up.svg")));
+    // Pager: [‹][pages][›] drawn as one joined control (see segment in Theme.cpp).
+    m_prevButton = new QPushButton(this);
+    m_prevButton->setIcon(assetIcon(QStringLiteral("chevron-left.svg")));
+    m_prevButton->setProperty("segment", QStringLiteral("left"));
     m_prevButton->setEnabled(false);
     m_prevButton->setToolTip(QStringLiteral("Load the previous page of results"));
 
-    m_loadMoreButton = new QPushButton(QStringLiteral("Next"), this);
-    m_loadMoreButton->setIcon(assetIcon(QStringLiteral("page-down.svg")));
+    m_loadMoreButton = new QPushButton(this);
+    m_loadMoreButton->setIcon(assetIcon(QStringLiteral("chevron-right.svg")));
+    m_loadMoreButton->setProperty("segment", QStringLiteral("right"));
     m_loadMoreButton->setEnabled(false);
     m_loadMoreButton->setToolTip(QStringLiteral("Load the next page of results"));
 
+    auto* pager = new QHBoxLayout();
+    pager->setSpacing(0);
+    pager->addWidget(m_prevButton);
+    pager->addWidget(m_pageLabel);
+    pager->addWidget(m_loadMoreButton);
+
     bar->addWidget(m_tagEdit, 1);
     bar->addWidget(m_searchButton);
-    bar->addWidget(m_pageLabel);
-    bar->addWidget(m_prevButton);
-    bar->addWidget(m_loadMoreButton);
+    bar->addLayout(pager);
 
     // Wrapped in a widget so it can be hidden wholesale.
     auto* barWidget = new QWidget(this);
@@ -254,7 +312,8 @@ void SourceBrowser::buildUi() {
     root->addWidget(m_gridScroll, 1);
 
     // Shown when a search finished without results.
-    m_emptyLabel = new QLabel(QStringLiteral("(nothing to show)"), m_gridScroll);
+    m_emptyLabel = new QLabel(QStringLiteral("No results"), m_gridScroll);
+    m_emptyLabel->setProperty("role", QStringLiteral("empty"));
     m_emptyLabel->setAlignment(Qt::AlignCenter);
     m_emptyLabel->hide();
 

@@ -2,4 +2,36 @@
     <qresource prefix="/">
         <file>icon.svg</file>
     </qresource>
+    <qresource prefix="/icons">
+        <file>bug.svg</file>
+        <file>check.svg</file>
+        <file>chevron-down.svg</file>
+        <file>chevron-left.svg</file>
+        <file>chevron-right.svg</file>
+        <file>chevron-up.svg</file>
+        <file>close-dim.svg</file>
+        <file>close.svg</file>
+        <file>delete.svg</file>
+        <file>down.svg</file>
+        <file>download.svg</file>
+        <file>fav.svg</file>
+        <file>feed.svg</file>
+        <file>file.svg</file>
+        <file>folder-open.svg</file>
+        <file>images.svg</file>
+        <file>love.svg</file>
+        <file>menu.svg</file>
+        <file>next.svg</file>
+        <file>page-down.svg</file>
+        <file>page-up.svg</file>
+        <file>pause.svg</file>
+        <file>play.svg</file>
+        <file>plus.svg</file>
+        <file>prev.svg</file>
+        <file>repeat.svg</file>
+        <file>save-favorite.svg</file>
+        <file>search.svg</file>
+        <file>up.svg</file>
+        <file>volume.svg</file>
+    </qresource>
 </RCC>

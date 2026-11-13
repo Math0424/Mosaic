@@ -31,6 +31,7 @@ class ThumbnailButton : public QWidget {
     void setPixmap(const QPixmap& pixmap);
     void releasePixmap() {
         m_pixmap = {};
+        m_scaled = {};
         update();
     }
     bool hasPixmap() const { return !m_pixmap.isNull(); }
@@ -42,10 +43,14 @@ class ThumbnailButton : public QWidget {
    protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
+    void enterEvent(QEnterEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
    private:
     SourceImage m_image;
     QPixmap m_pixmap;
+    QPixmap m_scaled;  // m_pixmap fitted to the last paint size
+    bool m_hovered = false;
 };
 
 // A browsing tab bound to one Source: tag search bar on top, infinitely

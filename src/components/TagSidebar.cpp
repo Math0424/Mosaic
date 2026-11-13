@@ -25,8 +25,19 @@ namespace Mosaic {
 
 namespace {
 
-constexpr int kCollapsedWidth = 34;  // strip width when collapsed
-constexpr int kExpandedWidth = 220;  // full sidebar width
+constexpr int kCollapsedWidth = 40;  // strip width when collapsed
+constexpr int kExpandedWidth = 240;  // full sidebar width
+// Display order of tag groups; unknown categories go last, alphabetically.
+int categoryRank(const QString& category) {
+    static const QStringList order = {
+        QStringLiteral("artist"),  QStringLiteral("copyright"), QStringLiteral("character"),
+        QStringLiteral("species"), QStringLiteral("model"),     QStringLiteral("general"),
+        QStringLiteral("meta"),    QStringLiteral("usergroup"),
+    };
+    const int rank = order.indexOf(category.isEmpty() ? QStringLiteral("general") : category);
+    return rank < 0 ? int(order.size()) : rank;
+}
+
 // Text budgets per row at expanded width.
 constexpr int kTextBudgetRemovable = 150;
 constexpr int kTextBudgetPlain = 180;
@@ -39,14 +50,16 @@ TagSidebar::TagSidebar(QWidget* parent) : QWidget(parent) {
 }
 
 void TagSidebar::buildUi() {
+    setObjectName(QStringLiteral("tagSidebar"));  // styled in Theme.cpp
+    setAttribute(Qt::WA_StyledBackground);
+
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(0, 0, 0, 0);
+    root->setContentsMargins(0, 0, 0, 8);
     root->setSpacing(4);
 
     m_header = new QPushButton(QStringLiteral("Tags"), this);
-    m_header->setFlat(true);
-    m_header->setStyleSheet(
-        QStringLiteral("QPushButton { text-align: left; font-weight: bold; padding: 4px; }"));
+    m_header->setObjectName(QStringLiteral("sidebarHeader"));
+    m_header->setCursor(Qt::PointingHandCursor);
     connect(m_header, &QPushButton::clicked, this, [this]() { setCollapsed(!m_collapsed); });
     root->addWidget(m_header);
 
@@ -56,8 +69,9 @@ void TagSidebar::buildUi() {
     m_body->setSpacing(4);
 
     m_tagList = new QListWidget(this);
+    m_tagList->setObjectName(QStringLiteral("tagList"));
     m_tagList->installEventFilter(this);
-    m_tagList->setAlternatingRowColors(true);
+    m_tagList->setSelectionMode(QAbstractItemView::NoSelection);
     m_tagList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_body->addWidget(m_tagList, 1);
 
@@ -78,12 +92,18 @@ void TagSidebar::buildUi() {
     m_tagEdit->installEventFilter(this);
 
     m_addButton = new QPushButton(QStringLiteral("Add tag"), this);
+    m_addButton->setIcon(assetIcon(QStringLiteral("plus.svg")));
 
     // Stacked vertically: side-by-side the button squeezes the line edit down.
-    m_body->addWidget(m_tagEdit);
-    m_body->addWidget(m_addButton);
+    auto* addBox = new QVBoxLayout();
+    addBox->setContentsMargins(8, 4, 8, 0);
+    addBox->setSpacing(6);
+    addBox->addWidget(m_tagEdit);
+    addBox->addWidget(m_addButton);
+    m_body->addLayout(addBox);
 
     root->addLayout(m_body, 1);
+    root->addStretch(0);  // keeps the header at the top while collapsed
 
     connect(m_addButton, &QPushButton::clicked, this, [this]() {
         const QString tag = m_tagEdit->text().trimmed();
@@ -164,20 +184,48 @@ void TagSidebar::rebuildList() {
 
     QList<SourceTag> tags = m_image.tags;
     std::sort(tags.begin(), tags.end(), [](const SourceTag& a, const SourceTag& b) {
-        if (a.category != b.category) {
+        const int ra = categoryRank(a.category);
+        const int rb = categoryRank(b.category);
+        if (ra != rb)
+            return ra < rb;
+        if (a.category != b.category)
             return a.category < b.category;
-        }
         return a.name < b.name;
     });
 
-    for (const SourceTag& tag : tags) {
+    auto groupOf = [](const SourceTag& tag) {
+        return tag.category.isEmpty() ? QStringLiteral("general") : tag.category;
+    };
+
+    QString currentGroup;
+    for (int i = 0; i < tags.size(); ++i) {
+        const SourceTag& tag = tags.at(i);
+        const QString group = groupOf(tag);
+
+        // Group header: colored dot + CATEGORY + count.
+        if (i == 0 || group != currentGroup) {
+            currentGroup = group;
+            int count = 0;
+            for (int j = i; j < tags.size() && groupOf(tags.at(j)) == group; ++j) ++count;
+
+            auto* headerItem = new QListWidgetItem(m_tagList);
+            headerItem->setFlags(Qt::NoItemFlags);
+            auto* header = new QLabel(m_tagList);
+            header->setProperty("role", QStringLiteral("sectionHeader"));
+            header->setTextFormat(Qt::RichText);
+            header->setText(QStringLiteral("<span style='color:%1;'>&#9679;</span>&nbsp; %2"
+                                           "&nbsp;&nbsp;<span style='font-weight:400;'>%3</span>")
+                                .arg(categoryColorHtml(group), group.toUpper().toHtmlEscaped())
+                                .arg(count));
+            header->setContentsMargins(6, i == 0 ? 4 : 12, 6, 2);
+            headerItem->setSizeHint(header->sizeHint());
+            m_tagList->setItemWidget(headerItem, header);
+        }
+
         const bool removable = m_editable && !(tag.category == QLatin1String("usergroup") &&
                                                tag.name == QLatin1String("favorite"));
 
-        QString text = tag.name;
-        if (!tag.category.isEmpty() && tag.category != QLatin1String("general")) {
-            text += QStringLiteral("  [%1]").arg(tag.category);
-        }
+        const QString text = tag.name;
 
         auto* item = new QListWidgetItem(m_tagList);
         auto* row = new QWidget(m_tagList);
@@ -217,7 +265,8 @@ void TagSidebar::rebuildList() {
     }
 
     if (tags.isEmpty()) {
-        auto* item = new QListWidgetItem(QStringLiteral("(no tags)"), m_tagList);
+        auto* item = new QListWidgetItem(QStringLiteral("No tags"), m_tagList);
+        item->setFlags(Qt::NoItemFlags);
         item->setForeground(palette().placeholderText());
     }
 }
@@ -237,7 +286,9 @@ void TagSidebar::setCollapsed(bool collapsed) {
     m_tagEdit->setVisible(!collapsed && m_editable);
     m_addButton->setVisible(!collapsed && m_editable);
 
-    m_header->setText(collapsed ? QStringLiteral("\u25B8") : QStringLiteral("\u25BE Tags"));
+    m_header->setText(collapsed ? QString() : QStringLiteral("Tags"));
+    m_header->setIcon(assetIcon(collapsed ? QStringLiteral("chevron-right.svg")
+                                          : QStringLiteral("chevron-left.svg")));
     m_header->setToolTip(collapsed ? QStringLiteral("Show tags") : QStringLiteral("Hide tags"));
 
     setFixedWidth(collapsed ? kCollapsedWidth : kExpandedWidth);

@@ -142,6 +142,7 @@ target_link_libraries(Mosaic PRIVATE
     ${OpenCV_LIBS}
     ffmpeg
     duckdb
+    $<$<PLATFORM_ID:Windows>:dwmapi>
 )
 
 # Opt-in strictness (the build is warning-free at /W4):

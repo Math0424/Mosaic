@@ -28,13 +28,13 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
-#include <QMenuBar>
 #include <QStatusBar>
 #include <QTabBar>
 #include <QTabWidget>
@@ -108,7 +108,7 @@ void MainWindow::buildUi() {
     m_tabs = new QTabWidget(this);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
-    m_tabs->setDocumentMode(true);
+    m_tabs->setDocumentMode(false);  // pane line sits under the tabs (Theme.cpp)
     connect(m_tabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
         QWidget* w = m_tabs->widget(index);
         // The Favorites tab is permanent.
@@ -141,11 +141,9 @@ void MainWindow::buildUi() {
             &MainWindow::showTabContextMenu);
 
     m_tabNameEditor = new QLineEdit(m_tabs->tabBar());
+    m_tabNameEditor->setObjectName(QStringLiteral("tabNameEditor"));  // styled in Theme.cpp
     m_tabNameEditor->setFrame(false);
     m_tabNameEditor->setAlignment(Qt::AlignCenter);
-    m_tabNameEditor->setStyleSheet(
-        QStringLiteral("QLineEdit { background: #23262d; color: #e8e9ec; border: 1px solid #4f8cff;"
-                       " padding: 0 4px; }"));
     m_tabNameEditor->hide();
     m_tabNameEditor->installEventFilter(this);
     m_tabs->tabBar()->installEventFilter(this);
@@ -173,18 +171,34 @@ void MainWindow::buildUi() {
     m_feedButton->setAutoRaise(true);
     m_feedButton->setToolTip(QStringLiteral("For You feed"));
     connect(m_feedButton, &QToolButton::clicked, this, &MainWindow::showFeedPage);
-    m_tabs->setCornerWidget(m_feedButton, Qt::TopRightCorner);
+
+    // App menu lives in the tab strip instead of a separate menu bar row.
+    auto* menuButton = new QToolButton(m_tabs);
+    menuButton->setIcon(Mosaic::assetIcon(QStringLiteral("menu.svg")));
+    menuButton->setAutoRaise(true);
+    menuButton->setToolTip(QStringLiteral("Menu"));
+
+    auto* corner = new QWidget(m_tabs);
+    auto* cornerLayout = new QHBoxLayout(corner);
+    cornerLayout->setContentsMargins(0, 2, 6, 0);
+    cornerLayout->setSpacing(2);
+    cornerLayout->addWidget(m_feedButton);
+    cornerLayout->addWidget(menuButton);
+    m_tabs->setCornerWidget(corner, Qt::TopRightCorner);
 
     setCentralWidget(m_tabs);
 
     m_status = new QLabel(this);
     statusBar()->addWidget(m_status);
 
-    QMenu* fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
-    fileMenu->addAction(QStringLiteral("&Exit"), this, &QWidget::close);
-
-    QMenu* toolsMenu = menuBar()->addMenu(QStringLiteral("&Tools"));
-    toolsMenu->addAction(QStringLiteral("&Conflicts (duplicates)…"), this, [this]() {
+    auto* toolsMenu = new QMenu(menuButton);
+    // Opened by hand so it right-aligns under the button instead of running
+    // off the window edge.
+    connect(menuButton, &QToolButton::clicked, this, [menuButton, toolsMenu]() {
+        const QPoint anchor = menuButton->mapToGlobal(menuButton->rect().bottomRight());
+        toolsMenu->exec(anchor - QPoint(toolsMenu->sizeHint().width() - 1, -2));
+    });
+    toolsMenu->addAction(QStringLiteral("Conflicts (duplicates)…"), this, [this]() {
         for (int i = 0; i < m_tabs->count(); ++i) {
             if (qobject_cast<ConflictsPage*>(m_tabs->widget(i))) {
                 m_tabs->setCurrentIndex(i);
@@ -194,7 +208,7 @@ void MainWindow::buildUi() {
         const int index = m_tabs->addTab(new ConflictsPage(m_tabs), QStringLiteral("Conflicts"));
         m_tabs->setCurrentIndex(index);
     });
-    toolsMenu->addAction(QStringLiteral("&Merge tags\u2026"), this, [this]() {
+    toolsMenu->addAction(QStringLiteral("Merge tags\u2026"), this, [this]() {
         for (int i = 0; i < m_tabs->count(); ++i) {
             if (qobject_cast<TagMergePage*>(m_tabs->widget(i))) {
                 m_tabs->setCurrentIndex(i);
@@ -204,7 +218,7 @@ void MainWindow::buildUi() {
         const int index = m_tabs->addTab(new TagMergePage(m_tabs), QStringLiteral("Merge tags"));
         m_tabs->setCurrentIndex(index);
     });
-    toolsMenu->addAction(QStringLiteral("&Import library…"), this, [this]() {
+    toolsMenu->addAction(QStringLiteral("Import library…"), this, [this]() {
         for (int i = 0; i < m_tabs->count(); ++i) {
             if (qobject_cast<ImportPage*>(m_tabs->widget(i))) {
                 m_tabs->setCurrentIndex(i);
@@ -214,10 +228,10 @@ void MainWindow::buildUi() {
         const int index = m_tabs->addTab(new ImportPage(m_tabs), QStringLiteral("Import"));
         m_tabs->setCurrentIndex(index);
     });
-    toolsMenu->addAction(QStringLiteral("&For You feed…"), this, &MainWindow::showFeedPage);
-    toolsMenu->addAction(QStringLiteral("&Web server…"), this, &MainWindow::showWebServerDialog);
+    toolsMenu->addAction(QStringLiteral("For You feed…"), this, &MainWindow::showFeedPage);
+    toolsMenu->addAction(QStringLiteral("Web server…"), this, &MainWindow::showWebServerDialog);
     toolsMenu->addSeparator();
-    toolsMenu->addAction(QStringLiteral("&Settings…"), this, [this]() {
+    toolsMenu->addAction(QStringLiteral("Settings…"), this, [this]() {
         const QString oldLibrary = m_state.libraryPath();
         SettingsDialog dialog(m_state, m_sources, this);
         if (dialog.exec() == QDialog::Accepted) {
@@ -230,6 +244,8 @@ void MainWindow::buildUi() {
             m_state.save();
         }
     });
+    toolsMenu->addSeparator();
+    toolsMenu->addAction(QStringLiteral("Exit"), this, &QWidget::close);
 }
 
 void MainWindow::applyGridSettings() {
@@ -306,6 +322,12 @@ void MainWindow::addFavoritesTab() {
     m_favoritesTab = new FavoritesPage(m_sources, m_state, m_tabs);
     const int index = m_tabs->addTab(m_favoritesTab, QStringLiteral("Favorites"));
     m_tabs->tabBar()->moveTab(index, 0);
+    // Permanent tab: no close button.
+    QTabBar* bar = m_tabs->tabBar();
+    if (QWidget* close = bar->tabButton(0, QTabBar::RightSide)) {
+        bar->setTabButton(0, QTabBar::RightSide, nullptr);
+        close->deleteLater();
+    }
 }
 
 void MainWindow::applyFeedTabSetting() {
@@ -392,6 +414,30 @@ void MainWindow::showTabContextMenu(const QPoint& pos) {
         return;
 
     QMenu menu(this);
+    menu.addAction(QStringLiteral("Duplicate tab"), this, [this, index]() {
+        auto* original = qobject_cast<SourceBrowser*>(m_tabs->widget(index));
+        if (!original)
+            return;
+        const QString title = m_tabs->tabText(index);
+        const QList<Source*> members = original->source()->members();
+        SourceBrowser* copy = members.isEmpty()
+                                  ? addSourceTab(original->source(), {}, title)
+                                  : addMultiSourceTab(members, title);
+        if (!copy)
+            return;
+        const QString tags = original->tags();
+        if (!tags.isEmpty()) {
+            copy->setTags(tags);
+            copy->searchFromPage(qMax(1, original->page()));
+        }
+        // Place the copy right after the original instead of at the end.
+        const int from = m_tabs->indexOf(copy);
+        const int to = m_tabs->indexOf(original) + 1;
+        if (from >= 0 && from != to)
+            m_tabs->tabBar()->moveTab(from, to);
+        m_tabs->setCurrentWidget(copy);
+    });
+    menu.addSeparator();
     menu.addAction(QStringLiteral("Add to Favorites…"), this, [this, index]() {
         auto* browser = qobject_cast<SourceBrowser*>(m_tabs->widget(index));
         if (!browser)
