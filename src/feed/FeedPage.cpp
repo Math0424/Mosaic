@@ -137,6 +137,8 @@ FeedPage::FeedPage(SourceManager& sources, std::shared_ptr<FeedEngine> engine,
     m_likedSeed = QRandomGenerator::global()->generate() | 1u;
     m_media = new MediaCache(this);
     m_media->setMaxEntries(24);
+    // Only the current post and the next few prefetches need to stay hot.
+    m_media->setMaxBytes(192LL * 1024 * 1024);
     Q_UNUSED(state);  // feed sources now live on the shared FeedEngine
     m_db = &m_engine->db();
     buildUi();

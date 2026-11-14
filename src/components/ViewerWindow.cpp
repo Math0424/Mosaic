@@ -54,6 +54,7 @@ namespace {
 
 constexpr int kSlideshowManualTime = 10 * 1000;
 constexpr int kMaxCacheEntries = 8;
+constexpr qint64 kMaxCacheBytes = 256LL * 1024 * 1024;  // videos can be 100+ MB each
 constexpr int kCacheRadius = 4;
 
 QString cacheKey(const QString& md5, FileKind kind) {
@@ -1189,6 +1190,21 @@ void ViewerWindow::evictCache() {
     while (m_cacheOrder.size() > kMaxCacheEntries) {
         const QString key = m_cacheOrder.takeFirst();
         m_cache.remove(key);
+    }
+
+    // Byte cap, oldest first. The post on screen is kept (save and the
+    // slideshow read its bytes back) along with the newest entry.
+    qint64 total = 0;
+    for (const QByteArray& bytes : std::as_const(m_cache)) total += bytes.size();
+    const QString currentPrefix = m_current.md5 + QLatin1Char(':');
+    for (int i = 0; total > kMaxCacheBytes && i < m_cacheOrder.size() - 1;) {
+        const QString& key = m_cacheOrder.at(i);
+        if (!m_current.md5.isEmpty() && key.startsWith(currentPrefix)) {
+            ++i;
+            continue;
+        }
+        total -= m_cache.take(key).size();
+        m_cacheOrder.removeAt(i);
     }
 }
 

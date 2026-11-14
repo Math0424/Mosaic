@@ -11,11 +11,13 @@
 
 #include <QtConcurrentRun>
 #include <QAbstractItemView>
+#include <QBuffer>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QImageReader>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
@@ -46,6 +48,37 @@ constexpr int kImageSize = 150;      ///< image area inside the cell
 constexpr int kPageSize = 75;        ///< images requested per page
 constexpr int kPrefetchPx = 400;     ///< load next page this close to the bottom
 constexpr int kRecycleMargin = 800;  ///< keep decoded thumbs this far beyond the viewport
+// Longest edge of a decoded thumbnail. Tiles paint at ~168px and stretch a
+// little to fill the row; x2 covers HiDPI. Library previews are the original
+// file, so without this cap one tile could hold a 100+ MB bitmap.
+constexpr int kThumbMaxEdge = 400;
+
+QSize thumbTargetSize(const QSize& size) {
+    if (size.width() <= kThumbMaxEdge && size.height() <= kThumbMaxEdge)
+        return size;
+    return size.scaled(kThumbMaxEdge, kThumbMaxEdge, Qt::KeepAspectRatio);
+}
+
+QImage capThumb(const QImage& image) {
+    if (image.isNull())
+        return image;
+    const QSize target = thumbTargetSize(image.size());
+    return target == image.size()
+               ? image
+               : image.scaled(target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+}
+
+// Decodes at thumbnail size. JPEG scales during decode, so big originals
+// are never fully expanded in memory.
+QImage readThumb(QImageReader& reader) {
+    const QSize full = reader.size();
+    if (full.isValid()) {
+        const QSize target = thumbTargetSize(full);
+        if (target != full)
+            reader.setScaledSize(target);
+    }
+    return capThumb(reader.read());
+}
 
 // On-disk thumbnail cache folder.
 QString thumbCacheDir() { return QDir(Paths::tempDir()).filePath(QStringLiteral("thumbcache")); }
@@ -586,14 +619,31 @@ void SourceBrowser::requestPreview(const SourceImage& image) {
         QImage decoded;
         const QString cachePath = cacheDir + QLatin1Char('/') + md5 + QLatin1String(".jpg");
 
-        if (!decoded.load(cachePath)) {
+        bool shrinkCached = false;
+        {
+            QImageReader cached(cachePath);
+            const QSize stored = cached.size();
+            decoded = readThumb(cached);
+            shrinkCached = !decoded.isNull() && stored.isValid() &&
+                           thumbTargetSize(stored) != stored;
+        }  // reader closed before the file is rewritten
+        if (shrinkCached)
+            decoded.save(cachePath, "JPG", 80);  // entry from before the size cap
+
+        if (decoded.isNull()) {
             if (QFileInfo::exists(cachePath))
                 QFile::remove(cachePath);
 
             const FileKind kind =
                 !image.previewUrl.isEmpty() ? FileKind::Preview : FileKind::Sample;
-            const QByteArray bytes = source->fetch(image, kind);
-            if (!decoded.loadFromData(bytes)) {
+            QByteArray bytes = source->fetch(image, kind);
+            {
+                QBuffer buffer(&bytes);
+                buffer.open(QIODevice::ReadOnly);
+                QImageReader reader(&buffer);
+                decoded = readThumb(reader);
+            }
+            if (decoded.isNull()) {
                 QString ext = QFileInfo(image.localPath).suffix().toLower();
                 if (ext.isEmpty()) {
                     ext = image.format.toLower();
@@ -609,7 +659,7 @@ void SourceBrowser::requestPreview(const SourceImage& image) {
                         if (decoder.open(tmp.fileName())) {
                             const Mosaic::VideoDecoder::Frame frame = decoder.nextFrame();
                             if (!frame.image.isNull()) {
-                                decoded = frame.image;
+                                decoded = capThumb(frame.image);
                             } else {
                                 qDebug() << "SourceBrowser::requestPreview: VideoDecoder returned "
                                             "no frame for"
