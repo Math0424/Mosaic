@@ -49,7 +49,7 @@ constexpr double kWeightNormalView = 0.05;
 constexpr double kWeightSkip = -0.03;
 constexpr double kWeightQuickSkip = -0.08;
 
-constexpr double kLongViewSeconds = 8.0;
+constexpr double kLongViewSeconds = FeedDatabase::kLongViewSeconds;
 constexpr double kQuickSkipSeconds = 1.5;
 
 // Taste model constants.

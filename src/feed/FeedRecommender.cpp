@@ -109,7 +109,7 @@ bool isExploratorySource(const QString& source) {
     return source == QLatin1String("exploration") || source == QLatin1String("tangent");
 }
 
-// Animated content is excluded from the feed entirely.
+// Animated content is excluded from the feed unless the setting allows it.
 bool isAnimated(const SourceImage& img) {
     static const QSet<QString> animatedFormats = {
         QStringLiteral("gif"), QStringLiteral("webm"), QStringLiteral("mp4"),
@@ -128,8 +128,10 @@ bool isAnimated(const SourceImage& img) {
 }
 
 // Appended to every candidate query. Plain "score:>2" - some sources
-// mishandle ">=" inside compound queries.
-const QString kMinScoreFilter = QStringLiteral("score:>2 -animated");
+// mishandle ">=" inside compound queries. "-animated" is added on top while
+// animated posts are excluded.
+const QString kMinScoreFilter = QStringLiteral("score:>2");
+const QString kNoAnimatedFilter = QStringLiteral(" -animated");
 
 // Tags with no taste information (quality, format, site mechanics).
 const QSet<QString>& genericTagSet() {
@@ -323,13 +325,16 @@ QList<SourceImage> FeedRecommender::fetchFromSource(const QString& sourceId, con
         }
         r34Query = r34Query.simplified();
 
-        QString fullTags = r34Query.isEmpty() ? QStringLiteral("-animated")
-                                              : r34Query + QStringLiteral(" -animated");
+        QString fullTags = r34Query;
+        if (!m_allowAnimated.load())
+            fullTags += kNoAnimatedFilter;
         if (!negExclusions.isEmpty())
             fullTags += negExclusions;
         q.tags = fullTags.trimmed();
     } else {
         QString filter = kMinScoreFilter;
+        if (!m_allowAnimated.load())
+            filter += kNoAnimatedFilter;
         if (!negExclusions.isEmpty())
             filter += negExclusions;
 
@@ -1301,7 +1306,7 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
             ++dropShown;
             continue;
         }
-        if (isAnimated(img)) {
+        if (!m_allowAnimated.load() && isAnimated(img)) {
             ++dropAnimated;
             continue;
         }
@@ -1405,7 +1410,8 @@ QList<SourceImage> FeedRecommender::nextBatch(int count) {
         const QList<SourceImage> fresh =
             fetchFromSource(src, QStringLiteral("order:random"), count * 2);
         for (const SourceImage& img : fresh) {
-            if (img.md5.isEmpty() || isAnimated(img) || img.score < kMinPostScore)
+            if (img.md5.isEmpty() || (!m_allowAnimated.load() && isAnimated(img)) ||
+                img.score < kMinPostScore)
                 continue;
             batch.append(img);
             if (batch.size() >= count)

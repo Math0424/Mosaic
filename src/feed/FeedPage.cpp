@@ -10,6 +10,7 @@
 #include "../core/ThreadPools.h"
 #include "../components/FlowLayout.h"
 #include "../components/Icons.h"
+#include "../components/MediaPlaybackController.h"
 #include "../components/SourceBrowser.h"
 #include "../components/TagSidebar.h"
 #include "../components/ViewerWindow.h"
@@ -46,6 +47,7 @@ Q_DECLARE_LOGGING_CATEGORY(lcFeed)
 #include <QToolTip>
 #include <QThreadPool>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include "../media/VideoDecoder.h"
@@ -86,6 +88,38 @@ QImage decodeBytes(const SourceImage& img, const QByteArray& bytes) {
     return decoded;
 }
 
+QString formatClock(qint64 ms) {
+    const qint64 s = qMax<qint64>(0, ms) / 1000;
+    return QStringLiteral("%1:%2").arg(s / 60).arg(s % 60, 2, 10, QLatin1Char('0'));
+}
+
+// Formats that may hold more than one frame. Plain .png only counts when
+// the post is tagged animated (APNG), so ordinary PNGs skip the decoder.
+bool mayBeAnimated(const SourceImage& img, QString* extOut) {
+    QString ext = img.format.toLower();
+    if (ext.isEmpty()) {
+        const int dot = img.fileUrl.lastIndexOf(QLatin1Char('.'));
+        if (dot >= 0)
+            ext = img.fileUrl.mid(dot + 1).toLower();
+    }
+    if (extOut)
+        *extOut = ext;
+    static const QSet<QString> animated = {
+        QStringLiteral("gif"), QStringLiteral("webp"), QStringLiteral("webm"),
+        QStringLiteral("mp4"), QStringLiteral("mov"),  QStringLiteral("mkv"),
+        QStringLiteral("m4v"), QStringLiteral("avi"),  QStringLiteral("apng"),
+    };
+    if (animated.contains(ext))
+        return true;
+    if (ext == QLatin1String("png")) {
+        for (const SourceTag& t : img.tags) {
+            if (t.name == QLatin1String("animated"))
+                return true;
+        }
+    }
+    return false;
+}
+
 // Display name of the site a post came from. Posts carry the id of the
 // member source that supplied them, even inside a merged "All sources" tab.
 QString sourceLabel(SourceManager& sources, const SourceImage& image) {
@@ -115,7 +149,118 @@ FeedPage::FeedPage(SourceManager& sources, std::shared_ptr<FeedEngine> engine,
     });
 }
 
-FeedPage::~FeedPage() = default;
+FeedPage::~FeedPage() { stopAnimation(); }
+
+void FeedPage::stopAnimation() {
+    if (m_playback)
+        m_playback->stop();  // closes the decoder, releasing the file
+    if (!m_playbackFile.isEmpty())
+        QFile::remove(m_playbackFile);
+    m_playbackFile.clear();
+    m_playbackMd5.clear();
+    m_playedMs = 0;
+    m_playRunStartMs = 0;
+    if (m_videoBar)
+        m_videoBar->hide();
+}
+
+qint64 FeedPage::playedMs() const {
+    const qint64 run =
+        m_playRunStartMs > 0 ? QDateTime::currentMSecsSinceEpoch() - m_playRunStartMs : 0;
+    return m_playedMs + run;
+}
+
+void FeedPage::pausePlayback() {
+    if (!m_playback || !m_playback->isActive())
+        return;
+    m_playedMs = playedMs();
+    m_playRunStartMs = 0;
+    m_playback->pause();
+    updatePlayButton();
+}
+
+void FeedPage::resumePlayback() {
+    if (!m_playback || !m_playback->isActive())
+        return;
+    if (m_playRunStartMs == 0)
+        m_playRunStartMs = QDateTime::currentMSecsSinceEpoch();
+    m_playback->resume();
+    updatePlayButton();
+}
+
+void FeedPage::updatePlayButton() {
+    if (!m_playButton)
+        return;
+    const bool playing = m_playback && m_playback->isPlaying();
+    m_playButton->setIcon(
+        assetIcon(playing ? QStringLiteral("pause.svg") : QStringLiteral("play.svg")));
+}
+
+void FeedPage::startAnimation(const SourceImage& image, const QByteArray& bytes) {
+    QString ext;
+    if (bytes.isEmpty() || !mayBeAnimated(image, &ext) || ext.isEmpty())
+        return;
+    if (m_playbackMd5 == image.md5)
+        return;  // already playing this post
+
+    // Opening the decoder probes the file; do it off the GUI thread.
+    QPointer<FeedPage> self(this);
+    const QString md5 = image.md5;
+    QThreadPool::globalInstance()->start([self, md5, ext, bytes]() {
+        const QString path = QDir(Paths::tempDir())
+                                 .filePath(QStringLiteral("feed-anim-%1.%2").arg(md5, ext));
+        auto* decoder = new VideoDecoder();
+        bool ok = false;
+        {
+            QDir().mkpath(Paths::tempDir());
+            QFile file(path);
+            if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) {
+                file.close();
+                ok = decoder->open(path) && decoder->isAnimated();
+            }
+        }
+        auto discard = [decoder, path]() {
+            decoder->close();
+            delete decoder;
+            QFile::remove(path);
+        };
+        if (!ok || !self) {
+            discard();
+            return;
+        }
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, md5, path, decoder, discard]() {
+                const bool current = self && self->m_position >= 0 &&
+                                     self->m_position < self->m_queue.size() &&
+                                     self->m_queue.at(self->m_position).md5 == md5;
+                if (!current) {
+                    discard();  // user moved on
+                    return;
+                }
+                self->stopAnimation();
+                self->m_playbackFile = path;
+                self->m_playbackMd5 = md5;
+                self->m_playback->start(decoder);  // takes ownership
+                self->m_playback->setVolume(self->m_volume->value());
+                self->m_playRunStartMs = QDateTime::currentMSecsSinceEpoch();
+
+                const qint64 duration = self->m_playback->durationMs();
+                self->m_progressUpdating = true;
+                self->m_progress->setRange(0, static_cast<int>(qMax<qint64>(0, duration)));
+                self->m_progress->setValue(0);
+                self->m_progressUpdating = false;
+                self->m_progress->setEnabled(duration > 0);
+                self->m_timeLabel->setText(
+                    QStringLiteral("0:00 / %1").arg(formatClock(duration)));
+                self->m_videoBar->show();
+                self->updatePlayButton();
+                if (!self->isVisible())
+                    self->pausePlayback();
+            },
+            Qt::QueuedConnection);
+    });
+}
 
 void FeedPage::buildUi() {
     auto* root = new QHBoxLayout(this);
@@ -142,6 +287,99 @@ void FeedPage::buildUi() {
     m_mediaLabel->setMinimumSize(320, 320);
     m_mediaLabel->setScaledContents(false);
     stageLayout->addWidget(m_mediaLabel, 1);
+
+    // Animated posts: frames replace the still image on the stage, looping.
+    m_playback = new MediaPlaybackController(this);
+    connect(m_playback, &MediaPlaybackController::frameReady, this,
+            [this](const VideoDecoder::Frame& frame) {
+                VideoDecoder::Frame shown = frame;
+                if (shown.image.isNull())
+                    shown = m_playback->seekTo(0);  // end reached: loop
+                if (shown.image.isNull())
+                    return;
+                m_mediaLabel->setPixmap(QPixmap::fromImage(shown.image.scaled(
+                    m_mediaLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+                if (!m_progress->isSliderDown() && shown.ptsMs >= 0) {
+                    m_progressUpdating = true;
+                    m_progress->setValue(static_cast<int>(shown.ptsMs));
+                    m_progressUpdating = false;
+                    m_timeLabel->setText(QStringLiteral("%1 / %2").arg(
+                        formatClock(shown.ptsMs), formatClock(m_playback->durationMs())));
+                }
+            });
+
+    // Animated-post controls: play/pause, seekable progress, volume.
+    m_videoBar = new QWidget(m_stage);
+    auto* videoLayout = new QHBoxLayout(m_videoBar);
+    videoLayout->setContentsMargins(0, 4, 0, 0);
+    videoLayout->setSpacing(8);
+    m_playButton = new QToolButton(m_videoBar);
+    m_playButton->setIcon(assetIcon(QStringLiteral("pause.svg")));
+    m_playButton->setToolTip(QStringLiteral("Play / pause"));
+    connect(m_playButton, &QToolButton::clicked, this, [this]() {
+        if (m_playback && m_playback->isPlaying())
+            pausePlayback();
+        else
+            resumePlayback();
+    });
+    m_progress = new QSlider(Qt::Horizontal, m_videoBar);
+    m_progress->setToolTip(QStringLiteral("Seek"));
+    auto seekToSlider = [this]() {
+        if (!m_playback || !m_playback->isActive())
+            return;
+        const VideoDecoder::Frame frame = m_playback->seekTo(m_progress->sliderPosition());
+        if (!frame.image.isNull()) {
+            m_mediaLabel->setPixmap(QPixmap::fromImage(frame.image.scaled(
+                m_mediaLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+        }
+    };
+    // Seek once on release (cheap for long videos); clicks on the groove seek too.
+    connect(m_progress, &QSlider::sliderReleased, this, seekToSlider);
+    connect(m_progress, &QSlider::valueChanged, this, [this, seekToSlider](int) {
+        if (!m_progressUpdating && !m_progress->isSliderDown())
+            seekToSlider();
+    });
+    connect(m_progress, &QSlider::sliderMoved, this, [this](int value) {
+        m_timeLabel->setText(QStringLiteral("%1 / %2").arg(
+            formatClock(value), formatClock(m_playback ? m_playback->durationMs() : 0)));
+    });
+    m_timeLabel = new QLabel(QStringLiteral("0:00 / 0:00"), m_videoBar);
+    m_timeLabel->setProperty("role", QStringLiteral("hint"));
+    auto* volumeIcon = new QLabel(m_videoBar);
+    volumeIcon->setPixmap(assetIcon(QStringLiteral("volume.svg")).pixmap(16, 16));
+    m_volume = new QSlider(Qt::Horizontal, m_videoBar);
+    m_volume->setRange(0, 100);
+    m_volume->setFixedWidth(100);
+    m_volume->setToolTip(QStringLiteral("Volume"));
+    {
+        AppState saved;
+        m_volume->setValue(saved.load() ? saved.feedVolume() : 0);
+    }
+    connect(m_volume, &QSlider::valueChanged, this, [this](int value) {
+        if (m_playback)
+            m_playback->setVolume(value);
+    });
+    // Persist once the user lets go, not on every step of a drag.
+    auto saveVolume = [this]() {
+        AppState saved;
+        if (saved.load()) {
+            saved.setFeedVolume(m_volume->value());
+            saved.save();
+        }
+    };
+    connect(m_volume, &QSlider::sliderReleased, this, saveVolume);
+    connect(m_volume, &QSlider::actionTriggered, this, [saveVolume](int action) {
+        if (action != QAbstractSlider::SliderMove)
+            QTimer::singleShot(0, saveVolume);  // clicks / wheel / keys
+    });
+    videoLayout->addWidget(m_playButton);
+    videoLayout->addWidget(m_progress, 1);
+    videoLayout->addWidget(m_timeLabel);
+    videoLayout->addSpacing(8);
+    videoLayout->addWidget(volumeIcon);
+    videoLayout->addWidget(m_volume);
+    m_videoBar->hide();
+    stageLayout->addWidget(m_videoBar);
 
     m_infoLabel = new QLabel(m_stage);
     m_infoLabel->setWordWrap(true);
@@ -647,6 +885,7 @@ void FeedPage::showPost(const SourceImage& image) {
     // Dwell timing starts when the media is visible, not when the slot opens.
     m_shownAt = 0;
     m_mediaLoaded = false;
+    stopAnimation();
 
     // Impression: marks the post as seen; carries no taste signal.
     if (!image.md5.isEmpty() && !m_interactedMd5s.contains(image.md5)) {
@@ -778,6 +1017,7 @@ void FeedPage::showPost(const SourceImage& image) {
             if (m_queue.at(m_position).md5 != img.md5)
                 return;  // user moved on
             decodeOffThread(img, bytes, /*allowSkipOnFailure=*/true, this);
+            startAnimation(img, bytes);
         });
 
     if (instant) {
@@ -828,6 +1068,7 @@ void FeedPage::applyDecodedMedia(const SourceImage& img, const QImage& decoded) 
 void FeedPage::hideEvent(QHideEvent* event) {
     // Tab switch voids this post's dwell time.
     m_shownAt = 0;
+    pausePlayback();
     QWidget::hideEvent(event);
 }
 
@@ -836,6 +1077,8 @@ void FeedPage::showEvent(QShowEvent* event) {
     // counting now; otherwise applyDecodedMedia() starts it on render.
     if (m_mediaLoaded)
         m_shownAt = QDateTime::currentMSecsSinceEpoch();
+    if (m_playback && m_playback->isActive() && !m_playback->isPlaying())
+        resumePlayback();
     QWidget::showEvent(event);
 }
 
@@ -892,11 +1135,16 @@ void FeedPage::advance(bool train) {
         m_dwelledMd5s.insert(m_queue.at(m_position).md5);
         const qint64 dwell = now - m_shownAt;
         const SourceImage img = m_queue.at(m_position);
+        // Animated posts that started playing are judged on play time vs
+        // length; ones that never got past the still frame count as images.
+        const bool played = m_playback && m_playback->isActive() && m_playbackMd5 == img.md5;
+        const qint64 duration = played ? m_playback->durationMs() : 0;
+        const qint64 playTime = played ? playedMs() : 0;
 
         // Training writes happen off the GUI thread.
         FeedEngine* engine = m_engine.get();
-        QThreadPool::globalInstance()->start([engine, img, dwell]() {
-            engine->recordDwell(img, dwell);
+        QThreadPool::globalInstance()->start([engine, img, dwell, duration, playTime]() {
+            engine->recordDwell(img, dwell, duration, playTime);
         });
     }
 

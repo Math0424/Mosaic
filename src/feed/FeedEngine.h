@@ -61,8 +61,12 @@ class FeedEngine {
 
     // A post that just left the screen after `dwellMs` of visible media:
     // records a skip or a view against the user's adaptive thresholds.
+    // Animated posts that played pass their length and how long they
+    // played; they need a share of the length watched (with the image
+    // thresholds as minimums for short loops).
     // Blocking (DB write lock) - worker threads only.
-    void recordDwell(const SourceImage& image, qint64 dwellMs);
+    void recordDwell(const SourceImage& image, qint64 dwellMs, qint64 mediaDurationMs = 0,
+                     qint64 playedMs = 0);
 
     // Explicit reaction (like / favorite / dislike) with its linger time.
     // Blocking - worker threads only.

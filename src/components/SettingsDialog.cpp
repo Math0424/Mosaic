@@ -128,6 +128,14 @@ void SettingsDialog::buildUi() {
         QStringLiteral("When off, the For You feed is only available via Tools > For You feed"));
     feedLayout->addWidget(m_feedTab);
 
+    m_feedAnimated = new QCheckBox(
+        QStringLiteral("Include animated posts (GIF, video, animated WebP)"), feedBox);
+    m_feedAnimated->setChecked(m_state.feedAllowAnimated());
+    m_feedAnimated->setToolTip(
+        QStringLiteral("Animated posts play muted and loop in the feed. They are downloaded "
+                       "in full, so they use more data than images."));
+    feedLayout->addWidget(m_feedAnimated);
+
     // --- Feed candidate sources ---
     auto* srcBox = new QGroupBox(QStringLiteral("For You feed sources"), feedBox);
     auto* srcLayout = new QVBoxLayout(srcBox);
@@ -172,6 +180,7 @@ void SettingsDialog::buildUi() {
         m_state.setThumbMaxSize(qMax(100, m_maxSize->value()));
         m_state.setThumbSpacing(m_spacing->value());
         m_state.setFeedTabEnabled(m_feedTab->isChecked());
+        m_state.setFeedAllowAnimated(m_feedAnimated->isChecked());
         QStringList feedIds;
         for (auto it = m_feedSourceChecks.begin(); it != m_feedSourceChecks.end(); ++it) {
             if (it.value()->isChecked())

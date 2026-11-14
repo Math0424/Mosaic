@@ -142,6 +142,8 @@ bool AppState::load() {
     m_thumbSpacing = qBound(0, grid.value(QStringLiteral("thumbSpacing")).toInt(1), 24);
 
     m_feedTabEnabled = root.value(QStringLiteral("feedTab")).toBool(true);
+    m_feedAllowAnimated = root.value(QStringLiteral("feedAnimated")).toBool(false);
+    m_feedVolume = qBound(0, root.value(QStringLiteral("feedVolume")).toInt(0), 100);
 
     // Hidden knob, edited by hand in state.json.
     if (root.contains(QStringLiteral("feedSources"))) {
@@ -281,6 +283,8 @@ bool AppState::save() const {
     root[QStringLiteral("favorites")] = favorites;
     root[QStringLiteral("grid")] = grid;
     root[QStringLiteral("feedTab")] = m_feedTabEnabled;
+    root[QStringLiteral("feedAnimated")] = m_feedAllowAnimated;
+    root[QStringLiteral("feedVolume")] = m_feedVolume;
     QJsonArray feedSources;
     for (const QString& id : m_feedSourceIds) feedSources.append(id);
     root[QStringLiteral("feedSources")] = feedSources;

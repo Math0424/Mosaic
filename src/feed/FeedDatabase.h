@@ -28,6 +28,9 @@ namespace Mosaic {
 // never touches long-term tastes.
 class FeedDatabase {
    public:
+    // A view at least this long counts as a long (stronger) view.
+    static constexpr double kLongViewSeconds = 8.0;
+
     FeedDatabase() = default;
     ~FeedDatabase();
 

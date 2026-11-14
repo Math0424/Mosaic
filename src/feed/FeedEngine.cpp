@@ -26,6 +26,13 @@ constexpr qint64 kSkipCeilingMs = 4000;
 // watch time - that's what lets the threshold rise with their pace.
 constexpr double kSkipShareOfWatchMs = 0.35;
 
+// Animated posts: share of the length that must play for a view, and for
+// a full watch (long view). Short loops also need the image minimums.
+constexpr double kAnimatedViewShare = 0.5;
+constexpr double kAnimatedFullShare = 0.9;
+// Walking away is judged in loops for animated posts (min kAbandonMs).
+constexpr int kAnimatedAbandonLoops = 3;
+
 }  // namespace
 
 FeedEngine::FeedEngine(SourceManager& sources, const QStringList& feedSourceIds)
@@ -81,8 +88,12 @@ QStringList FeedEngine::tagNames(const SourceImage& image) {
     return tags;
 }
 
-void FeedEngine::recordDwell(const SourceImage& image, qint64 dwellMs) {
-    if (dwellMs <= 0 || dwellMs >= kAbandonMs)
+void FeedEngine::recordDwell(const SourceImage& image, qint64 dwellMs, qint64 mediaDurationMs,
+                             qint64 playedMs) {
+    const bool animated = mediaDurationMs > 0;
+    const qint64 abandonMs =
+        animated ? qMax(kAbandonMs, mediaDurationMs * kAnimatedAbandonLoops) : kAbandonMs;
+    if (dwellMs <= 0 || dwellMs >= abandonMs)
         return;
     // Adaptive thresholds from this user's linger history.
     const QHash<QString, qint64> lingers = m_db->averageLingers();
@@ -93,6 +104,33 @@ void FeedEngine::recordDwell(const SourceImage& image, qint64 dwellMs) {
 
     const QStringList tags = tagNames(image);
     const double dwellSecs = dwellMs / 1000.0;
+
+    if (animated) {
+        // Judged on time actually played. A view needs half the length and
+        // at least the image skip cutoff (short loops are like images); a
+        // full watch needs 90% and at least the image long-view time.
+        // Not added to the linger averages: those calibrate image pacing.
+        const qint64 longViewMs =
+            static_cast<qint64>(FeedDatabase::kLongViewSeconds * 1000.0);
+        const qint64 viewMs =
+            qMax(skipMs, static_cast<qint64>(kAnimatedViewShare * mediaDurationMs));
+        const qint64 fullMs =
+            qMax(longViewMs, static_cast<qint64>(kAnimatedFullShare * mediaDurationMs));
+        const double playedSecs = playedMs / 1000.0;
+        if (playedMs < viewMs) {
+            m_db->recordEvent(FeedDatabase::Event::Skip, image.sourceId, image.md5, tags,
+                              playedSecs);
+            return;
+        }
+        // The database weighs a view by its length: report a full watch as
+        // at least a long view, a partial one as just under it.
+        const double watchSecs =
+            playedMs >= fullMs ? qMax(playedSecs, FeedDatabase::kLongViewSeconds)
+                               : qMin(playedSecs, FeedDatabase::kLongViewSeconds - 0.01);
+        m_db->recordEvent(FeedDatabase::Event::View, image.sourceId, image.md5, tags, watchSecs);
+        return;
+    }
+
     if (dwellMs < skipMs) {
         // A skip is a weak negative, not a dislike.
         m_db->recordEvent(FeedDatabase::Event::Skip, image.sourceId, image.md5, tags, dwellSecs);

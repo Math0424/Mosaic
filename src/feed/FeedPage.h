@@ -21,6 +21,7 @@ class QPushButton;
 class QSlider;
 class QStackedWidget;
 class QTextBrowser;
+class QToolButton;
 
 namespace Mosaic {
 
@@ -32,6 +33,7 @@ class AppState;
 class SourceManager;
 class TagSidebar;
 class MultiSource;
+class MediaPlaybackController;
 
 // TikTok-style vertical feed of recommended posts. One post fills the
 // viewport; wheel/Space/Next advance. Interactions (watch, like, save,
@@ -139,6 +141,29 @@ class FeedPage : public QWidget {
     // the full file downloads in parallel.
     MediaCache* m_media = nullptr;
     int m_mediaIndex = -1;  // queue index whose media is on screen
+
+    // Animated posts play (muted, looping) on the stage once their full
+    // file has arrived; the still frame shows until then.
+    MediaPlaybackController* m_playback = nullptr;
+    QString m_playbackFile;  // temp copy the decoder reads from
+    QString m_playbackMd5;
+    // Play time counts toward "viewed" only while actually playing.
+    qint64 m_playedMs = 0;         // accumulated before the current run
+    qint64 m_playRunStartMs = 0;   // wall time the current run began, 0 = paused
+    qint64 playedMs() const;
+    void pausePlayback();
+    void resumePlayback();
+
+    // Controls under the stage, shown only for animated posts.
+    QWidget* m_videoBar = nullptr;
+    QToolButton* m_playButton = nullptr;
+    QSlider* m_progress = nullptr;
+    QLabel* m_timeLabel = nullptr;
+    QSlider* m_volume = nullptr;
+    bool m_progressUpdating = false;  // programmatic progress updates
+    void updatePlayButton();
+    void startAnimation(const SourceImage& image, const QByteArray& bytes);
+    void stopAnimation();
 
     // Debug panel: tier-2 (heavy DB) stats cached between async loads.
     QString m_heavyStatsHtml;  // last rendered "Totals & profile" HTML

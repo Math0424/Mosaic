@@ -35,6 +35,7 @@ class SettingsDialog : public QDialog {
     QSpinBox* m_maxSize = nullptr;
     QSpinBox* m_spacing = nullptr;
     QCheckBox* m_feedTab = nullptr;
+    QCheckBox* m_feedAnimated = nullptr;
     QHash<QString, QCheckBox*> m_feedSourceChecks;
     QHash<QString, QPair<QLineEdit*, QLineEdit*>> m_credFields;
 };

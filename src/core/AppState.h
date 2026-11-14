@@ -88,6 +88,14 @@ class AppState {
     bool feedTabEnabled() const { return m_feedTabEnabled; }
     void setFeedTabEnabled(bool v) { m_feedTabEnabled = v; }
 
+    // Animated posts (GIF, video, animated WebP) in the For You feed.
+    bool feedAllowAnimated() const { return m_feedAllowAnimated; }
+    void setFeedAllowAnimated(bool v) { m_feedAllowAnimated = v; }
+
+    // Volume (0-100) for animated posts in the feed; starts muted.
+    int feedVolume() const { return m_feedVolume; }
+    void setFeedVolume(int v) { m_feedVolume = qBound(0, v, 100); }
+
     // Feed candidate source ids (hidden knob, edit state.json by hand).
     QStringList feedSourceIds() const { return m_feedSourceIds; }
     void setFeedSourceIds(const QStringList& ids) { m_feedSourceIds = ids; }
@@ -144,6 +152,8 @@ class AppState {
     int m_thumbMaxSize = 220;
     int m_thumbSpacing = 1;
     bool m_feedTabEnabled = true;
+    bool m_feedAllowAnimated = false;
+    int m_feedVolume = 0;
     QStringList m_feedSourceIds = {QStringLiteral("e621"), QStringLiteral("r34")};
     QSet<QString> m_blacklistTags;
     bool m_webServerEnabled = false;

@@ -236,12 +236,17 @@ void MainWindow::buildUi() {
     toolsMenu->addAction(QStringLiteral("Web server…"), this, &MainWindow::showWebServerDialog);
     toolsMenu->addSeparator();
     toolsMenu->addAction(QStringLiteral("Settings…"), this, [this]() {
+        // Pick up values other windows saved since startup (feed volume,
+        // viewer geometry) so saving the dialog doesn't overwrite them.
+        m_state.load();
         const QString oldLibrary = m_state.libraryPath();
         SettingsDialog dialog(m_state, m_sources, this);
         if (dialog.exec() == QDialog::Accepted) {
             applyGridSettings();
             applyBlacklist();
             applyFeedTabSetting();
+            if (m_feedEngine)
+                m_feedEngine->recommender().setAllowAnimated(m_state.feedAllowAnimated());
             m_sources.applyGelbooruCredentials(m_state.siteCredentials());
             if (m_state.libraryPath() != oldLibrary)
                 applyLibraryPath(m_state.libraryPath());
@@ -364,6 +369,7 @@ void MainWindow::showFeedPage() {
 std::shared_ptr<FeedEngine> MainWindow::feedEngine() {
     if (!m_feedEngine)
         m_feedEngine = std::make_shared<FeedEngine>(m_sources, m_state.feedSourceIds());
+        m_feedEngine->recommender().setAllowAnimated(m_state.feedAllowAnimated());
     return m_feedEngine;
 }
 

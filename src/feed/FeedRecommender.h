@@ -5,6 +5,8 @@
 #include "../sources/Source.h"
 
 #include <QHash>
+
+#include <atomic>
 #include <QList>
 #include <QSet>
 #include <QStringList>
@@ -37,6 +39,11 @@ class FeedRecommender {
                              VisualFeatures* visual = nullptr);
 
     QList<SourceImage> nextBatch(int count = 10);
+
+    // Animated posts (GIF, video, animated WebP) are excluded unless allowed.
+    // Thread-safe: settings change on the GUI thread while batches build.
+    void setAllowAnimated(bool allow) { m_allowAnimated.store(allow); }
+    bool allowAnimated() const { return m_allowAnimated.load(); }
 
     // True for tags too generic to carry taste information.
     static bool isGenericTag(const QString& tag);
@@ -152,6 +159,7 @@ class FeedRecommender {
     QList<Explanation> explainPosts(const QList<SourceImage>& images) const;
 
    private:
+    std::atomic<bool> m_allowAnimated{false};
     struct Candidate {
         SourceImage image;
         QString source;
