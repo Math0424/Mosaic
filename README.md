@@ -1,12 +1,10 @@
 # Mosaic
 <img src="assets/icon.png" width="100">
 
-Browse and download from boards like alongside your own
-local library. Search by tag, get a feed tuned to your taste, and keep
-everything organized — including near-duplicate cleanup.
-
-Inspired by [imgbrd-grabber](https://github.com/Bionus/imgbrd-grabber), but
-simpler and built around a local, searchable library.
+A desktop app for browsing and downloading from image boards, and for
+managing the library you end up with. It's inspired by
+[imgbrd-grabber](https://github.com/Bionus/imgbrd-grabber), but simpler,
+and it keeps a local library you can search.
 
 ![Homepage](docs/images/Homepage.png)
 
@@ -14,29 +12,24 @@ simpler and built around a local, searchable library.
 
 ## Features
 
-- **Tabbed browser** — one tab per source, or an "All sources" tab that
-  searches several sites at once. Tag search with autocomplete and
-  infinite-scroll thumbnails.
-- **Standalone viewer** — flip between posts with ← / →, walk the
-  parent/child chain with ↑ / ↓, scrub video frame-by-frame, save with a
-  keystroke.
+- **Tabs**: one tab per source, or an "All sources" tab that searches
+  several at once. Tag search has autocomplete, and thumbnails load as you
+  scroll.
+- **Viewer**: ← / → moves between posts, ↑ / ↓ follows parent/child posts,
+  and videos can be stepped frame by frame.
 
   ![Viewer](docs/images/WindowViewer.png)
 
-- **"For You" feed** — a vertical feed of recommended posts that learns from
-  every like, save, and skip, with an **Explore** slider for how often it
-  tries new tangents.
-- **Local catalog** — tags, favorites, and metadata for your own library.
-- **Duplicate detection** — find near-identical images and resolve them in
-  one click.
-- **Tag tools** — merge similar tags, resolve conflicts, filter from a
-  sidebar.
-- **Phone / browser access** — *Tools → Web server* serves a mobile web app
-  on your network: a swipe-up "For You" feed (double-tap to like, save to
-  the library) that trains the same recommender, plus library tag search
-  with autocomplete and a swipeable viewer. Mosaic must stay open.
-- **Fast** — GPU-accelerated rendering, background prefetching, and full
-  video/animated post playback.
+- **For You feed**: a vertical feed that learns from what you like, save and
+  skip. The Explore slider controls how often it shows you something new.
+- **Local library**: tags, favorites and metadata for what you've saved.
+- **Duplicates**: finds near-identical images so you can pick which to keep.
+- **Tag tools**: merge similar tags, fix conflicts, filter from a sidebar.
+- **Web server**: *Tools → Web server* serves a mobile page on your network
+  with the For You feed (double-tap to like) and library search. It trains
+  the same recommender. Mosaic has to stay open.
+- Images, video and animated posts all play back, with rendering on the GPU
+  and prefetching in the background.
 
   ![Favorites](docs/images/Favorites.png)
 
@@ -93,15 +86,15 @@ single-instance guard (`InstanceGuard`) is a no-op on other platforms.
 | `Ctrl+S` | Save to library and advance |
 | `F12` | Toggle debug info |
 
-The **Explore** slider next to the action buttons sets how adventurous the
-feed is: further left sticks to what you already like, further right spends
-more of each batch on tangents (new tags and looks the feed is unsure about).
+The **Explore** slider next to the action buttons sets how much the feed
+branches out. Left sticks to what you already like. Right fills more of each
+batch with posts it's unsure about, like new tags or styles.
 
-The debug sidebar (`F12`) shows the learned model's progress (how much of the
-ranking it controls, its accuracy against the heuristic, learned likes and
-dislikes, upcoming tangents) and has **Dropped images** (why the funnel rejected posts)
-and **Liked posts**, which opens every liked/saved post in the viewer. Liked
-posts are paged in as you walk toward the end of the loaded list, so a profile
-with thousands of likes never loads all at once.
+The debug sidebar (`F12`) shows how the learned model is doing: how much of
+the ranking it controls, its accuracy compared to the heuristic, what it has
+learned from your likes and dislikes, and the tangents coming up. It also has
+**Dropped images**, which lists why posts were rejected, and **Liked posts**,
+which opens everything you've liked or saved in the viewer. Liked posts load
+in pages as you scroll, so a large history doesn't all load at once.
 
 ---
