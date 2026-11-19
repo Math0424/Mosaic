@@ -7,12 +7,16 @@
 
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QImageReader>
 #include <QHash>
+#include <QMutex>
 #include <QSaveFile>
 #include <QSet>
+
+#include <algorithm>
 
 #include <QDebug>
 #include <QCryptographicHash>
@@ -140,7 +144,173 @@ void attachTags(DbConnection& conn, QList<SourceImage>& images, const QStringLis
     duckdb_destroy_result(&res);
 }
 
+// feed ranking ("feed:NN")
+
+QMutex& feedRankerMutex() {
+    static QMutex mutex;
+    return mutex;
+}
+
+LibraryCatalog::FeedRanker& feedRankerSlot() {
+    static LibraryCatalog::FeedRanker ranker;
+    return ranker;
+}
+
+LibraryCatalog::FeedRanker currentFeedRanker() {
+    QMutexLocker lock(&feedRankerMutex());
+    return feedRankerSlot();
+}
+
+// Ranked md5s per query string, so pages 2+ slice the order page 1 drew
+// (exploration is random: re-ranking per page would repeat / skip posts).
+// Page 1 always re-ranks. Small: one entry per recent "feed:" query.
+struct FeedRankCache {
+    QMutex mutex;
+    QHash<QString, QStringList> byQuery;
+};
+
+FeedRankCache& feedRankCache() {
+    static FeedRankCache cache;
+    return cache;
+}
+
+constexpr int kFeedRankCacheEntries = 8;
+
+/**
+ * Scores every image matching `where` (a "WHERE ..." clause over images i,
+ * possibly empty) with the installed ranker. False when no ranker is
+ * installed or the catalog query fails.
+ */
+bool rankLibraryMatches(DbConnection& conn, const QString& queryKey, const QString& where,
+                        int level, bool refresh, const SearchProgress& progress,
+                        QStringList* out, QString* error) {
+    if (!refresh) {
+        FeedRankCache& cache = feedRankCache();
+        QMutexLocker lock(&cache.mutex);
+        auto it = cache.byQuery.constFind(queryKey);
+        if (it != cache.byQuery.constEnd()) {
+            *out = it.value();
+            return true;
+        }
+    }
+
+    const LibraryCatalog::FeedRanker ranker = currentFeedRanker();
+    if (!ranker)
+        return false;
+
+    // Lightweight rows: the recommender needs tags (and age / format), not
+    // the full column set. Tags come from one join over the same filter
+    // rather than a giant md5 IN list.
+    auto report = [&progress](const QString& stage, qint64 done, qint64 total) {
+        if (progress)
+            progress(stage, done, total);
+    };
+
+    QElapsedTimer timer;
+    timer.start();
+    qint64 readMs = 0, tagsMs = 0;
+
+    QList<SourceImage> posts;
+    QHash<QString, int> indexByMd5;
+    report(QStringLiteral("Reading library"), 0, -1);
+    {
+        duckdb_result res{};
+        if (!conn.query(QStringLiteral("SELECT i.md5, i.format, epoch(i.created_at) "
+                                       "FROM images i %1")
+                            .arg(where),
+                        &res, error))
+            return false;
+        const idx_t rows = duckdb_row_count(&res);
+        posts.reserve(static_cast<int>(rows));
+        for (idx_t row = 0; row < rows; ++row) {
+            SourceImage img;
+            char* value = duckdb_value_varchar(&res, 0, row);
+            img.md5 = value ? QString::fromUtf8(value) : QString();
+            if (value)
+                duckdb_free(value);
+            value = duckdb_value_varchar(&res, 1, row);
+            img.format = value ? QString::fromUtf8(value) : QString();
+            if (value)
+                duckdb_free(value);
+            img.createdAt = duckdb_value_int64(&res, 2, row);
+            if (img.md5.isEmpty() || indexByMd5.contains(img.md5))
+                continue;
+            indexByMd5.insert(img.md5, posts.size());
+            posts.append(img);
+        }
+        duckdb_destroy_result(&res);
+    }
+    readMs = timer.restart();
+    if (!posts.isEmpty()) {
+        report(QStringLiteral("Loading tags"), 0, -1);
+        duckdb_result res{};
+        if (conn.query(QStringLiteral("SELECT i.md5, t.name, t.category FROM images i "
+                                      "JOIN image_tags it ON it.image_id = i.id "
+                                      "JOIN tags t ON t.id = it.tag_id %1")
+                           .arg(where),
+                       &res, error)) {
+            const idx_t rows = duckdb_row_count(&res);
+            for (idx_t row = 0; row < rows; ++row) {
+                char* value = duckdb_value_varchar(&res, 0, row);
+                const QString md5 = value ? QString::fromUtf8(value) : QString();
+                if (value)
+                    duckdb_free(value);
+                const int index = indexByMd5.value(md5, -1);
+                if (index < 0)
+                    continue;
+                value = duckdb_value_varchar(&res, 1, row);
+                const QString name = value ? QString::fromUtf8(value) : QString();
+                if (value)
+                    duckdb_free(value);
+                value = duckdb_value_varchar(&res, 2, row);
+                const QString category = value ? QString::fromUtf8(value) : QString();
+                if (value)
+                    duckdb_free(value);
+                posts[index].tags.append(SourceTag{name, category});
+            }
+            duckdb_destroy_result(&res);
+        }
+    }
+
+    tagsMs = timer.restart();
+    QStringList ranked = ranker(posts, 1.0 - level / 100.0, progress);
+    qInfo().noquote() << QStringLiteral("feed:%1 library search | %2 posts | read %3ms, tags %4ms, "
+                                        "ranker %5ms")
+                             .arg(level)
+                             .arg(posts.size())
+                             .arg(readMs)
+                             .arg(tagsMs)
+                             .arg(timer.elapsed());
+    // The ranker may drop posts it cannot score; keep them, at the end.
+    if (ranked.size() < posts.size()) {
+        const QSet<QString> seen(ranked.cbegin(), ranked.cend());
+        for (const SourceImage& img : posts)
+            if (!seen.contains(img.md5))
+                ranked << img.md5;
+    }
+
+    {
+        FeedRankCache& cache = feedRankCache();
+        QMutexLocker lock(&cache.mutex);
+        if (!cache.byQuery.contains(queryKey) && cache.byQuery.size() >= kFeedRankCacheEntries)
+            cache.byQuery.clear();
+        cache.byQuery.insert(queryKey, ranked);
+    }
+    *out = ranked;
+    return true;
+}
+
 }  // namespace
+
+void LibraryCatalog::setFeedRanker(FeedRanker ranker) {
+    {
+        QMutexLocker lock(&feedRankerMutex());
+        feedRankerSlot() = std::move(ranker);
+    }
+    FeedRankCache& cache = feedRankCache();
+    QMutexLocker lock(&cache.mutex);
+    cache.byQuery.clear();
+}
 
 // queries
 
@@ -203,12 +373,42 @@ SourceResult LibraryCatalog::search(const SourceQuery& query) {
                               .arg(excludePredicates.join(QStringLiteral(" OR ")));
         }
     }
-    if (!conditions.isEmpty())
-        sql += QStringLiteral("WHERE %1 ").arg(conditions.join(QStringLiteral(" AND ")));
+    const QString where =
+        conditions.isEmpty()
+            ? QString()
+            : QStringLiteral("WHERE %1 ").arg(conditions.join(QStringLiteral(" AND ")));
 
     const int limit = qBound(1, query.limit, 500);
     const int offset = (qMax(1, query.page) - 1) * limit;
-    sql += orderByClause(orderTerm) + QStringLiteral(" LIMIT %1 OFFSET %2").arg(limit).arg(offset);
+
+    // "feed:NN": the recommender orders every match; this page is a slice
+    // of that order. Without a ranker it falls through to the default order.
+    QStringList feedOrder;
+    bool feedRanked = false;
+    if (const int level = feedOrderLevel(orderTerm); level >= 0) {
+        QString rankError;
+        feedRanked = rankLibraryMatches(conn, query.tags.simplified().toLower(), where, level,
+                                        query.page <= 1, query.progress, &feedOrder,
+                                        &rankError);
+        if (feedRanked && query.progress)
+            query.progress(QStringLiteral("Loading page"), 0, -1);
+        if (!feedRanked && !rankError.isEmpty()) {
+            result.error = rankError;
+            return result;
+        }
+    }
+
+    if (feedRanked) {
+        const QStringList slice = feedOrder.mid(offset, limit);
+        if (slice.isEmpty()) {
+            result.ok = true;
+            return result;
+        }
+        sql += QStringLiteral("WHERE i.md5 IN (%1) ").arg(inList(slice));
+    } else {
+        sql += where + orderByClause(orderTerm) +
+               QStringLiteral(" LIMIT %1 OFFSET %2").arg(limit).arg(offset);
+    }
 
     duckdb_result res{};
     QString queryError;
@@ -228,6 +428,17 @@ SourceResult LibraryCatalog::search(const SourceQuery& query) {
         md5s << quoted(img.md5);
     }
     duckdb_destroy_result(&res);
+
+    if (feedRanked) {
+        // IN (...) returns rows in table order; restore the ranking.
+        QHash<QString, int> rank;
+        for (int i = 0; i < feedOrder.size() && i < offset + limit; ++i)
+            rank.insert(feedOrder.at(i), i);
+        std::stable_sort(result.images.begin(), result.images.end(),
+                         [&rank](const SourceImage& a, const SourceImage& b) {
+                             return rank.value(a.md5) < rank.value(b.md5);
+                         });
+    }
 
     // Repair rows imported without dimensions (legacy imports, sources
     // that did not report a size): read the real size from the stored

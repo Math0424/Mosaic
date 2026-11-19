@@ -24,6 +24,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QStringListModel>
+#include <QLocale>
 #include <QPointer>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -322,6 +323,7 @@ void SourceBrowser::buildUi() {
     m_searchBar = barWidget;
     root->addWidget(barWidget);
 
+
     connect(m_searchButton, &QPushButton::clicked, this, &SourceBrowser::onSearchClicked);
     connect(m_tagEdit, &QLineEdit::returnPressed, this, &SourceBrowser::onSearchClicked);
     connect(m_prevButton, &QPushButton::clicked, this, &SourceBrowser::onLoadPrevClicked);
@@ -425,8 +427,8 @@ void SourceBrowser::runSearch(int page, FetchMode mode) {
     m_searchButton->setEnabled(false);
     m_prevButton->setEnabled(false);
     m_loadMoreButton->setEnabled(false);
-    emit statusChanged(
-        QStringLiteral("Loading page %1 from %2…").arg(page).arg(m_source->displayName()));
+    showSearchProgress(
+        QStringLiteral("Loading page %1 from %2").arg(page).arg(m_source->displayName()), 0, -1);
 
     SourceQuery query;
     query.tags = m_tagEdit->text().trimmed();
@@ -435,6 +437,15 @@ void SourceBrowser::runSearch(int page, FetchMode mode) {
     query.limit = kPageSize;
 
     QPointer<SourceBrowser> self(this);
+    query.progress = [self](const QString& stage, qint64 done, qint64 total) {
+        QMetaObject::invokeMethod(
+            self.data(),
+            [self, stage, done, total]() {
+                if (self && self->m_searching)
+                    self->showSearchProgress(stage, done, total);
+            },
+            Qt::QueuedConnection);
+    };
     Source* source = m_source;
     const auto future = QtConcurrent::run(ThreadPools::network(), [self, source, query, page, mode]() {
         const SourceResult result = source->search(query);
@@ -452,8 +463,21 @@ void SourceBrowser::runSearch(int page, FetchMode mode) {
     Q_UNUSED(future);
 }
 
+void SourceBrowser::showSearchProgress(const QString& stage, qint64 done, qint64 total) {
+    if (total < 0) {
+        m_loadingText = stage + QStringLiteral("…");
+    } else {
+        const QLocale locale;
+        m_loadingText = QStringLiteral("%1… %2 / %3")
+                            .arg(stage, locale.toString(done), locale.toString(total));
+    }
+    emit statusChanged(m_loadingText);
+    updateEmptyLabel();
+}
+
 void SourceBrowser::appendResult(const SourceResult& result, FetchMode mode, int page) {
     m_searching = false;
+    m_loadingText.clear();
     m_searchButton->setEnabled(true);
 
     if (!result.ok) {
@@ -550,7 +574,15 @@ void SourceBrowser::appendResult(const SourceResult& result, FetchMode mode, int
 void SourceBrowser::updateEmptyLabel() {
     if (!m_emptyLabel)
         return;
-    m_emptyLabel->setVisible(!m_searching && m_images.isEmpty() && m_page > 0);
+    // While a search runs on an empty grid the label shows its progress;
+    // over existing results progress goes to the status bar only.
+    if (m_searching && m_images.isEmpty() && !m_loadingText.isEmpty()) {
+        m_emptyLabel->setText(m_loadingText);
+        m_emptyLabel->show();
+    } else {
+        m_emptyLabel->setText(QStringLiteral("No results"));
+        m_emptyLabel->setVisible(!m_searching && m_images.isEmpty() && m_page > 0);
+    }
     m_emptyLabel->raise();
 }
 

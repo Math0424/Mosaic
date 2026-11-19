@@ -169,6 +169,14 @@ void splitTagGroups(const QString& tags, QList<TagGroup>& groups, QStringList& e
             continue;
         }
 
+        // "feed:NN" ranks with the For You recommender; kept whole in
+        // orderTerm (see feedOrderLevel()).
+        if (token.startsWith(QLatin1String("feed:"), Qt::CaseInsensitive)) {
+            flushPending();
+            orderTerm = token.toLower();
+            continue;
+        }
+
         const QString term = normalizeAlternative(token);
         if (term.isEmpty())
             continue;
@@ -182,6 +190,17 @@ void splitTagGroups(const QString& tags, QList<TagGroup>& groups, QStringList& e
         }
     }
     flushPending();
+}
+
+int feedOrderLevel(const QString& order) {
+    if (!order.startsWith(QLatin1String("feed:")))
+        return -1;
+    const QString value = order.mid(5).trimmed();
+    if (value.isEmpty())
+        return 100;  // bare "feed:" = pure taste ranking
+    bool ok = false;
+    const int level = value.toInt(&ok);
+    return ok ? qBound(0, level, 100) : 100;
 }
 
 QString orderByClause(const QString& order) {

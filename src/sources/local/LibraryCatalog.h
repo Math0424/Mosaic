@@ -18,6 +18,16 @@ struct ImportResult {
 // flat md5-named library folder. Synchronous and thread-safe.
 class LibraryCatalog {
    public:
+    // Orders library posts for the "feed:NN" search modifier: returns the
+    // md5s best-first. `exploration` is in [0, 1] (0 = pure taste, 1 =
+    // pure exploration). Posts carry md5, tags, format and createdAt only.
+    // Called on search worker threads; `progress` may be empty.
+    using FeedRanker = std::function<QStringList(
+        const QList<SourceImage>& posts, double exploration, const SearchProgress& progress)>;
+    // Installed by the app once the feed recommender is available; an
+    // empty function removes it ("feed:" then falls back to newest first).
+    static void setFeedRanker(FeedRanker ranker);
+
     // queries
 
     SourceResult search(const SourceQuery& query);

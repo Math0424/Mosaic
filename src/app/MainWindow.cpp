@@ -8,11 +8,13 @@
 #include "../components/FavoritesPage.h"
 #include "../components/ImportPage.h"
 #include "../components/MultiSourceDialog.h"
+#include "../components/SearchHelpDialog.h"
 #include "../components/SettingsDialog.h"
 #include "../components/SourceBrowser.h"
 #include "../components/ViewerWindow.h"
 #include "../feed/FeedEngine.h"
 #include "../feed/FeedPage.h"
+#include "../feed/FeedRecommender.h"
 #include "../web/WebServer.h"
 #include "../web/WebServerDialog.h"
 #include "../core/Database.h"
@@ -90,6 +92,18 @@ MainWindow::MainWindow(Database& db, QWidget* parent) : QMainWindow(parent), m_d
     restoreState();
 
     m_webServer = new WebServer(m_sources, [this]() { return feedEngine(); }, this);
+
+    // "feed:NN" library searches rank with the For You recommender (desktop
+    // and web share the library source, so both get it).
+    LibraryCatalog::setFeedRanker([this](const QList<SourceImage>& posts, double exploration,
+                                         const SearchProgress& progress) {
+        if (Shutdown::requested())
+            return QStringList();
+        const std::shared_ptr<FeedEngine> engine = feedEngine();
+        if (!engine || !engine->isOpen())
+            return QStringList();
+        return engine->recommender().rankLibrary(posts, exploration, progress);
+    });
     if (m_state.webServerEnabled()) {
         QString error;
         if (!applyWebServer(&error))
@@ -106,7 +120,7 @@ MainWindow::MainWindow(Database& db, QWidget* parent) : QMainWindow(parent), m_d
     startLibraryScan();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() { LibraryCatalog::setFeedRanker({}); }
 
 void MainWindow::buildUi() {
     m_tabs = new QTabWidget(this);
@@ -253,6 +267,10 @@ void MainWindow::buildUi() {
             m_state.save();
         }
     });
+    toolsMenu->addAction(QStringLiteral("Search help…"), this, [this]() {
+        SearchHelpDialog dialog(this);
+        dialog.exec();
+    });
     toolsMenu->addSeparator();
     toolsMenu->addAction(QStringLiteral("Exit"), this, &QWidget::close);
 }
@@ -367,9 +385,12 @@ void MainWindow::showFeedPage() {
 }
 
 std::shared_ptr<FeedEngine> MainWindow::feedEngine() {
-    if (!m_feedEngine)
+    // Also reached from worker threads (web server, "feed:" library search).
+    QMutexLocker lock(&m_feedEngineMutex);
+    if (!m_feedEngine) {
         m_feedEngine = std::make_shared<FeedEngine>(m_sources, m_state.feedSourceIds());
         m_feedEngine->recommender().setAllowAnimated(m_state.feedAllowAnimated());
+    }
     return m_feedEngine;
 }
 
@@ -692,6 +713,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
     // Close the feed DB before waiting on the pool: its workers hold the
     // DB lock and duckdb_close must not race them. Also CHECKPOINTs the WAL.
+    LibraryCatalog::setFeedRanker({});
     if (m_feedEngine)
         m_feedEngine->shutdown();
 

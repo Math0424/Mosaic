@@ -859,6 +859,12 @@ const Library = (() => {
     const my = gen;
     status.replaceChildren(el("div", "spinner"));
     status.firstChild.style.margin = "0 auto";
+    // feed:NN ranks the whole library on page 1: say why it takes a moment.
+    if (page === 0 && /(^|\s)feed:/i.test(query)) {
+      const note = el("div", null, "Ranking your library...");
+      note.style.cssText = "text-align:center;margin-top:8px;opacity:.7;font-size:13px";
+      status.appendChild(note);
+    }
     try {
       const data = await getJson(`/api/library/search?q=${encodeURIComponent(query)}&page=${page + 1}&limit=60`);
       if (my !== gen) return;

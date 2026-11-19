@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QMutex>
 #include <QPointer>
 
 #include <memory>
@@ -85,6 +86,7 @@ class MainWindow : public QMainWindow {
     FavoritesPage* m_favoritesTab = nullptr;
     FeedPage* m_feedPage = nullptr;
     std::shared_ptr<FeedEngine> m_feedEngine;
+    QMutex m_feedEngineMutex;  // guards m_feedEngine creation
     WebServer* m_webServer = nullptr;
     QToolButton* m_feedButton = nullptr;
     QList<TabState> m_closedTabs;

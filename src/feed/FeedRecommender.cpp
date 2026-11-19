@@ -7,6 +7,11 @@
 
 #include <QDateTime>
 #include <QDebug>
+#include <QElapsedTimer>
+#include <QFuture>
+#include <QThread>
+#include <QThreadPool>
+#include <QtConcurrentMap>
 #include <QLoggingCategory>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -1589,6 +1594,170 @@ QList<FeedRecommender::Explanation> FeedRecommender::explainPosts(
         out.append(e);
     }
     return out;
+}
+
+QStringList FeedRecommender::rankLibrary(const QList<SourceImage>& posts, double exploration,
+                                         const SearchProgress& progress) const {
+    QStringList ranked;
+    if (posts.isEmpty())
+        return ranked;
+    const double level = qBound(0.0, exploration, 1.0);
+    const qint64 total = posts.size();
+    auto report = [&progress](const QString& stage, qint64 done, qint64 of) {
+        if (progress)
+            progress(stage, done, of);
+    };
+
+    // Per-stage timings in the log, to see where a slow ranking goes.
+    QElapsedTimer stageTimer;
+    stageTimer.start();
+    QStringList timings;
+    auto lap = [&stageTimer, &timings](const char* name) {
+        timings << QStringLiteral("%1 %2ms").arg(QLatin1String(name)).arg(stageTimer.restart());
+    };
+
+    report(QStringLiteral("Loading your taste profile"), 0, -1);
+    ScoringContext ctx = buildContext();
+    ctx.exploration = level;  // the query's level, not the feed slider
+    const FeedModel model = m_db.modelSnapshot();
+    const double blend = model.blendWeight();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    lap("context");
+
+    // Visual descriptors in slices so a large library reports progress.
+    constexpr int kVisualSlice = 2000;
+    const QString visualStage = QStringLiteral("Loading visual features");
+    QHash<QString, QList<float>> rawVisuals;
+    rawVisuals.reserve(posts.size());
+    for (int start = 0; start < posts.size(); start += kVisualSlice) {
+        report(visualStage, start, total);
+        QStringList md5s;
+        const int end = qMin<int>(posts.size(), start + kVisualSlice);
+        md5s.reserve(end - start);
+        for (int i = start; i < end; ++i) md5s << posts.at(i).md5;
+        rawVisuals.insert(m_db.visualsFor(md5s));
+    }
+    report(visualStage, total, total);
+
+    QSet<QString> hardNegatives;
+    for (const QString& tag : m_db.hardNegativeTags()) hardNegatives.insert(tag.toLower());
+    lap("visuals");
+
+    const int n = posts.size();
+    QList<double> heuristic(n), meanLogit(n), sampled(n), uncertainty(n), novelty(n);
+    QList<bool> hardNegative(n, false);
+    // Kept for the serial Thompson pass below (exploration only).
+    QList<FeatureVector> features(level > 0.0 ? n : 0);
+
+    // Per-post scoring is independent and read-only (context, model
+    // snapshot and visuals are local copies), so it fans out over the CPU
+    // pool in chunks; each chunk writes only its own indices. The caller
+    // thread polls the shared counter to report progress.
+    constexpr int kChunk = 64;
+    QList<int> chunkStarts;
+    for (int start = 0; start < n; start += kChunk) chunkStarts << start;
+    std::atomic<int> scoredCount{0};
+    const QString scoreStage = QStringLiteral("Ranking posts");
+    report(scoreStage, 0, total);
+    // Raw pointers: no QList detach checks from worker threads.
+    double* const heuristicOut = heuristic.data();
+    double* const meanOut = meanLogit.data();
+    double* const uncertaintyOut = uncertainty.data();
+    double* const noveltyOut = novelty.data();
+    bool* const hardNegativeOut = hardNegative.data();
+    FeatureVector* const featuresOut = features.data();
+    auto scoreChunk = [&](int start) {
+        const int end = qMin(n, start + kChunk);
+        for (int i = start; i < end; ++i) {
+            const SourceImage& img = posts.at(i);
+            const QStringList tags = contentTags(img);
+            double signalValues[kSignalCount] = {};
+            heuristicOut[i] =
+                computeSignals(ctx, model, img, QString(), signalValues, nullptr, nullptr);
+            noveltyOut[i] = signalValues[kSignalNovelty];
+            const QList<double> visual = model.standardizeVisual(rawVisuals.value(img.md5));
+            FeatureVector x = buildModelFeatures(tags, visual, signalValues);
+            meanOut[i] = model.meanScore(x, nowMs);
+            uncertaintyOut[i] = model.uncertainty(x, nowMs);
+            for (const QString& tag : tags) {
+                if (hardNegatives.contains(tag)) {
+                    hardNegativeOut[i] = true;
+                    break;
+                }
+            }
+            if (level > 0.0)
+                featuresOut[i] = std::move(x);
+        }
+        scoredCount.fetch_add(end - start, std::memory_order_relaxed);
+    };
+    QFuture<void> scoring =
+        QtConcurrent::map(QThreadPool::globalInstance(), chunkStarts, scoreChunk);
+    while (!scoring.isFinished()) {
+        QThread::msleep(40);
+        report(scoreStage, scoredCount.load(std::memory_order_relaxed), total);
+    }
+    scoring.waitForFinished();
+    lap("scoring");
+
+    // One posterior draw for the whole ranking, as for a feed batch.
+    // ThompsonDraw caches its draws lazily (not thread-safe): serial, but
+    // only a dot product per post.
+    if (level > 0.0) {
+        ThompsonDraw draw(model, thompsonTemperature(level),
+                          QRandomGenerator::global()->generate64());
+        for (int i = 0; i < n; ++i) sampled[i] = draw.score(features.at(i));
+        features.clear();
+    } else {
+        sampled = meanLogit;
+    }
+    report(scoreStage, total, total);
+    lap("thompson");
+
+    // Everything on a common scale: z-scores within this result set.
+    auto zScores = [](QList<double>& values) {
+        double mean, sd;
+        meanStd(values, &mean, &sd);
+        for (double& v : values) v = (v - mean) / sd;
+    };
+    zScores(heuristic);
+    zScores(meanLogit);
+    zScores(sampled);
+    zScores(uncertainty);
+    zScores(novelty);
+
+    // Exploit: the feed's relevance blend on the posterior mean - the
+    // model's share is exactly as large as it has earned.
+    // Explore: a Thompson-sampled relevance plus credit for what the model
+    // is unsure about / has never seen, with random spread so repeated
+    // searches surface different corners of the library.
+    std::mt19937_64 rng(QRandomGenerator::global()->generate64());
+    std::normal_distribution<double> noise(0.0, 0.6);
+    QList<QPair<double, int>> scores;
+    scores.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        const double exploit = (1.0 - blend) * heuristic[i] + blend * meanLogit[i];
+        double score = exploit;
+        if (level > 0.0) {
+            const double sampledRelevance = (1.0 - blend) * heuristic[i] + blend * sampled[i];
+            const double explore = 0.4 * sampledRelevance + 0.35 * uncertainty[i] +
+                                   0.25 * novelty[i] + noise(rng);
+            score = (1.0 - level) * exploit + level * explore;
+        }
+        // Learned hard negatives sink but stay reachable (it's your library).
+        if (hardNegative[i])
+            score -= 3.0;
+        scores.append({score, i});
+    }
+    std::stable_sort(scores.begin(), scores.end(),
+                     [](const QPair<double, int>& a, const QPair<double, int>& b) {
+                         return a.first > b.first;
+                     });
+    ranked.reserve(n);
+    for (const auto& [score, index] : scores) ranked << posts.at(index).md5;
+    lap("sort");
+    qCInfo(lcFeed).noquote() << "library ranking |" << n << "posts | exploration" << level << "|"
+                             << timings.join(QStringLiteral(", "));
+    return ranked;
 }
 
 }  // namespace Mosaic

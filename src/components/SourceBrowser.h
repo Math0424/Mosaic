@@ -101,6 +101,8 @@ class SourceBrowser : public QWidget {
 
     void buildUi();
     void runSearch(int page, FetchMode mode);
+    // total < 0 = busy (no known length).
+    void showSearchProgress(const QString& stage, qint64 done, qint64 total);
     void appendResult(const SourceResult& result, FetchMode mode, int page);
     void clearGrid();
     void openViewer(int index);
@@ -127,6 +129,9 @@ class SourceBrowser : public QWidget {
     QPushButton* m_prevButton = nullptr;
     QPushButton* m_loadMoreButton = nullptr;
     QCompleter* m_completer = nullptr;
+    // Current search stage ("Ranking posts… 1,200 / 2,600"), shown in the
+    // empty-grid label; empty when idle.
+    QString m_loadingText;
 
     // Results grid
     QScrollArea* m_gridScroll = nullptr;

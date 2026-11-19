@@ -37,6 +37,11 @@ void splitTagGroups(const QString& tags, QList<TagGroup>& groups, QStringList& e
 
 QString orderByClause(const QString& order);
 
+// "feed:NN" order term -> NN clamped to [0, 100] (100 = pure taste,
+// 0 = pure exploration; malformed values mean 100). -1 when the term is
+// not a feed ranking.
+int feedOrderLevel(const QString& order);
+
 }  // namespace LibrarySql
 
 }  // namespace Mosaic

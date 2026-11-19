@@ -40,6 +40,8 @@ add_executable(Mosaic
     components/MultiSourceDialog.cpp
     components/SettingsDialog.h
     components/SettingsDialog.cpp
+    components/SearchHelpDialog.h
+    components/SearchHelpDialog.cpp
     components/SourceBrowser.h
     components/SourceBrowser.cpp
     components/TagMergePage.h

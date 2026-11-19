@@ -77,10 +77,16 @@ struct SourceImage {
     QString tooltipHtml() const;
 };
 
+// Progress of a slow search stage, called on the search thread. `total` is
+// -1 when the stage has no known length (show it as busy).
+using SearchProgress = std::function<void(const QString& stage, qint64 done, qint64 total)>;
+
 struct SourceQuery {
     QString tags;
     int page = 1;
     int limit = 75;
+    // Optional; only slow sources report (library "feed:" ranking).
+    SearchProgress progress;
 };
 
 struct SourceResult {

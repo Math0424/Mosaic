@@ -158,6 +158,14 @@ class FeedRecommender {
     };
     QList<Explanation> explainPosts(const QList<SourceImage>& images) const;
 
+    // Orders already-saved library posts (the "feed:NN" library search)
+    // with the same scorers as the feed; returns their md5s best-first.
+    // exploration 0 = pure predicted taste (deterministic), 1 = favor what
+    // the model knows least about, Thompson-sampled with random spread.
+    // Read-only: it never logs impressions or trains the model.
+    QStringList rankLibrary(const QList<SourceImage>& posts, double exploration,
+                            const SearchProgress& progress = {}) const;
+
    private:
     std::atomic<bool> m_allowAnimated{false};
     struct Candidate {
